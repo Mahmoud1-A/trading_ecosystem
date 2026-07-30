@@ -25,6 +25,12 @@ from discovery.stress_backend import (
 # the scenario backend's own returned artifact).
 _REQUIRED_RESEARCH_SIGNAL_SOURCE = "candidate_dsl_trees"
 STRESS_SIGNAL_INTEGRITY_FAILED = "STRESS_SIGNAL_INTEGRITY_FAILED"
+STRESS_INTEGRITY_FAILED = "STRESS_INTEGRITY_FAILED"
+STRESS_BACKEND_KIND_INVALID = "STRESS_BACKEND_KIND_INVALID"
+STRESS_SIGNAL_SOURCE_INVALID = "STRESS_SIGNAL_SOURCE_INVALID"
+STRESS_WFO_INCOMPLETE = "STRESS_WFO_INCOMPLETE"
+
+BASELINE_ARTIFACT_SOURCE_ORIGINAL_WFO = "original_qualifying_wfo"
 
 
 STRESS_SCENARIOS: tuple[str, ...] = (
@@ -102,6 +108,21 @@ def _default_backend_factory(scenario: str) -> BacktestBackend:
     return SyntheticOOSBackend(seed_salt=stable_int_hash(scenario, bits=32) % 10_000)
 
 
+def _integrity_failure_reason(
+    *,
+    signal_source: str,
+    backend_kind: str,
+    completed_fold_count: int,
+) -> str:
+    if signal_source != _REQUIRED_RESEARCH_SIGNAL_SOURCE:
+        return STRESS_SIGNAL_SOURCE_INVALID
+    if backend_kind != STRESS_BACKEND_KIND:
+        return STRESS_BACKEND_KIND_INVALID
+    if completed_fold_count <= 0:
+        return STRESS_WFO_INCOMPLETE
+    return STRESS_INTEGRITY_FAILED
+
+
 @dataclass
 class StressTester:
     budget: SearchBudget
@@ -112,6 +133,8 @@ class StressTester:
     synthetic_stress_forbidden: bool = False
     # Legacy field retained but NOT used as sole pass criterion on research paths.
     min_fitness_ratio: float = 0.35
+    # Accounting from the most recent run() call (honest Stress budget proof).
+    last_run_accounting: dict[str, Any] = field(default_factory=dict)
 
     def run(
         self,
@@ -119,23 +142,30 @@ class StressTester:
         *,
         base_fitness: float,
         scenarios: tuple[str, ...] | None = None,
+        baseline_artifacts: dict[str, Any] | None = None,
     ) -> list[StressResult]:
         chosen = scenarios or STRESS_SCENARIOS
         results: list[StressResult] = []
         forbid = bool(self.synthetic_stress_forbidden or self.research_eligible)
+        scenario_backend_calls = 0
+        stress_before = int(self.counters.stress)
 
-        # Seed baseline artifacts from a real base_costs run when factory supports it.
-        baseline_arts: dict[str, Any] | None = None
+        # Seed removed_best_* from the candidate-specific original WFO snapshot.
+        # Never re-evaluate the base event backend here — that would be a hidden,
+        # unbudgeted Full WFO rerun outside Stress counters.
+        baseline_arts: dict[str, Any] | None = (
+            dict(baseline_artifacts) if baseline_artifacts else None
+        )
         cache = getattr(self.backend_factory, "baseline_cache", None)
-        base_event = getattr(self.backend_factory, "base_event_backend", None)
-        if base_event is not None and hasattr(base_event, "evaluate"):
-            try:
-                base_event.evaluate(candidate)
-                baseline_arts = dict(getattr(base_event, "last_run_artifacts", {}) or {})
-                if cache is not None:
-                    cache["arts"] = baseline_arts
-            except Exception:  # noqa: BLE001
-                baseline_arts = None
+        if cache is not None:
+            cache["arts"] = baseline_arts
+
+        baseline_candidate_id = None
+        if baseline_arts is not None:
+            baseline_candidate_id = str(
+                baseline_arts.get("candidate_id") or candidate.candidate_id
+            )
+        hidden_baseline_rerun = False
 
         single_symbol = len(candidate.asset_universe) <= 1
 
@@ -186,6 +216,7 @@ class StressTester:
                 continue
 
             folds, _ = backend.evaluate(candidate)
+            scenario_backend_calls += 1
             # Research integrity: never post-process / haircut fold metrics.
             fit = self.fitness_model.score(folds, complexity=candidate.complexity_score)
             arts: dict[str, Any] = {}
@@ -223,7 +254,11 @@ class StressTester:
                 # not prove a real DSL-tree event-driven rerun is an integrity
                 # failure, not a pass — regardless of the economic gate result.
                 passed = False
-                failure_reason = failure_reason or STRESS_SIGNAL_INTEGRITY_FAILED
+                failure_reason = _integrity_failure_reason(
+                    signal_source=signal_source,
+                    backend_kind=backend_kind,
+                    completed_fold_count=completed_fold_count,
+                )
 
             results.append(
                 StressResult(
@@ -252,10 +287,28 @@ class StressTester:
                         ),
                         "economic_gate": "RobustFitness.score",
                         "baseline_seeded": baseline_arts is not None,
+                        "baseline_artifact_source": (
+                            BASELINE_ARTIFACT_SOURCE_ORIGINAL_WFO
+                            if baseline_arts is not None
+                            else None
+                        ),
+                        "baseline_candidate_id": baseline_candidate_id,
+                        "hidden_baseline_rerun": hidden_baseline_rerun,
                     },
                 )
             )
             self.counters.stress += 1
+
+        stress_counter_delta = int(self.counters.stress) - stress_before
+        self.last_run_accounting = {
+            "baseline_artifact_source": (
+                BASELINE_ARTIFACT_SOURCE_ORIGINAL_WFO if baseline_arts is not None else None
+            ),
+            "baseline_candidate_id": baseline_candidate_id,
+            "hidden_baseline_rerun": hidden_baseline_rerun,
+            "scenario_backend_calls": scenario_backend_calls,
+            "stress_counter_delta": stress_counter_delta,
+        }
         return results
 
     @staticmethod
@@ -298,6 +351,11 @@ def attach_stress(record: EvaluationRecord, results: list[StressResult]) -> Eval
 # Re-export factory helper for control-plane wiring.
 __all__ = [
     "STRESS_SCENARIOS",
+    "STRESS_INTEGRITY_FAILED",
+    "STRESS_BACKEND_KIND_INVALID",
+    "STRESS_SIGNAL_SOURCE_INVALID",
+    "STRESS_WFO_INCOMPLETE",
+    "BASELINE_ARTIFACT_SOURCE_ORIGINAL_WFO",
     "StressResult",
     "StressTester",
     "attach_stress",

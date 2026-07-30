@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import time
 from dataclasses import dataclass, field
@@ -52,6 +53,71 @@ class EvalOutcome(str, Enum):
     WFO_FAILED = "WFO_FAILED"
     REJECTED = "REJECTED"
     FINALIST = "FINALIST"
+
+
+BASELINE_WFO_ARTIFACT_KEYS: tuple[str, ...] = (
+    "candidate_id",
+    "signal_source",
+    "backend_kind",
+    "is_full_event_wfo",
+    "wfo_completed_folds",
+    "closed_trades",
+    "orders_count",
+    "fills_count",
+    "trades_count",
+    "oos_ranges",
+)
+
+
+def snapshot_baseline_wfo_artifacts(
+    *,
+    candidate_id: str,
+    backend: Any,
+    train_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Immutable Stress baseline subset from the original qualifying WFO.
+
+    Captures only fields required by Stress (removed_best_* / integrity proof).
+    Never aliases mutable ``backend.last_run_artifacts``.
+    """
+    arts = dict(getattr(backend, "last_run_artifacts", None) or {})
+    train = dict(train_metrics or {})
+    closed_raw = arts.get("closed_trades")
+    closed_trades = copy.deepcopy(list(closed_raw)) if closed_raw else []
+    oos_raw = arts.get("oos_ranges")
+    if oos_raw is None:
+        oos_raw = train.get("oos_ranges")
+    oos_ranges = copy.deepcopy(list(oos_raw)) if oos_raw else []
+    return {
+        "candidate_id": str(arts.get("candidate_id") or candidate_id),
+        "signal_source": str(
+            arts.get("signal_source") or train.get("signal_source") or ""
+        ),
+        "backend_kind": str(
+            arts.get("backend_kind")
+            or train.get("backend_kind")
+            or getattr(backend, "backend_kind", type(backend).__name__)
+        ),
+        "is_full_event_wfo": bool(
+            arts.get(
+                "is_full_event_wfo",
+                train.get(
+                    "is_full_event_wfo",
+                    getattr(backend, "is_full_event_wfo", False),
+                ),
+            )
+        ),
+        "wfo_completed_folds": int(
+            arts.get("wfo_completed_folds")
+            or train.get("wfo_completed_folds")
+            or 0
+        ),
+        "closed_trades": closed_trades,
+        "orders_count": int(arts.get("orders_count") or train.get("orders_count") or 0),
+        "fills_count": int(arts.get("fills_count") or train.get("fills_count") or 0),
+        "trades_count": int(arts.get("trades_count") or train.get("trades_count") or 0),
+        "oos_ranges": oos_ranges,
+    }
 
 
 @dataclass
@@ -556,6 +622,11 @@ class CandidateEvaluator:
                         "phase": "validation_oos",
                     },
                 )
+            baseline_wfo_artifacts = snapshot_baseline_wfo_artifacts(
+                candidate_id=candidate.candidate_id,
+                backend=self.backend,
+                train_metrics=train_metrics if isinstance(train_metrics, dict) else {},
+            )
         except Exception as exc:  # noqa: BLE001 — register evaluation failures
             trial_id = self._register(
                 candidate,
@@ -638,7 +709,11 @@ class CandidateEvaluator:
                 oos_folds=oos_folds,
                 train_metrics=train_metrics,
                 runtime_seconds=time.perf_counter() - t0,
-                meta={"is_full_wfo_completion": is_full_wfo_completion, **feature_resolution_note},
+                meta={
+                    "is_full_wfo_completion": is_full_wfo_completion,
+                    "baseline_wfo_artifacts": baseline_wfo_artifacts,
+                    **feature_resolution_note,
+                },
             )
             self._records.append(rec)
             self._emit_progress(
@@ -669,7 +744,11 @@ class CandidateEvaluator:
                 oos_folds=oos_folds,
                 train_metrics=train_metrics,
                 runtime_seconds=time.perf_counter() - t0,
-                meta={"is_full_wfo_completion": is_full_wfo_completion, **feature_resolution_note},
+                meta={
+                    "is_full_wfo_completion": is_full_wfo_completion,
+                    "baseline_wfo_artifacts": baseline_wfo_artifacts,
+                    **feature_resolution_note,
+                },
             )
             self._records.append(rec)
             self._emit_progress(
@@ -714,7 +793,11 @@ class CandidateEvaluator:
             oos_folds=oos_folds,
             train_metrics=train_metrics,
             runtime_seconds=time.perf_counter() - t0,
-            meta={"is_full_wfo_completion": is_full_wfo_completion, **feature_resolution_note},
+            meta={
+                "is_full_wfo_completion": is_full_wfo_completion,
+                "baseline_wfo_artifacts": baseline_wfo_artifacts,
+                **feature_resolution_note,
+            },
         )
         self._records.append(rec)
         self.counters.runtime_seconds += rec.runtime_seconds

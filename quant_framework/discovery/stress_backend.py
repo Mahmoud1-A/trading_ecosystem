@@ -459,7 +459,8 @@ def make_stress_backend_factory(
         )
         return built
 
-    # Attach helper for StressTester to seed baseline artifacts after base_costs.
+    # Attach helper so callers can seed baseline artifacts from the original
+    # qualifying WFO snapshot (never via a hidden base_event.evaluate re-run).
     _factory.base_event_backend = base_backend  # type: ignore[attr-defined]
     _factory.baseline_cache = baseline_cache  # type: ignore[attr-defined]
     _factory.research_eligible = research_eligible  # type: ignore[attr-defined]

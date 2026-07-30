@@ -54,6 +54,8 @@ STRESS_NOT_ENTERED = "STRESS_NOT_ENTERED"
 REAL_STRESS_BACKEND_REQUIRED = "REAL_STRESS_BACKEND_REQUIRED"
 STRESS_SIGNAL_SOURCE_INVALID = "STRESS_SIGNAL_SOURCE_INVALID"
 STRESS_WFO_INCOMPLETE = "STRESS_WFO_INCOMPLETE"
+STRESS_BACKEND_KIND_INVALID = "STRESS_BACKEND_KIND_INVALID"
+STRESS_INTEGRITY_FAILED = "STRESS_INTEGRITY_FAILED"
 STRESS_BUDGET_EXHAUSTED = "STRESS_BUDGET_EXHAUSTED"
 STRESS_NO_EXECUTED_SCENARIOS = "STRESS_NO_EXECUTED_SCENARIOS"
 STRESS_UNSUPPORTED_REQUIRED = "STRESS_UNSUPPORTED_REQUIRED"
@@ -61,6 +63,8 @@ STRESS_BASELINE_UNAVAILABLE_REQUIRED = "STRESS_BASELINE_UNAVAILABLE_REQUIRED"
 STRESS_PASS_RATE_LOW = "STRESS_PASS_RATE_LOW"
 
 _REQUIRED_STRESS_SIGNAL_SOURCE = "candidate_dsl_trees"
+_REQUIRED_STRESS_BACKEND_KIND = STRESS_BACKEND_KIND
+BASELINE_ARTIFACT_SOURCE_ORIGINAL_WFO = "original_qualifying_wfo"
 
 DEFAULT_MULTIFAMILY_STRESS_SCENARIOS: tuple[str, ...] = (
     "base_costs",
@@ -736,6 +740,12 @@ class CandidateStressSummary:
     final_decision: str = STRESS_NOT_ENTERED
     final_reason: str = ""
     stress_budget_consumed: int = 0
+    integrity_failures: list[dict[str, Any]] = field(default_factory=list)
+    baseline_artifact_source: str | None = None
+    baseline_candidate_id: str | None = None
+    hidden_baseline_rerun: bool = False
+    scenario_backend_calls: int = 0
+    stress_counter_delta: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -767,6 +777,12 @@ class CandidateStressSummary:
             "final_decision": self.final_decision,
             "final_reason": self.final_reason,
             "stress_budget_consumed": self.stress_budget_consumed,
+            "integrity_failures": [dict(x) for x in self.integrity_failures],
+            "baseline_artifact_source": self.baseline_artifact_source,
+            "baseline_candidate_id": self.baseline_candidate_id,
+            "hidden_baseline_rerun": self.hidden_baseline_rerun,
+            "scenario_backend_calls": self.scenario_backend_calls,
+            "stress_counter_delta": self.stress_counter_delta,
         }
 
 
@@ -1419,6 +1435,34 @@ class MultiFamilyCampaign:
         failed = [r for r in executed if not r.passed]
         denom = len(executed)
         pass_rate = (len(passed) / denom) if denom > 0 else 0.0
+
+        integrity_failures: list[dict[str, Any]] = []
+        integrity_reason: str | None = None
+        for r in executed:
+            reasons: list[str] = []
+            if r.signal_source != _REQUIRED_STRESS_SIGNAL_SOURCE:
+                reasons.append(STRESS_SIGNAL_SOURCE_INVALID)
+            if r.backend_kind != _REQUIRED_STRESS_BACKEND_KIND:
+                reasons.append(STRESS_BACKEND_KIND_INVALID)
+            if int(r.completed_fold_count) <= 0:
+                reasons.append(STRESS_WFO_INCOMPLETE)
+            if not r.integrity_ok and not reasons:
+                reasons.append(STRESS_INTEGRITY_FAILED)
+            if reasons or not r.integrity_ok:
+                primary = reasons[0] if reasons else STRESS_INTEGRITY_FAILED
+                if integrity_reason is None:
+                    integrity_reason = primary
+                integrity_failures.append(
+                    {
+                        "scenario": r.scenario,
+                        "integrity_ok": bool(r.integrity_ok),
+                        "signal_source": r.signal_source,
+                        "backend_kind": r.backend_kind,
+                        "completed_fold_count": int(r.completed_fold_count),
+                        "failure_reason": primary,
+                    }
+                )
+
         stats = {
             "configured": [r.scenario for r in results],
             "executed": [r.scenario for r in executed],
@@ -1430,6 +1474,7 @@ class MultiFamilyCampaign:
             "denominator": denom,
             "pass_rate": pass_rate,
             "required_pass_rate": required_pass_rate,
+            "integrity_failures": integrity_failures,
         }
         if fail_closed_unsupported and unsupported:
             return STRESS_FAILED, STRESS_UNSUPPORTED_REQUIRED, stats
@@ -1437,12 +1482,9 @@ class MultiFamilyCampaign:
             return STRESS_FAILED, STRESS_BASELINE_UNAVAILABLE_REQUIRED, stats
         if denom <= 0:
             return STRESS_FAILED, STRESS_NO_EXECUTED_SCENARIOS, stats
-        # Integrity: every executed scenario must prove DSL signal source + folds.
-        for r in executed:
-            if r.signal_source != _REQUIRED_STRESS_SIGNAL_SOURCE:
-                return STRESS_FAILED, STRESS_SIGNAL_SOURCE_INVALID, stats
-            if int(r.completed_fold_count) <= 0:
-                return STRESS_FAILED, STRESS_WFO_INCOMPLETE, stats
+        # Integrity failures are hard research failures — pass-rate cannot override.
+        if integrity_failures:
+            return STRESS_FAILED, integrity_reason or STRESS_INTEGRITY_FAILED, stats
         if pass_rate < float(required_pass_rate):
             return STRESS_FAILED, STRESS_PASS_RATE_LOW, stats
         return STRESS_PASSED, "stress_pass_rate_ok", stats
@@ -1462,6 +1504,7 @@ class MultiFamilyCampaign:
         required_pass_rate: float,
         budget_before: int,
         budget_after: int,
+        accounting_extra: dict[str, Any] | None = None,
     ) -> CandidateStressSummary:
         executed = [r for r in results if r.status == "executed"]
         worst_scenario = None
@@ -1488,6 +1531,7 @@ class MultiFamilyCampaign:
             for r in results
             if r.status == "executed"
         }
+        acct = dict(accounting_extra or {})
         return CandidateStressSummary(
             candidate_id=cand.candidate_id,
             family_id=family_id,
@@ -1535,6 +1579,12 @@ class MultiFamilyCampaign:
             final_decision=decision,
             final_reason=reason,
             stress_budget_consumed=max(0, int(budget_after) - int(budget_before)),
+            integrity_failures=list(stats.get("integrity_failures") or []),
+            baseline_artifact_source=acct.get("baseline_artifact_source"),
+            baseline_candidate_id=acct.get("baseline_candidate_id"),
+            hidden_baseline_rerun=bool(acct.get("hidden_baseline_rerun", False)),
+            scenario_backend_calls=int(acct.get("scenario_backend_calls") or 0),
+            stress_counter_delta=int(acct.get("stress_counter_delta") or 0),
         )
 
     def _run_stress_phase(
@@ -1687,11 +1737,17 @@ class MultiFamilyCampaign:
                 continue
 
             budget_before = int(counters.stress)
+            baseline_arts = None
+            if isinstance(rec.meta, dict):
+                raw_baseline = rec.meta.get("baseline_wfo_artifacts")
+                if isinstance(raw_baseline, dict):
+                    baseline_arts = dict(raw_baseline)
             try:
                 results = tester.run(
                     cand,
                     base_fitness=float(rec.fitness.fitness) if rec.fitness else 0.0,
                     scenarios=chosen,
+                    baseline_artifacts=baseline_arts,
                 )
             except RuntimeError as exc:
                 msg = str(exc)
@@ -1738,12 +1794,21 @@ class MultiFamilyCampaign:
                         final_decision=STRESS_FAILED,
                         final_reason=fail_reason,
                         stress_budget_consumed=max(0, int(counters.stress) - budget_before),
+                        hidden_baseline_rerun=False,
                     )
                 )
                 continue
 
             attach_stress(rec, results)
             budget_after = int(counters.stress)
+            run_acct = dict(getattr(tester, "last_run_accounting", {}) or {})
+            if baseline_arts is not None and not run_acct.get("baseline_artifact_source"):
+                run_acct["baseline_artifact_source"] = BASELINE_ARTIFACT_SOURCE_ORIGINAL_WFO
+            if baseline_arts is not None and not run_acct.get("baseline_candidate_id"):
+                run_acct["baseline_candidate_id"] = str(
+                    baseline_arts.get("candidate_id") or cand.candidate_id
+                )
+            run_acct.setdefault("hidden_baseline_rerun", False)
             decision, reason, stats = self._decide_stress_outcome(
                 results,
                 required_pass_rate=float(cfg.min_stress_pass_rate),
@@ -1762,6 +1827,7 @@ class MultiFamilyCampaign:
                 required_pass_rate=float(cfg.min_stress_pass_rate),
                 budget_before=budget_before,
                 budget_after=budget_after,
+                accounting_extra=run_acct,
             )
             self.candidate_stress_summaries.append(summary)
             accounting.candidates_stress_entered += 1
