@@ -15,6 +15,10 @@ from discovery.typecheck import check_ast_types, check_strategy_trees, parse_dsl
 from discovery.types import CreationMethod, NodeKind, ValueType
 
 
+class MutationRejected(ValueError):
+    """Raised when a strict mutation produces an invalid descendant."""
+
+
 class Mutator:
     def __init__(self, grammar: Grammar | None = None) -> None:
         self.grammar = grammar or Grammar()
@@ -150,8 +154,16 @@ class Mutator:
             return self._replace(tree, idx, op_node(OperatorId.ENTRY_LONG, cond))
         return tree
 
-    def mutate(self, parent: StrategyCandidate, *, seed: int) -> StrategyCandidate:
+    def mutate(
+        self,
+        parent: StrategyCandidate,
+        *,
+        seed: int,
+        strict: bool = False,
+        generation: int | None = None,
+    ) -> StrategyCandidate:
         rng = np.random.default_rng(seed)
+        mutation_op = "mutate_tree"
         try:
             entry = repair_entry(
                 clamp_lookbacks(self.mutate_tree(parent.entry_tree, rng), self.grammar),
@@ -163,8 +175,11 @@ class Mutator:
                 operation="mutation",
                 parent_ids=(parent.candidate_id,),
             )
-        except DSLValidationError:
+        except DSLValidationError as exc:
+            if strict:
+                raise MutationRejected(f"invalid mutated entry: {exc}") from exc
             entry = parent.entry_tree
+            mutation_op = "mutate_entry_reverted"
 
         exit_tree = parent.exit_tree
         if exit_tree is not None and rng.random() < 0.5:
@@ -176,7 +191,10 @@ class Mutator:
                     operation="mutation",
                     parent_ids=(parent.candidate_id,),
                 )
-            except DSLValidationError:
+                mutation_op = "mutate_entry_and_exit"
+            except DSLValidationError as exc:
+                if strict:
+                    raise MutationRejected(f"invalid mutated exit: {exc}") from exc
                 exit_tree = parent.exit_tree
 
         check = structural_precheck(
@@ -187,9 +205,20 @@ class Mutator:
             seed=seed,
         )
         if not check.accepted:
+            if strict:
+                raise MutationRejected(f"structural_precheck:{check.reason}")
             entry = parent.entry_tree
             exit_tree = parent.exit_tree
+            mutation_op = "mutate_precheck_reverted"
 
+        prov = dict(parent.family_provenance or {})
+        prov.update(
+            {
+                "mutation_operation": mutation_op,
+                "source_parent_id": parent.candidate_id,
+            }
+        )
+        child_generation = int(generation) if generation is not None else parent.generation + 1
         cand = build_candidate(
             entry_tree=entry,
             exit_tree=exit_tree,
@@ -199,14 +228,14 @@ class Mutator:
             regime_gates=parent.regime_gates,
             strategy_family=parent.strategy_family,
             creation_method=CreationMethod.MUTATION,
-            generation=parent.generation + 1,
+            generation=child_generation,
             parent_ids=(parent.candidate_id,),
             grammar_version=parent.grammar_version,
             feature_set_version=parent.feature_set_version,
             cost_model_version=parent.cost_model_version,
             asset_universe=parent.asset_universe,
             random_seed=seed,
-            family_provenance=dict(parent.family_provenance or {}),
+            family_provenance=prov,
         )
         try:
             check_strategy_trees(
@@ -220,10 +249,13 @@ class Mutator:
                 parent_ids=(parent.candidate_id,),
             )
         except DSLValidationError as exc:
-            raise parse_dsl_validation_error(
+            err = parse_dsl_validation_error(
                 exc,
                 operation="mutation",
                 candidate_id=cand.candidate_id,
                 parent_ids=(parent.candidate_id,),
-            ) from exc
+            )
+            if strict:
+                raise MutationRejected(str(err)) from err
+            raise err from exc
         return cand

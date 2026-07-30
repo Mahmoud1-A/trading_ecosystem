@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from statistics import median
 from typing import Any, Callable
 from uuid import uuid4
 
-from discovery.evaluator import CandidateEvaluator, EvalOutcome
+from discovery.candidate import StrategyCandidate
+from discovery.crossover import Crossover, CrossoverError
+from discovery.evaluator import CandidateEvaluator, EvalOutcome, EvaluationRecord
+from discovery.expression_tree import ExprNode
 from discovery.family_generator import StrategyFamilyGenerator
 from discovery.family_spec import FamilySpec, assert_diverse_family_grammars
 from discovery.fitness import RobustFitness
 from discovery.generator import CandidateGenerator
+from discovery.grammar import Grammar
+from discovery.mutation import MutationRejected, Mutator
+from discovery.operators import OperatorId
 from discovery.search_budget import BudgetCounters, SearchBudget
 from discovery.search_controller import DiscoveryRunResult
 from discovery.stable_hash import stable_seed
+from discovery.types import NodeKind
 from registry.experiment_registry import ExperimentRegistry
 from registry.hashing import sha256_json
 
@@ -24,6 +32,9 @@ NOT_PARENT_ELIGIBLE = "NOT_PARENT_ELIGIBLE"
 
 # Honest capability declaration: MultiFamily currently screens via Full WFO only.
 PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING = "MULTI_FAMILY_WFO_SCREENING"
+PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING = (
+    "MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING"
+)
 SCORE_QUALIFIED_MEANING = "passed economic WFO qualification"
 SCORE_QUALIFIED_DOES_NOT_MEAN = (
     "finalist",
@@ -41,6 +52,20 @@ CLUSTERING_NOT_RUN = "CLUSTERING_NOT_RUN"
 NOT_RESEARCH_SHORTLISTED = "NOT_RESEARCH_SHORTLISTED"
 FAMILY_LOCAL_EVOLUTION_NOT_READY = "FAMILY_LOCAL_EVOLUTION_NOT_READY"
 CROSS_FAMILY_CROSSOVER_UNSUPPORTED = "CROSS_FAMILY_CROSSOVER_UNSUPPORTED"
+FAMILY_STAGNATION = "FAMILY_STAGNATION"
+
+# Outcomes that must never be used as evolutionary parents.
+_NOT_PARENT_OUTCOMES = frozenset(
+    {
+        EvalOutcome.INVALID_DSL_TYPE,
+        EvalOutcome.PRECHECK_FAILED,
+        EvalOutcome.INVALID_FEATURE_THRESHOLD_DOMAIN,
+        EvalOutcome.FEATURE_UNAVAILABLE,
+        EvalOutcome.FEATURE_CAPABILITY_RESOLUTION_FAILED,
+        EvalOutcome.DUPLICATE_SKIPPED,
+        EvalOutcome.EVAL_FAILED,
+    }
+)
 
 POST_WFO_BLOCKED_REASONS: tuple[str, ...] = (
     POST_WFO_PIPELINE_NOT_RUN,
@@ -79,6 +104,7 @@ class FamilyCampaignConfig:
     family_local_evolution: bool = False
     evolution_generations: int = 2
     allow_cross_family_crossover: bool = False
+    minimum_improvement: float = 1e-4
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +125,7 @@ class FamilyCampaignConfig:
             "family_local_evolution": self.family_local_evolution,
             "evolution_generations": self.evolution_generations,
             "allow_cross_family_crossover": self.allow_cross_family_crossover,
+            "minimum_improvement": self.minimum_improvement,
         }
 
 
@@ -149,6 +176,60 @@ class FamilyStats:
 
 
 @dataclass
+class GenerationRecord:
+    """Per-family, per-generation evolution accounting."""
+
+    family_id: str
+    generation: int
+    input_population_ids: list[str] = field(default_factory=list)
+    evaluated_candidate_ids: list[str] = field(default_factory=list)
+    selected_parent_ids: list[str] = field(default_factory=list)
+    mutation_candidate_ids: list[str] = field(default_factory=list)
+    crossover_candidate_ids: list[str] = field(default_factory=list)
+    completed_full_wfo_candidate_ids: list[str] = field(default_factory=list)
+    score_qualified_candidate_ids: list[str] = field(default_factory=list)
+    best_generation_score: float | None = None
+    best_score_so_far: float | None = None
+    generated_count: int = 0
+    evaluated_count: int = 0
+    completed_full_wfo_count: int = 0
+    stagnation_count: int = 0
+    stop_reason: str | None = None
+    previous_best_score: float | None = None
+    generation_best_score: float | None = None
+    improvement: float | None = None
+    minimum_required_improvement: float | None = None
+    parent_selection_reasons: dict[str, str] = field(default_factory=dict)
+    parent_eligibility: dict[str, str] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "family_id": self.family_id,
+            "generation": self.generation,
+            "input_population_ids": list(self.input_population_ids),
+            "evaluated_candidate_ids": list(self.evaluated_candidate_ids),
+            "selected_parent_ids": list(self.selected_parent_ids),
+            "mutation_candidate_ids": list(self.mutation_candidate_ids),
+            "crossover_candidate_ids": list(self.crossover_candidate_ids),
+            "completed_full_wfo_candidate_ids": list(self.completed_full_wfo_candidate_ids),
+            "score_qualified_candidate_ids": list(self.score_qualified_candidate_ids),
+            "best_generation_score": self.best_generation_score,
+            "best_score_so_far": self.best_score_so_far,
+            "generated_count": self.generated_count,
+            "evaluated_count": self.evaluated_count,
+            "completed_full_wfo_count": self.completed_full_wfo_count,
+            "stagnation_count": self.stagnation_count,
+            "stop_reason": self.stop_reason,
+            "previous_best_score": self.previous_best_score,
+            "generation_best_score": self.generation_best_score,
+            "improvement": self.improvement,
+            "minimum_required_improvement": self.minimum_required_improvement,
+            "parent_selection_reasons": dict(self.parent_selection_reasons),
+            "parent_eligibility": dict(self.parent_eligibility),
+        }
+
+
+@dataclass
 class MultiFamilyCampaignResult:
     campaign_id: str
     families: list[FamilySpec]
@@ -170,6 +251,7 @@ class MultiFamilyCampaignResult:
     research_shortlist: list[Any] = field(default_factory=list)
     vault_candidates: list[Any] = field(default_factory=list)
     paper_candidates: list[Any] = field(default_factory=list)
+    generation_records: list[GenerationRecord] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -195,6 +277,7 @@ class MultiFamilyCampaignResult:
             "research_shortlist": list(self.research_shortlist),
             "vault_candidates": list(self.vault_candidates),
             "paper_candidates": list(self.paper_candidates),
+            "generation_records": [g.as_dict() for g in self.generation_records],
             # Explicit empty post-WFO surfaces — never silent.
             "finalists": [],
             "promoted": [],
@@ -463,17 +546,27 @@ class MultiFamilyCampaign:
             if rec.rejection_reason:
                 rejections[rec.rejection_reason] = rejections.get(rec.rejection_reason, 0) + 1
             status = NOT_PARENT_ELIGIBLE
-            if rec.outcome is EvalOutcome.REGISTERED and rec.fitness is not None and not rec.fitness.rejected:
+            is_score_qualified = False
+            if rec.outcome in _NOT_PARENT_OUTCOMES:
+                status = NOT_PARENT_ELIGIBLE
+            elif rec.outcome is EvalOutcome.REGISTERED and rec.fitness is not None and not rec.fitness.rejected:
+                is_score_qualified = True
                 score_qualified += 1
-                status = SCORE_QUALIFIED
+                status = STRUCTURAL_PARENT_ELIGIBLE
                 fitnesses.append((float(rec.fitness.fitness), rec.candidate_id))
                 comps = rec.fitness.components or {}
                 if "pos_median_oos_expectancy" in comps:
                     expectancies.append(float(comps["pos_median_oos_expectancy"]))
                 if "pos_oos_profit_factor" in comps:
                     pfs.append(float(comps["pos_oos_profit_factor"]))
-            elif rec.fitness is not None and not rec.fitness.rejected:
+            elif rec.fitness is not None:
+                # Structurally evaluated (may be economically rejected) — parent-eligible
+                # without implying Score Qualified.
                 status = STRUCTURAL_PARENT_ELIGIBLE
+                if not rec.fitness.rejected:
+                    fitnesses.append((float(rec.fitness.fitness), rec.candidate_id))
+                else:
+                    fitnesses.append((float(rec.fitness.fitness), rec.candidate_id))
             elif rec.outcome is EvalOutcome.REGISTERED:
                 status = STRUCTURAL_PARENT_ELIGIBLE
             elif rec.rejection_reason in {
@@ -482,9 +575,10 @@ class MultiFamilyCampaign:
                 "INSUFFICIENT_OOS_TRADES",
                 "MAX_DRAWDOWN_EXCEEDED",
             }:
-                # Structural parent may still be eligible without Score Qualified.
                 status = STRUCTURAL_PARENT_ELIGIBLE
             parent_status[status] = parent_status.get(status, 0) + 1
+            if is_score_qualified:
+                parent_status[SCORE_QUALIFIED] = parent_status.get(SCORE_QUALIFIED, 0) + 1
             if rec.stress_results:
                 passed = sum(
                     1
@@ -525,11 +619,701 @@ class MultiFamilyCampaign:
             parent_status_counts=parent_status,
         )
 
+    @staticmethod
+    def classify_parent_eligibility(
+        rec: EvaluationRecord,
+    ) -> tuple[str, bool, str]:
+        """Return (parent_status, is_score_qualified, reason).
+
+        STRUCTURAL_PARENT_ELIGIBLE never implies Score Qualified / Stress /
+        finalist / promoted / shortlist / Vault / Paper.
+        """
+        if rec.outcome in _NOT_PARENT_OUTCOMES:
+            return (
+                NOT_PARENT_ELIGIBLE,
+                False,
+                f"not_parent:{rec.outcome.value}:{rec.rejection_reason or 'n/a'}",
+            )
+        is_sq = (
+            rec.outcome is EvalOutcome.REGISTERED
+            and rec.fitness is not None
+            and not rec.fitness.rejected
+        )
+        if rec.fitness is not None or rec.outcome is EvalOutcome.REGISTERED:
+            reason = (
+                "structural_parent_after_wfo_score_qualified"
+                if is_sq
+                else "structural_parent_after_wfo_not_score_qualified"
+            )
+            return STRUCTURAL_PARENT_ELIGIBLE, is_sq, reason
+        if rec.rejection_reason in {
+            "NEGATIVE_EXPECTANCY",
+            "PF_BELOW_ONE",
+            "INSUFFICIENT_OOS_TRADES",
+            "MAX_DRAWDOWN_EXCEEDED",
+        }:
+            return (
+                STRUCTURAL_PARENT_ELIGIBLE,
+                False,
+                f"structural_parent_economic_reject:{rec.rejection_reason}",
+            )
+        return (
+            NOT_PARENT_ELIGIBLE,
+            False,
+            f"not_parent:unclassified:{rec.outcome.value}:{rec.rejection_reason or 'n/a'}",
+        )
+
+    @staticmethod
+    def candidate_within_family_grammar(cand: StrategyCandidate, grammar: Grammar) -> bool:
+        allowed_features = {leaf.feature_id for leaf in grammar.feature_leaves}
+        for fid in cand.feature_ids:
+            if fid not in allowed_features:
+                return False
+        trees: list[ExprNode | None] = [
+            cand.entry_tree,
+            cand.exit_tree,
+            cand.stop,
+            cand.target,
+            cand.sizing,
+            *cand.regime_gates,
+        ]
+        for tree in trees:
+            if tree is None:
+                continue
+            for node in tree.walk():
+                if node.kind is NodeKind.OPERATOR:
+                    try:
+                        oid = OperatorId(node.name)
+                    except ValueError:
+                        return False
+                    if not grammar.allows_operator(oid):
+                        return False
+        return True
+
+    def _bind_evaluator_features(self, ev: CandidateEvaluator) -> None:
+        avail = getattr(self.backend, "available_feature_ids", None)
+        if avail is not None:
+            ev.available_feature_ids = frozenset(avail)
+            ev.dataset_capabilities = tuple(
+                getattr(self.backend, "dataset_capabilities", ()) or ()
+            )
+
+    def _evaluate_candidate(
+        self,
+        *,
+        ev: CandidateEvaluator,
+        cand: StrategyCandidate,
+        full_wfo_counts: dict[str, int],
+        fid: str,
+    ) -> EvaluationRecord:
+        prev_full_wfo = ev.counters.full_wfo
+        rec = ev.evaluate(cand)
+        if ev.counters.full_wfo > prev_full_wfo:
+            full_wfo_counts[fid] = full_wfo_counts.get(fid, 0) + 1
+        return rec
+
+    def _generate_initial_population(
+        self,
+        *,
+        spec: FamilySpec,
+        target: int,
+        seen: set[str],
+    ) -> list[StrategyCandidate]:
+        cfg = self.config
+        generator = CandidateGenerator.from_family_spec(spec)
+        pool: list[StrategyCandidate] = []
+        attempts = 0
+        while len(pool) < target and attempts < target * 8:
+            attempts += 1
+            seed_i = stable_seed(cfg.seed, spec.family_id, attempts, salt=997)
+            try:
+                cand = generator.generate(seed=seed_i)
+            except Exception:  # noqa: BLE001
+                continue
+            if cand.strategy_family == "dsl_generated":
+                raise RuntimeError(
+                    f"FAMILY_LABEL_COLLAPSE: generated dsl_generated under {spec.family_id!r}"
+                )
+            if cand.candidate_id in seen:
+                continue
+            seen.add(cand.candidate_id)
+            # Force generation index 0 for the initial queue.
+            if cand.generation != 0:
+                from discovery.candidate import build_candidate
+
+                cand = build_candidate(
+                    entry_tree=cand.entry_tree,
+                    exit_tree=cand.exit_tree,
+                    stop=cand.stop,
+                    target=cand.target,
+                    sizing=cand.sizing,
+                    regime_gates=cand.regime_gates,
+                    strategy_family=cand.strategy_family,
+                    creation_method=cand.creation_method,
+                    generation=0,
+                    parent_ids=cand.parent_ids,
+                    grammar_version=cand.grammar_version,
+                    feature_set_version=cand.feature_set_version,
+                    cost_model_version=cand.cost_model_version,
+                    asset_universe=cand.asset_universe,
+                    random_seed=cand.random_seed,
+                    family_provenance=dict(cand.family_provenance or {}),
+                )
+                if cand.candidate_id in seen:
+                    continue
+                seen.add(cand.candidate_id)
+            pool.append(cand)
+            self._emit(
+                "CANDIDATE_GENERATED",
+                {
+                    "candidate_id": cand.candidate_id,
+                    "family": cand.strategy_family,
+                    "family_id": spec.family_id,
+                    "generation": 0,
+                },
+            )
+        return pool
+
+    def _select_parents_deterministic(
+        self,
+        *,
+        eligible: list[tuple[StrategyCandidate, EvaluationRecord, float]],
+        n_parents: int,
+    ) -> tuple[list[StrategyCandidate], dict[str, str]]:
+        """Rank by fitness then candidate_id; record deterministic selection reasons."""
+        ranked = sorted(
+            eligible,
+            key=lambda t: (-float(t[2]), t[0].candidate_id),
+        )
+        selected = [t[0] for t in ranked[: max(0, n_parents)]]
+        reasons: dict[str, str] = {}
+        for rank, cand in enumerate(selected):
+            reasons[cand.candidate_id] = (
+                f"deterministic_structural_fitness_rank_{rank}"
+            )
+        return selected, reasons
+
+    def _run_family_local_evolution(
+        self,
+        *,
+        families: list[FamilySpec],
+        gen_alloc: dict[str, int],
+        wfo_alloc: dict[str, int],
+    ) -> MultiFamilyCampaignResult:
+        """Deterministic per-family generation queues with mutation/crossover."""
+        cfg = self.config
+        t0 = time.perf_counter()
+        pipeline = PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING
+        family_ids = [f.family_id for f in families]
+        records_by_family: dict[str, list[EvaluationRecord]] = {fid: [] for fid in family_ids}
+        full_wfo_counts: dict[str, int] = {fid: 0 for fid in family_ids}
+        generated_counts: dict[str, int] = {fid: 0 for fid in family_ids}
+        cand_by_id: dict[str, StrategyCandidate] = {}
+        generation_records: list[GenerationRecord] = []
+        seen_ids: set[str] = set()
+        campaign_generated = 0
+        campaign_evaluated = 0
+        campaign_full_wfo = 0
+        max_evaluated = (
+            int(cfg.max_evaluated_candidates)
+            if cfg.max_evaluated_candidates is not None
+            else int(cfg.total_candidate_budget)
+        )
+        stop_reason = "multi_family_evolutionary_wfo_screening_completed"
+        completed_generation_count = 0
+
+        self._emit(
+            "MULTI_FAMILY_EVOLUTION_STARTED",
+            {"families": family_ids, "gen_alloc": gen_alloc, "wfo_alloc": wfo_alloc},
+        )
+
+        for spec in families:
+            fid = spec.family_id
+            grammar = spec.to_grammar()
+            mutator = Mutator(grammar=grammar)
+            crossover = Crossover(grammar=grammar)
+            family_gen_cap = int(gen_alloc[fid])
+            family_wfo_cap = int(wfo_alloc[fid])
+            initial_n = max(2, min(int(cfg.population_size), family_gen_cap))
+            # Leave headroom for descendants when allocation allows.
+            if family_gen_cap > initial_n + 1:
+                initial_n = min(initial_n, max(2, family_gen_cap // 2))
+
+            # --- Generation 0 queue (initial population only) ---
+            gen_queues: dict[int, list[StrategyCandidate]] = {
+                0: self._generate_initial_population(
+                    spec=spec, target=initial_n, seen=seen_ids
+                )
+            }
+            if len(gen_queues[0]) < 2:
+                raise RuntimeError(
+                    f"FAMILY_GENERATION_SHORTFALL: {fid} produced {len(gen_queues[0])} "
+                    f"< 2 required for family-local evolution"
+                )
+            generated_counts[fid] = len(gen_queues[0])
+            campaign_generated += len(gen_queues[0])
+            for c in gen_queues[0]:
+                cand_by_id[c.candidate_id] = c
+
+            best_score_so_far = float("-inf")
+            stagnation_count = 0
+            family_stop: str | None = None
+            population: list[StrategyCandidate] = list(gen_queues[0])
+            rec_by_id: dict[str, EvaluationRecord] = {}
+
+            max_gen_index = max(0, int(cfg.evolution_generations) - 1)
+            for gen in range(0, max_gen_index + 1):
+                runtime = time.perf_counter() - t0
+                if runtime >= float(cfg.max_runtime_seconds):
+                    family_stop = "max_runtime_seconds"
+                    stop_reason = "max_runtime_seconds"
+                    break
+                if campaign_generated > cfg.total_candidate_budget:
+                    family_stop = "total_candidate_budget"
+                    stop_reason = "total_candidate_budget"
+                    break
+                if campaign_evaluated >= max_evaluated:
+                    family_stop = "max_evaluated_candidates"
+                    stop_reason = "max_evaluated_candidates"
+                    break
+                if campaign_full_wfo >= cfg.max_full_wfo:
+                    family_stop = "max_full_wfo"
+                    stop_reason = "max_full_wfo"
+                    break
+                if generated_counts[fid] > family_gen_cap:
+                    family_stop = "family_generated_allocation"
+                    stop_reason = "family_generated_allocation"
+                    break
+                if full_wfo_counts[fid] >= family_wfo_cap and gen > 0:
+                    # Allow finishing current queue only if WFO remains; else stop breeding.
+                    pass
+
+                # Breed descendants into the NEXT generation queue before evaluating
+                # the current generation only when gen>0 was already filled; for gen0
+                # the queue is the initial population. For gen>=1, create the queue
+                # from parents of the previous generation first if missing.
+                if gen > 0 and gen not in gen_queues:
+                    # Should have been filled at end of previous iteration.
+                    break
+
+                queue = list(gen_queues.get(gen, []))
+                if not queue:
+                    family_stop = "empty_generation_queue"
+                    break
+
+                # Evaluate ONLY this generation's queue (never append behind older randoms).
+                remaining_wfo = family_wfo_cap - full_wfo_counts[fid]
+                remaining_campaign_wfo = cfg.max_full_wfo - campaign_full_wfo
+                remaining_eval = max_evaluated - campaign_evaluated
+                eval_cap = min(len(queue), remaining_eval)
+                if remaining_wfo <= 0 or remaining_campaign_wfo <= 0:
+                    if gen == 0:
+                        # Still need at least structural evaluation attempts within WFO cap 0?
+                        # With zero WFO allocation, stop.
+                        family_stop = "family_full_wfo_allocation"
+                        stop_reason = "max_full_wfo"
+                        break
+                    family_stop = "family_full_wfo_allocation"
+                    stop_reason = "max_full_wfo"
+                    break
+
+                wfo_room = min(remaining_wfo, remaining_campaign_wfo, eval_cap)
+                ev = self._make_evaluator(
+                    spec=spec,
+                    wfo_cap=max(wfo_room, 1),
+                    gen_cap=max(family_gen_cap, len(queue)),
+                )
+                self._bind_evaluator_features(ev)
+
+                greg = GenerationRecord(
+                    family_id=fid,
+                    generation=gen,
+                    input_population_ids=[c.candidate_id for c in population],
+                    minimum_required_improvement=float(cfg.minimum_improvement),
+                    previous_best_score=(
+                        None if best_score_so_far == float("-inf") else float(best_score_so_far)
+                    ),
+                )
+                take = queue[:eval_cap]
+                greg.generated_count = len(queue)
+                valid_eval_count = 0
+                gen_scores: list[float] = []
+
+                for cand in take:
+                    if campaign_evaluated >= max_evaluated:
+                        family_stop = "max_evaluated_candidates"
+                        stop_reason = "max_evaluated_candidates"
+                        break
+                    if full_wfo_counts[fid] >= family_wfo_cap and campaign_full_wfo >= 0:
+                        # Still allow non-WFO rejects (invalid) but evaluator may no-op WFO.
+                        if ev.counters.full_wfo >= ev.budget.max_full_wfo_evaluations:
+                            # Rebuild evaluator with zero remaining room — skip further WFO.
+                            if full_wfo_counts[fid] >= family_wfo_cap:
+                                family_stop = family_stop or "family_full_wfo_allocation"
+                                break
+                    if time.perf_counter() - t0 >= float(cfg.max_runtime_seconds):
+                        family_stop = "max_runtime_seconds"
+                        stop_reason = "max_runtime_seconds"
+                        break
+
+                    assert cand.generation == gen, (
+                        f"candidate {cand.candidate_id} generation={cand.generation} "
+                        f"!= queue generation={gen}"
+                    )
+                    prev_campaign_wfo = campaign_full_wfo
+                    prev_family_wfo = full_wfo_counts[fid]
+                    rec = self._evaluate_candidate(
+                        ev=ev,
+                        cand=cand,
+                        full_wfo_counts=full_wfo_counts,
+                        fid=fid,
+                    )
+                    records_by_family[fid].append(rec)
+                    rec_by_id[cand.candidate_id] = rec
+                    campaign_evaluated += 1
+                    greg.evaluated_candidate_ids.append(cand.candidate_id)
+                    greg.evaluated_count += 1
+
+                    if full_wfo_counts[fid] > prev_family_wfo:
+                        delta = full_wfo_counts[fid] - prev_family_wfo
+                        campaign_full_wfo += delta
+                        greg.completed_full_wfo_candidate_ids.append(cand.candidate_id)
+                        greg.completed_full_wfo_count += delta
+
+                    parent_status, is_sq, reason = self.classify_parent_eligibility(rec)
+                    greg.parent_eligibility[cand.candidate_id] = parent_status
+                    if is_sq:
+                        greg.score_qualified_candidate_ids.append(cand.candidate_id)
+                    if parent_status != NOT_PARENT_ELIGIBLE and rec.fitness is not None:
+                        score_val = float(rec.fitness.fitness)
+                        if score_val == score_val and abs(score_val) != float("inf"):  # finite
+                            valid_eval_count += 1
+                            gen_scores.append(score_val)
+                        elif parent_status == STRUCTURAL_PARENT_ELIGIBLE:
+                            # Structurally valid but non-finite fitness still counts as a
+                            # completed valid evaluation for stagnation gating.
+                            valid_eval_count += 1
+                    _ = reason
+                    _ = prev_campaign_wfo
+
+                generation_best = max(gen_scores) if gen_scores else None
+                greg.best_generation_score = generation_best
+                greg.generation_best_score = generation_best
+                min_imp = float(cfg.minimum_improvement)
+                if valid_eval_count > 0:
+                    prev = best_score_so_far
+                    if prev == float("-inf"):
+                        # Establish baseline after the first completed generation.
+                        best_score_so_far = (
+                            float(generation_best) if generation_best is not None else 0.0
+                        )
+                        stagnation_count = 0
+                        greg.improvement = None
+                    else:
+                        if generation_best is None:
+                            improvement = 0.0
+                        else:
+                            improvement = float(generation_best - prev)
+                        greg.improvement = float(improvement)
+                        if improvement < min_imp:
+                            stagnation_count += 1
+                        else:
+                            stagnation_count = 0
+                            best_score_so_far = float(generation_best)
+                    greg.best_score_so_far = float(best_score_so_far)
+                else:
+                    greg.improvement = None
+                    greg.best_score_so_far = (
+                        None
+                        if best_score_so_far == float("-inf")
+                        else float(best_score_so_far)
+                    )
+
+                greg.stagnation_count = stagnation_count
+                completed_generation_count += 1
+
+                if (
+                    valid_eval_count > 0
+                    and stagnation_count >= int(cfg.stagnation_generations)
+                ):
+                    family_stop = FAMILY_STAGNATION
+                    stop_reason = FAMILY_STAGNATION
+                    greg.stop_reason = FAMILY_STAGNATION
+                    generation_records.append(greg)
+                    break
+
+                # Update population from evaluated structural parents in this generation.
+                eligible_scored: list[tuple[StrategyCandidate, EvaluationRecord, float]] = []
+                for cid in greg.evaluated_candidate_ids:
+                    rec = rec_by_id[cid]
+                    status, _, sel_reason = self.classify_parent_eligibility(rec)
+                    if status is NOT_PARENT_ELIGIBLE:
+                        continue
+                    fit = float(rec.fitness.fitness) if rec.fitness is not None else float("-inf")
+                    eligible_scored.append((cand_by_id[cid], rec, fit))
+                    _ = sel_reason
+
+                # Also keep prior structural parents that remain eligible.
+                for prev_c in population:
+                    if prev_c.candidate_id in {e[0].candidate_id for e in eligible_scored}:
+                        continue
+                    prev_rec = rec_by_id.get(prev_c.candidate_id)
+                    if prev_rec is None:
+                        continue
+                    status, _, _ = self.classify_parent_eligibility(prev_rec)
+                    if status is NOT_PARENT_ELIGIBLE:
+                        continue
+                    fit = (
+                        float(prev_rec.fitness.fitness)
+                        if prev_rec.fitness is not None
+                        else float("-inf")
+                    )
+                    eligible_scored.append((prev_c, prev_rec, fit))
+
+                n_parents = min(max(2, int(cfg.population_size)), len(eligible_scored))
+                parents, parent_reasons = self._select_parents_deterministic(
+                    eligible=eligible_scored, n_parents=n_parents
+                )
+                greg.selected_parent_ids = [p.candidate_id for p in parents]
+                greg.parent_selection_reasons = dict(parent_reasons)
+                population = list(parents) if parents else list(population)
+
+                # If this was the last generation index, do not breed further.
+                if gen >= max_gen_index or family_stop:
+                    greg.stop_reason = family_stop or "evolution_generations_completed"
+                    generation_records.append(greg)
+                    break
+
+                # --- Breed into a SEPARATE next-generation queue ---
+                next_gen = gen + 1
+                next_queue: list[StrategyCandidate] = []
+                remaining_gen_budget = family_gen_cap - generated_counts[fid]
+                remaining_campaign_gen = cfg.total_candidate_budget - campaign_generated
+                breed_budget = min(
+                    remaining_gen_budget,
+                    remaining_campaign_gen,
+                    max(int(cfg.population_size), 2),
+                )
+
+                if breed_budget <= 0 or len(parents) < 1:
+                    greg.stop_reason = family_stop or "budget_exhausted_before_breed"
+                    generation_records.append(greg)
+                    break
+
+                breed_seed_base = int(stable_seed(cfg.seed, fid, next_gen, salt=4242) % (2**31 - 1))
+
+                def _accept_descendant(
+                    child: StrategyCandidate,
+                    *,
+                    kind: str,
+                    family_ref: str,
+                ) -> bool:
+                    nonlocal campaign_generated
+                    if len(next_queue) >= breed_budget:
+                        return False
+                    if child.candidate_id in seen_ids:
+                        return False
+                    if child.generation != next_gen:
+                        return False
+                    if child.strategy_family != family_ref:
+                        return False
+                    if not self.candidate_within_family_grammar(child, grammar):
+                        return False
+                    seen_ids.add(child.candidate_id)
+                    next_queue.append(child)
+                    cand_by_id[child.candidate_id] = child
+                    generated_counts[fid] += 1
+                    campaign_generated += 1
+                    if kind == "crossover":
+                        greg.crossover_candidate_ids.append(child.candidate_id)
+                    else:
+                        greg.mutation_candidate_ids.append(child.candidate_id)
+                    return True
+
+                def _try_mutate(parent: StrategyCandidate, salt: int) -> bool:
+                    for attempt in range(32):
+                        if len(next_queue) >= breed_budget:
+                            return False
+                        mut_seed = (breed_seed_base + salt + attempt * 97) % (2**31 - 1)
+                        try:
+                            mutant = mutator.mutate(
+                                parent,
+                                seed=mut_seed,
+                                strict=True,
+                                generation=next_gen,
+                            )
+                        except MutationRejected:
+                            continue
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if _accept_descendant(
+                            mutant, kind="mutation", family_ref=parent.strategy_family
+                        ):
+                            return True
+                    return False
+
+                # Guarantee a mutation slot first when budget allows, then crossover,
+                # then fill remaining slots with further mutations.
+                if parents:
+                    _try_mutate(parents[0], salt=11)
+
+                if len(parents) >= 2 and len(next_queue) < breed_budget:
+                    pa, pb = parents[0], parents[1]
+                    for attempt in range(24):
+                        if greg.crossover_candidate_ids:
+                            break
+                        if len(next_queue) >= breed_budget:
+                            break
+                        try:
+                            children = crossover.crossover(
+                                pa,
+                                pb,
+                                seed=(breed_seed_base + attempt * 31) % (2**31 - 1),
+                                strict=True,
+                                require_same_family=True,
+                                generation=next_gen,
+                            )
+                        except CrossoverError:
+                            continue
+                        for child in children:
+                            _accept_descendant(
+                                child, kind="crossover", family_ref=pa.strategy_family
+                            )
+
+                for i, parent in enumerate(parents):
+                    if len(next_queue) >= breed_budget:
+                        break
+                    _try_mutate(parent, salt=17 * (i + 1) + 100)
+
+                gen_queues[next_gen] = next_queue
+                greg.stop_reason = None
+                generation_records.append(greg)
+                if not next_queue:
+                    family_stop = "no_valid_descendants"
+                    break
+
+                self._emit(
+                    "FAMILY_GENERATION_COMPLETED",
+                    {
+                        "family_id": fid,
+                        "generation": gen,
+                        "full_wfo": full_wfo_counts[fid],
+                        "stagnation_count": stagnation_count,
+                    },
+                )
+
+            if family_stop and (
+                not generation_records
+                or generation_records[-1].family_id != fid
+                or generation_records[-1].stop_reason is None
+            ):
+                pass  # stop_reason already recorded on last greg when possible
+
+        family_stats = []
+        for spec in families:
+            st = self._stats_from_records(
+                spec=spec,
+                records=records_by_family[spec.family_id],
+                generated=generated_counts[spec.family_id],
+                allocation_generated=gen_alloc[spec.family_id],
+                allocation_wfo=wfo_alloc[spec.family_id],
+                full_wfo=full_wfo_counts[spec.family_id],
+            )
+            family_stats.append(st)
+
+        # Budget invariant assertions (soft: encode into stop / payload).
+        assert campaign_generated <= cfg.total_candidate_budget + 0  # noqa: S101
+        assert campaign_full_wfo <= cfg.max_full_wfo
+        assert campaign_evaluated <= max_evaluated
+        for fid in family_ids:
+            assert generated_counts[fid] <= gen_alloc[fid]
+            assert full_wfo_counts[fid] <= wfo_alloc[fid]
+
+        rankings: list[dict[str, Any]] = []
+        for st in family_stats:
+            for cid in st.best_candidate_ids:
+                rankings.append(
+                    {
+                        "candidate_id": cid,
+                        "fitness": st.best_fitness,
+                        "ranking_source": "validation_oos",
+                        "family": st.family_id,
+                    }
+                )
+        empty_reasons = {k: list(v) for k, v in EMPTY_COLLECTIONS_REASONS.items()}
+        discovery = DiscoveryRunResult(
+            discovery_run_id=self.discovery_run_id,
+            budget_id="budget_multi_family",
+            stop_reason=stop_reason,
+            generations=completed_generation_count,
+            evaluated=sum(s.evaluated for s in family_stats),
+            registered_trials=len(self.registry.all_trials()),
+            rankings=rankings,
+            finalists=[],
+            promoted=[],
+            portfolio_pool={"members": [], "size": 0},
+            clusters=[],
+            reproducible_fingerprint="",
+            pipeline_level=pipeline,
+            post_wfo_pipeline_complete=False,
+            score_qualified_meaning=SCORE_QUALIFIED_MEANING,
+            empty_collections_reasons=empty_reasons,
+            research_shortlist=[],
+            vault_candidates=[],
+            paper_candidates=[],
+        )
+        allocation_payload = {
+            "generated": gen_alloc,
+            "full_wfo_initial": wfo_alloc,
+            "full_wfo_early": wfo_alloc,
+            "full_wfo_final": wfo_alloc,
+            "adaptive_reallocation": False,
+            "allocation_detail": {},
+            "min_candidates_per_family": cfg.min_candidates_per_family,
+            "total_candidate_budget": cfg.total_candidate_budget,
+            "max_full_wfo": cfg.max_full_wfo,
+            "family_local_evolution": True,
+            "allow_cross_family_crossover": False,
+            "pipeline_level": pipeline,
+            "post_wfo_pipeline_complete": False,
+            "completed_generations": completed_generation_count,
+            "campaign_generated": campaign_generated,
+            "campaign_evaluated": campaign_evaluated,
+            "campaign_full_wfo": campaign_full_wfo,
+        }
+        fingerprint = sha256_json(
+            {
+                "families": [f.canonical_hash() for f in families],
+                "allocation": allocation_payload,
+                "config": cfg.as_dict(),
+                "pipeline_level": pipeline,
+                "generation_records": [g.as_dict() for g in generation_records],
+            }
+        )
+        discovery.reproducible_fingerprint = fingerprint
+        return MultiFamilyCampaignResult(
+            campaign_id=self.discovery_run_id,
+            families=families,
+            family_stats=family_stats,
+            budget_allocation=allocation_payload,
+            discovery_results=[discovery],
+            aggregated_stop_reason=stop_reason,
+            reproducible_fingerprint=fingerprint,
+            pipeline_level=pipeline,
+            post_wfo_pipeline_complete=False,
+            score_qualified_meaning=SCORE_QUALIFIED_MEANING,
+            score_qualified_does_not_mean=SCORE_QUALIFIED_DOES_NOT_MEAN,
+            post_wfo_blocked_reasons=list(POST_WFO_BLOCKED_REASONS),
+            empty_collections_reasons=empty_reasons,
+            research_shortlist=[],
+            vault_candidates=[],
+            paper_candidates=[],
+            generation_records=generation_records,
+        )
+
     def run(self) -> MultiFamilyCampaignResult:
         cfg = self.config
-        # Incomplete Phase-3 features: fail fast rather than silently partial-run.
-        if cfg.family_local_evolution:
-            raise RuntimeError(FAMILY_LOCAL_EVOLUTION_NOT_READY)
+        # Cross-family crossover remains explicitly unsupported.
         if cfg.allow_cross_family_crossover:
             raise RuntimeError(CROSS_FAMILY_CROSSOVER_UNSUPPORTED)
 
@@ -558,6 +1342,15 @@ class MultiFamilyCampaign:
             max_full_wfo=cfg.max_full_wfo,
             min_per_family=wfo_floor,
         )
+
+        if cfg.family_local_evolution:
+            # Evolution uses the same equal allocations; adaptive reallocation is
+            # intentionally not applied inside the family-local generation loop.
+            return self._run_family_local_evolution(
+                families=families,
+                gen_alloc=gen_alloc,
+                wfo_alloc=initial_wfo,
+            )
 
         self._emit(
             "MULTI_FAMILY_STARTED",
@@ -650,12 +1443,7 @@ class MultiFamilyCampaign:
             ev = self._make_evaluator(
                 spec=spec, wfo_cap=quota, gen_cap=max(len(pool[fid]), 1)
             )
-            avail = getattr(self.backend, "available_feature_ids", None)
-            if avail is not None:
-                ev.available_feature_ids = frozenset(avail)
-                ev.dataset_capabilities = tuple(
-                    getattr(self.backend, "dataset_capabilities", ()) or ()
-                )
+            self._bind_evaluator_features(ev)
             for cand in take:
                 # Authoritative counter delta: the evaluator only advances
                 # counters.full_wfo when a real WFO evaluation completed and
@@ -665,12 +1453,11 @@ class MultiFamilyCampaign:
                 # truth — outcomes like PRECHECK_FAILED, INVALID_DSL_TYPE,
                 # DUPLICATE_SKIPPED, FEATURE_UNAVAILABLE, or an evaluation
                 # exception never move this counter.
-                prev_full_wfo = ev.counters.full_wfo
-                rec = ev.evaluate(cand)
+                rec = self._evaluate_candidate(
+                    ev=ev, cand=cand, full_wfo_counts=full_wfo_counts, fid=fid
+                )
                 records_by_family[fid].append(rec)
                 evaluated_ids[fid].add(cand.candidate_id)
-                if ev.counters.full_wfo > prev_full_wfo:
-                    full_wfo_counts[fid] += 1
                 # FEATURE_UNAVAILABLE must not consume Full WFO budget or
                 # count toward early-phase scoring/candidate tracking.
                 if rec.outcome is EvalOutcome.FEATURE_UNAVAILABLE:
@@ -687,9 +1474,6 @@ class MultiFamilyCampaign:
                 "FAMILY_PHASE_COMPLETED",
                 {"family_id": spec.family_id, "phase": 1, "full_wfo": full_wfo_counts[spec.family_id]},
             )
-
-        # Family-local evolution is intentionally not implemented yet.
-        # Enabling it fails at the start of run() with FAMILY_LOCAL_EVOLUTION_NOT_READY.
 
         final_wfo = dict(initial_wfo)
         alloc_report: dict[str, dict[str, Any]] = {}
@@ -835,4 +1619,5 @@ def family_campaign_from_config(raw: dict[str, Any] | None) -> FamilyCampaignCon
         family_local_evolution=bool(raw.get("family_local_evolution", False)),
         evolution_generations=int(raw.get("evolution_generations", 2)),
         allow_cross_family_crossover=bool(raw.get("allow_cross_family_crossover", False)),
+        minimum_improvement=float(raw.get("minimum_improvement", 1e-4)),
     )

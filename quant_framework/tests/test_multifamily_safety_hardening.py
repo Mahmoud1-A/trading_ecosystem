@@ -14,8 +14,8 @@ from discovery.evaluator import SyntheticOOSBackend
 from discovery.multi_family_campaign import (
     CROSS_FAMILY_CROSSOVER_UNSUPPORTED,
     EMPTY_COLLECTIONS_REASONS,
-    FAMILY_LOCAL_EVOLUTION_NOT_READY,
     NOT_RESEARCH_SHORTLISTED,
+    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING,
     PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING,
     POST_WFO_BLOCKED_REASONS,
     POST_WFO_PIPELINE_NOT_RUN,
@@ -168,16 +168,28 @@ class TestNoFalseFinalistsOrPromotions:
 
 
 class TestIncompleteEvolutionGuards:
-    def test_family_local_evolution_fails_fast(self, tmp_path: Path) -> None:
+    def test_family_local_evolution_runs_evolutionary_pipeline(self, tmp_path: Path) -> None:
         registry = ExperimentRegistry(tmp_path / "reg_evo")
         campaign = MultiFamilyCampaign(
-            config=_cfg(family_local_evolution=True),
+            config=_cfg(
+                family_local_evolution=True,
+                evolution_generations=2,
+                population_size=2,
+                stagnation_generations=99,
+            ),
             registry=registry,
             backend=SyntheticOOSBackend(),
-            discovery_run_id="test_evo_not_ready",
+            discovery_run_id="test_evo_ready",
         )
-        with pytest.raises(RuntimeError, match=FAMILY_LOCAL_EVOLUTION_NOT_READY):
-            campaign.run()
+        result = campaign.run()
+        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING
+        assert result.post_wfo_pipeline_complete is False
+        assert result.discovery_results[0].finalists == []
+        assert result.discovery_results[0].promoted == []
+        assert result.discovery_results[0].clusters == []
+        assert result.research_shortlist == []
+        assert result.generation_records
+        assert result.discovery_results[0].generations == len(result.generation_records)
 
     def test_cross_family_crossover_fails_fast(self, tmp_path: Path) -> None:
         registry = ExperimentRegistry(tmp_path / "reg_xover")

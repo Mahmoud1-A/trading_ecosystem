@@ -74,27 +74,72 @@ class Crossover:
                 continue
         raise CrossoverError("no compatible crossover sites")
 
+    @staticmethod
+    def _family_key(cand: StrategyCandidate) -> str:
+        prov = cand.family_provenance or {}
+        fid = prov.get("family_id")
+        if fid:
+            return str(fid)
+        return str(cand.strategy_family)
+
     def crossover(
         self,
         parent_a: StrategyCandidate,
         parent_b: StrategyCandidate,
         *,
         seed: int,
+        strict: bool = False,
+        require_same_family: bool = False,
+        generation: int | None = None,
     ) -> tuple[StrategyCandidate, StrategyCandidate]:
+        if require_same_family or strict:
+            fa = self._family_key(parent_a)
+            fb = self._family_key(parent_b)
+            if fa != fb:
+                raise CrossoverError(
+                    f"family-local crossover requires same FamilySpec; got {fa!r} vs {fb!r}"
+                )
+            if parent_a.strategy_family != parent_b.strategy_family:
+                raise CrossoverError(
+                    "family-local crossover requires matching strategy_family "
+                    f"{parent_a.strategy_family!r} vs {parent_b.strategy_family!r}"
+                )
+
         rng = np.random.default_rng(seed)
         try:
             e1, e2 = self.crossover_trees(parent_a.entry_tree, parent_b.entry_tree, rng)
             e1 = repair_entry(clamp_lookbacks(e1, self.grammar), self.grammar)
             e2 = repair_entry(clamp_lookbacks(e2, self.grammar), self.grammar)
-        except (CrossoverError, DSLValidationError):
+        except (CrossoverError, DSLValidationError) as exc:
+            if strict:
+                raise CrossoverError(f"crossover tree failure: {exc}") from exc
             e1, e2 = parent_a.entry_tree, parent_b.entry_tree
+
+        child_generation = (
+            int(generation)
+            if generation is not None
+            else max(parent_a.generation, parent_b.generation) + 1
+        )
 
         def _build(entry: ExprNode, parents: tuple[str, ...], s: int) -> StrategyCandidate:
             check = structural_precheck(
-                entry=entry, exit=parent_a.exit_tree, regime_gates=(), grammar=self.grammar, seed=s
+                entry=entry,
+                exit=parent_a.exit_tree,
+                regime_gates=parent_a.regime_gates,
+                grammar=self.grammar,
+                seed=s,
             )
             if not check.accepted:
+                if strict:
+                    raise CrossoverError(f"structural_precheck:{check.reason}")
                 entry = parent_a.entry_tree
+            prov = dict(parent_a.family_provenance or {})
+            prov.update(
+                {
+                    "crossover_parent_ids": list(parents),
+                    "source_parent_ids": list(parents),
+                }
+            )
             cand = build_candidate(
                 entry_tree=entry,
                 exit_tree=parent_a.exit_tree,
@@ -102,14 +147,14 @@ class Crossover:
                 target=parent_a.target,
                 strategy_family=parent_a.strategy_family,
                 creation_method=CreationMethod.CROSSOVER,
-                generation=max(parent_a.generation, parent_b.generation) + 1,
+                generation=child_generation,
                 parent_ids=parents,
                 grammar_version=parent_a.grammar_version,
                 feature_set_version=parent_a.feature_set_version,
                 cost_model_version=parent_a.cost_model_version,
                 asset_universe=parent_a.asset_universe,
                 random_seed=s,
-                family_provenance=dict(parent_a.family_provenance or {}),
+                family_provenance=prov,
             )
             try:
                 check_strategy_trees(
@@ -117,17 +162,21 @@ class Crossover:
                     cand.exit_tree,
                     cand.stop,
                     cand.target,
+                    *cand.regime_gates,
                     operation="crossover",
                     candidate_id=cand.candidate_id,
                     parent_ids=parents,
                 )
             except DSLValidationError as exc:
-                raise parse_dsl_validation_error(
+                err = parse_dsl_validation_error(
                     exc,
                     operation="crossover",
                     candidate_id=cand.candidate_id,
                     parent_ids=parents,
-                ) from exc
+                )
+                if strict:
+                    raise CrossoverError(str(err)) from err
+                raise err from exc
             return cand
 
         return (
