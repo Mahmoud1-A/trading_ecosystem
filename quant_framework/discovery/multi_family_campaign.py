@@ -59,8 +59,8 @@ _FOLLOW_FEATURES = frozenset(
         "price.breakout_distance_20",
     }
 )
-# Breakout context features inherit follow economics only inside breakout families.
-_BREAKOUT_CONTEXT_FEATURES = frozenset(
+# Volatility / liquidity / participation context — never casts a direction vote.
+_CONTEXT_ONLY_FEATURES = frozenset(
     {
         "vol.range_compression_20",
         "liq.volume_pct_20",
@@ -143,13 +143,17 @@ def _unwrap_abs_feature(node: ExprNode) -> tuple[str | None, bool]:
 
 
 def _mechanism_for_feature(family_id: str, feature_id: str) -> str | None:
-    """Return ``'fade'``, ``'follow'``, or ``None`` if feature is not directional."""
+    """Return ``'fade'``, ``'follow'``, or ``None`` if feature is not directional.
+
+    Context-only features (compression, volume participation, etc.) never vote.
+    """
+    _ = family_id
+    if feature_id in _CONTEXT_ONLY_FEATURES:
+        return None
     if feature_id in _FADE_FEATURES:
         # Gap and displacement features are fade economics regardless of family label.
         return "fade"
     if feature_id in _FOLLOW_FEATURES:
-        return "follow"
-    if feature_id in _BREAKOUT_CONTEXT_FEATURES and family_id == "breakout":
         return "follow"
     return None
 
@@ -208,6 +212,8 @@ def validate_family_direction_coherence(
         "comparison_operator": None,
         "threshold_value": None,
         "expected_direction": None,
+        "directional_evidence": [],
+        "context_evidence": [],
         "coherence_reason": None,
     }
 
@@ -249,7 +255,8 @@ def validate_family_direction_coherence(
     _ = prov.get("entry_pattern") or prov.get("pattern")
 
     expected_votes: list[str] = []
-    evidence: list[dict[str, Any]] = []
+    directional_evidence: list[dict[str, Any]] = []
+    context_evidence: list[dict[str, Any]] = []
     abs_only_directional = False
 
     for node in condition.walk():
@@ -261,28 +268,40 @@ def validate_family_direction_coherence(
         feature_id, wrapped_abs = _unwrap_abs_feature(left)
         if feature_id is None:
             continue
+        thr = _numeric_threshold(right)
+        # Context features may be recorded but never cast a direction vote.
+        if feature_id in _CONTEXT_ONLY_FEATURES:
+            context_evidence.append(
+                {
+                    "condition_feature": feature_id,
+                    "comparison_operator": node.name,
+                    "threshold_value": thr,
+                    "wrapped_abs": wrapped_abs,
+                    "role": "context",
+                }
+            )
+            continue
         mechanism = _mechanism_for_feature(family_id, feature_id)
         if mechanism is None:
             continue
         if wrapped_abs:
             # ABS(signed_feature) alone cannot prove trade direction.
             abs_only_directional = True
-            evidence.append(
+            directional_evidence.append(
                 {
                     "condition_feature": feature_id,
                     "comparison_operator": node.name,
-                    "threshold_value": _numeric_threshold(right),
+                    "threshold_value": thr,
                     "coherence_reason": "abs_signed_feature_ambiguous",
                 }
             )
             continue
-        thr = _numeric_threshold(right)
         expected, reason = _expected_direction_from_comparison(
             mechanism=mechanism,
             op_name=node.name,
             threshold=thr,
         )
-        evidence.append(
+        directional_evidence.append(
             {
                 "condition_feature": feature_id,
                 "comparison_operator": node.name,
@@ -292,14 +311,22 @@ def validate_family_direction_coherence(
             }
         )
         if expected is None:
-            details = {**base_details, **evidence[-1]}
-            details["coherence_reason"] = reason
+            details = {
+                **base_details,
+                **directional_evidence[-1],
+                "directional_evidence": directional_evidence,
+                "context_evidence": context_evidence,
+                "coherence_reason": reason,
+            }
             return DirectionCoherenceResult(
                 coherent=False,
                 rejection_reason=FAMILY_DIRECTION_INCOHERENT,
                 details=details,
             )
         expected_votes.append(expected)
+
+    base_details["directional_evidence"] = directional_evidence
+    base_details["context_evidence"] = context_evidence
 
     if not expected_votes:
         reason = (
@@ -308,8 +335,23 @@ def validate_family_direction_coherence(
             else "no_provable_directional_condition"
         )
         details = {**base_details, "coherence_reason": reason}
-        if evidence:
-            details.update(evidence[0])
+        if directional_evidence:
+            details.update(
+                {
+                    k: v
+                    for k, v in directional_evidence[0].items()
+                    if k != "coherence_reason"
+                }
+            )
+            details["coherence_reason"] = reason
+        elif context_evidence:
+            details.update(
+                {
+                    k: v
+                    for k, v in context_evidence[0].items()
+                    if k not in {"role", "wrapped_abs"}
+                }
+            )
             details["coherence_reason"] = reason
         return DirectionCoherenceResult(
             coherent=False,
@@ -320,8 +362,10 @@ def validate_family_direction_coherence(
     if len(set(expected_votes)) != 1:
         details = {
             **base_details,
-            **(evidence[0] if evidence else {}),
+            **(directional_evidence[0] if directional_evidence else {}),
             "expected_direction": sorted(set(expected_votes)),
+            "directional_evidence": directional_evidence,
+            "context_evidence": context_evidence,
             "coherence_reason": "conflicting_directional_conditions",
         }
         return DirectionCoherenceResult(
@@ -331,11 +375,13 @@ def validate_family_direction_coherence(
         )
 
     expected_direction = expected_votes[0]
-    primary = evidence[0] if evidence else {}
+    primary = directional_evidence[0] if directional_evidence else {}
     details = {
         **base_details,
         **primary,
         "expected_direction": expected_direction,
+        "directional_evidence": directional_evidence,
+        "context_evidence": context_evidence,
     }
     if entry_direction != expected_direction:
         details["coherence_reason"] = (
