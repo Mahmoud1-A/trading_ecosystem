@@ -1,0 +1,54 @@
+name: Apply Alpha Miner budget-drain hardening
+
+on:
+  push:
+    branches:
+      - fix/alpha-budget-drain
+    paths:
+      - scripts/apply_alpha_budget_drain_hardening.py
+      - .github/workflows/apply-alpha-budget-drain.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/alpha-budget-drain
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply targeted patch
+        run: python scripts/apply_alpha_budget_drain_hardening.py
+
+      - name: Install framework
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "./quant_framework[dev]"
+
+      - name: Run focused regression tests
+        working-directory: quant_framework
+        run: |
+          python -m pytest -q \
+            tests/test_alpha_budget_drain_hardening.py \
+            tests/test_alpha_miner.py \
+            tests/test_control_plane_alpha_dashboard.py \
+            tests/test_real_data_alpha_miner_backend.py
+
+      - name: Commit generated code changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add quant_framework
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit"
+          else
+            git commit -m "Fix Alpha Miner stress budgets, trade gates, and pipeline drain"
+            git push origin HEAD:fix/alpha-budget-drain
+          fi
