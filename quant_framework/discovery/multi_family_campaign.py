@@ -10,7 +10,12 @@ from uuid import uuid4
 
 from discovery.candidate import StrategyCandidate
 from discovery.crossover import Crossover, CrossoverError
-from discovery.evaluator import CandidateEvaluator, EvalOutcome, EvaluationRecord
+from discovery.evaluator import (
+    CandidateEvaluator,
+    EvalOutcome,
+    EvaluationRecord,
+    SyntheticOOSBackend,
+)
 from discovery.expression_tree import ExprNode
 from discovery.family_generator import StrategyFamilyGenerator
 from discovery.family_spec import FamilySpec, assert_diverse_family_grammars
@@ -23,6 +28,12 @@ from discovery.operators import OperatorId
 from discovery.search_budget import BudgetCounters, SearchBudget
 from discovery.search_controller import DiscoveryRunResult
 from discovery.stable_hash import stable_seed
+from discovery.stress import StressResult, StressTester, attach_stress
+from discovery.stress_backend import (
+    STRESS_BACKEND_KIND,
+    SYNTHETIC_STRESS_FORBIDDEN,
+    make_stress_backend_factory,
+)
 from discovery.types import NodeKind
 from registry.experiment_registry import ExperimentRegistry
 from registry.hashing import sha256_json
@@ -31,6 +42,38 @@ STRUCTURAL_PARENT_ELIGIBLE = "STRUCTURAL_PARENT_ELIGIBLE"
 SCORE_QUALIFIED = "SCORE_QUALIFIED"
 NOT_PARENT_ELIGIBLE = "NOT_PARENT_ELIGIBLE"
 FAMILY_DIRECTION_INCOHERENT = "FAMILY_DIRECTION_INCOHERENT"
+
+# Phase 3B.1 candidate status events (sequence-ordered; not wall-clock).
+FULL_WFO_COMPLETED = "FULL_WFO_COMPLETED"
+STRESS_TESTED = "STRESS_TESTED"
+STRESS_PASSED = "STRESS_PASSED"
+STRESS_FAILED = "STRESS_FAILED"
+STRESS_NOT_ENTERED = "STRESS_NOT_ENTERED"
+
+# Explicit Stress integrity / entry failures.
+REAL_STRESS_BACKEND_REQUIRED = "REAL_STRESS_BACKEND_REQUIRED"
+STRESS_SIGNAL_SOURCE_INVALID = "STRESS_SIGNAL_SOURCE_INVALID"
+STRESS_WFO_INCOMPLETE = "STRESS_WFO_INCOMPLETE"
+STRESS_BUDGET_EXHAUSTED = "STRESS_BUDGET_EXHAUSTED"
+STRESS_NO_EXECUTED_SCENARIOS = "STRESS_NO_EXECUTED_SCENARIOS"
+STRESS_UNSUPPORTED_REQUIRED = "STRESS_UNSUPPORTED_REQUIRED"
+STRESS_BASELINE_UNAVAILABLE_REQUIRED = "STRESS_BASELINE_UNAVAILABLE_REQUIRED"
+STRESS_PASS_RATE_LOW = "STRESS_PASS_RATE_LOW"
+
+_REQUIRED_STRESS_SIGNAL_SOURCE = "candidate_dsl_trees"
+
+DEFAULT_MULTIFAMILY_STRESS_SCENARIOS: tuple[str, ...] = (
+    "base_costs",
+    "costs_2x",
+    "costs_4x",
+    "wider_spread",
+    "worse_slippage",
+    "delayed_execution",
+    "conservative_intrabar",
+    "removed_best_day",
+    "removed_best_trades",
+    "symbol_exclusion",
+)
 
 # Families whose entry condition sign must economically match ENTRY_LONG/SHORT.
 _DIRECTION_LINKED_FAMILY_IDS = frozenset(
@@ -80,10 +123,13 @@ _DOWN_OPS = frozenset(
 )
 _CMP_OPS = _UP_OPS | _DOWN_OPS
 
-# Honest capability declaration: MultiFamily currently screens via Full WFO only.
+# Honest capability declaration.
 PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING = "MULTI_FAMILY_WFO_SCREENING"
 PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING = (
     "MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING"
+)
+PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING = (
+    "MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING"
 )
 SCORE_QUALIFIED_MEANING = "passed economic WFO qualification"
 SCORE_QUALIFIED_DOES_NOT_MEAN = (
@@ -94,12 +140,23 @@ SCORE_QUALIFIED_DOES_NOT_MEAN = (
     "vault eligible",
     "paper eligible",
 )
+STRESS_PASSED_DOES_NOT_MEAN = (
+    "finalist",
+    "promoted",
+    "research shortlisted",
+    "vault eligible",
+    "paper eligible",
+)
 
 POST_WFO_PIPELINE_NOT_RUN = "POST_WFO_PIPELINE_NOT_RUN"
 STRESS_NOT_RUN = "STRESS_NOT_RUN"
 ROBUSTNESS_NOT_RUN = "ROBUSTNESS_NOT_RUN"
+STATISTICS_NOT_RUN = "STATISTICS_NOT_RUN"
 CLUSTERING_NOT_RUN = "CLUSTERING_NOT_RUN"
 NOT_RESEARCH_SHORTLISTED = "NOT_RESEARCH_SHORTLISTED"
+VAULT_NOT_RUN = "VAULT_NOT_RUN"
+PAPER_NOT_RUN = "PAPER_NOT_RUN"
+LIVE_NOT_RUN = "LIVE_NOT_RUN"
 FAMILY_LOCAL_EVOLUTION_NOT_READY = "FAMILY_LOCAL_EVOLUTION_NOT_READY"
 CROSS_FAMILY_CROSSOVER_UNSUPPORTED = "CROSS_FAMILY_CROSSOVER_UNSUPPORTED"
 FAMILY_STAGNATION = "FAMILY_STAGNATION"
@@ -413,17 +470,52 @@ POST_WFO_BLOCKED_REASONS: tuple[str, ...] = (
     POST_WFO_PIPELINE_NOT_RUN,
     STRESS_NOT_RUN,
     ROBUSTNESS_NOT_RUN,
+    STATISTICS_NOT_RUN,
     CLUSTERING_NOT_RUN,
     NOT_RESEARCH_SHORTLISTED,
+    VAULT_NOT_RUN,
+    PAPER_NOT_RUN,
+    LIVE_NOT_RUN,
+)
+
+# After Phase 3B.1 Stress orchestration: Stress ran; later stages still blocked.
+POST_STRESS_BLOCKED_REASONS: tuple[str, ...] = (
+    POST_WFO_PIPELINE_NOT_RUN,
+    ROBUSTNESS_NOT_RUN,
+    STATISTICS_NOT_RUN,
+    CLUSTERING_NOT_RUN,
+    NOT_RESEARCH_SHORTLISTED,
+    VAULT_NOT_RUN,
+    PAPER_NOT_RUN,
+    LIVE_NOT_RUN,
 )
 
 EMPTY_COLLECTIONS_REASONS: dict[str, list[str]] = {
-    "finalists": [POST_WFO_PIPELINE_NOT_RUN, STRESS_NOT_RUN, ROBUSTNESS_NOT_RUN, CLUSTERING_NOT_RUN],
+    "finalists": [
+        POST_WFO_PIPELINE_NOT_RUN,
+        STRESS_NOT_RUN,
+        ROBUSTNESS_NOT_RUN,
+        CLUSTERING_NOT_RUN,
+    ],
     "promoted": [POST_WFO_PIPELINE_NOT_RUN, STRESS_NOT_RUN, ROBUSTNESS_NOT_RUN],
     "clusters": [POST_WFO_PIPELINE_NOT_RUN, CLUSTERING_NOT_RUN],
     "research_shortlist": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
-    "vault_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
-    "paper_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
+    "vault_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED, VAULT_NOT_RUN],
+    "paper_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED, PAPER_NOT_RUN],
+}
+
+EMPTY_COLLECTIONS_REASONS_AFTER_STRESS: dict[str, list[str]] = {
+    "finalists": [
+        POST_WFO_PIPELINE_NOT_RUN,
+        ROBUSTNESS_NOT_RUN,
+        CLUSTERING_NOT_RUN,
+        NOT_RESEARCH_SHORTLISTED,
+    ],
+    "promoted": [POST_WFO_PIPELINE_NOT_RUN, ROBUSTNESS_NOT_RUN],
+    "clusters": [POST_WFO_PIPELINE_NOT_RUN, CLUSTERING_NOT_RUN],
+    "research_shortlist": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
+    "vault_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED, VAULT_NOT_RUN],
+    "paper_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED, PAPER_NOT_RUN],
 }
 
 
@@ -447,6 +539,12 @@ class FamilyCampaignConfig:
     evolution_generations: int = 2
     allow_cross_family_crossover: bool = False
     minimum_improvement: float = 1e-4
+    # Phase 3B.1 Stress orchestration (evolutionary path).
+    max_stress_evaluations: int = 24
+    max_stress_scenarios_per_candidate: int = 10
+    min_stress_pass_rate: float = 0.5
+    stress_scenarios: tuple[str, ...] | None = None
+    fail_closed_unsupported_stress: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -468,6 +566,13 @@ class FamilyCampaignConfig:
             "evolution_generations": self.evolution_generations,
             "allow_cross_family_crossover": self.allow_cross_family_crossover,
             "minimum_improvement": self.minimum_improvement,
+            "max_stress_evaluations": self.max_stress_evaluations,
+            "max_stress_scenarios_per_candidate": self.max_stress_scenarios_per_candidate,
+            "min_stress_pass_rate": self.min_stress_pass_rate,
+            "stress_scenarios": (
+                list(self.stress_scenarios) if self.stress_scenarios is not None else None
+            ),
+            "fail_closed_unsupported_stress": self.fail_closed_unsupported_stress,
         }
 
 
@@ -574,6 +679,136 @@ class GenerationRecord:
 
 
 @dataclass
+class CandidateStatusEvent:
+    """Deterministic sequence-ordered candidate status transition."""
+
+    sequence: int
+    candidate_id: str
+    family_id: str
+    generation: int
+    prior_status: str
+    new_status: str
+    reason: str
+    artifact_refs: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "candidate_id": self.candidate_id,
+            "family_id": self.family_id,
+            "generation": self.generation,
+            "prior_status": self.prior_status,
+            "new_status": self.new_status,
+            "reason": self.reason,
+            "artifact_refs": dict(self.artifact_refs),
+        }
+
+
+@dataclass
+class CandidateStressSummary:
+    """Deterministic candidate-level Stress summary (Phase 3B.1)."""
+
+    candidate_id: str
+    family_id: str
+    generation: int
+    lineage: dict[str, Any]
+    score_qualified_proof: dict[str, Any]
+    backend_kind: str
+    research_eligible: bool
+    scenario_names: list[str] = field(default_factory=list)
+    scenario_statuses: dict[str, str] = field(default_factory=dict)
+    scenario_artifact_refs: dict[str, Any] = field(default_factory=dict)
+    total_scenarios_configured: int = 0
+    total_scenarios_executed: int = 0
+    passed_count: int = 0
+    failed_count: int = 0
+    not_applicable_count: int = 0
+    unsupported_count: int = 0
+    denominator: int = 0
+    pass_rate: float = 0.0
+    required_pass_rate: float = 0.5
+    worst_scenario: str | None = None
+    worst_expectancy: float | None = None
+    worst_pf: float | None = None
+    worst_drawdown: float | None = None
+    signal_source_proof: dict[str, Any] = field(default_factory=dict)
+    completed_fold_proof: dict[str, Any] = field(default_factory=dict)
+    final_decision: str = STRESS_NOT_ENTERED
+    final_reason: str = ""
+    stress_budget_consumed: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "family_id": self.family_id,
+            "generation": self.generation,
+            "lineage": dict(self.lineage),
+            "score_qualified_proof": dict(self.score_qualified_proof),
+            "backend_kind": self.backend_kind,
+            "research_eligible": self.research_eligible,
+            "scenario_names": list(self.scenario_names),
+            "scenario_statuses": dict(self.scenario_statuses),
+            "scenario_artifact_refs": dict(self.scenario_artifact_refs),
+            "total_scenarios_configured": self.total_scenarios_configured,
+            "total_scenarios_executed": self.total_scenarios_executed,
+            "passed_count": self.passed_count,
+            "failed_count": self.failed_count,
+            "not_applicable_count": self.not_applicable_count,
+            "unsupported_count": self.unsupported_count,
+            "denominator": self.denominator,
+            "pass_rate": self.pass_rate,
+            "required_pass_rate": self.required_pass_rate,
+            "worst_scenario": self.worst_scenario,
+            "worst_expectancy": self.worst_expectancy,
+            "worst_pf": self.worst_pf,
+            "worst_drawdown": self.worst_drawdown,
+            "signal_source_proof": dict(self.signal_source_proof),
+            "completed_fold_proof": dict(self.completed_fold_proof),
+            "final_decision": self.final_decision,
+            "final_reason": self.final_reason,
+            "stress_budget_consumed": self.stress_budget_consumed,
+        }
+
+
+@dataclass
+class CampaignStressAccounting:
+    """Campaign-level Stress budget and scenario counters."""
+
+    max_stress_evaluations: int = 0
+    stress_evaluations_consumed: int = 0
+    candidates_score_qualified: int = 0
+    candidates_stress_entered: int = 0
+    candidates_stress_passed: int = 0
+    candidates_stress_failed: int = 0
+    candidates_stress_not_entered: int = 0
+    scenarios_configured: list[str] = field(default_factory=list)
+    scenarios_executed: int = 0
+    scenarios_passed: int = 0
+    scenarios_failed: int = 0
+    scenarios_not_applicable: int = 0
+    scenarios_unsupported: int = 0
+    stop_reason: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "max_stress_evaluations": self.max_stress_evaluations,
+            "stress_evaluations_consumed": self.stress_evaluations_consumed,
+            "candidates_score_qualified": self.candidates_score_qualified,
+            "candidates_stress_entered": self.candidates_stress_entered,
+            "candidates_stress_passed": self.candidates_stress_passed,
+            "candidates_stress_failed": self.candidates_stress_failed,
+            "candidates_stress_not_entered": self.candidates_stress_not_entered,
+            "scenarios_configured": list(self.scenarios_configured),
+            "scenarios_executed": self.scenarios_executed,
+            "scenarios_passed": self.scenarios_passed,
+            "scenarios_failed": self.scenarios_failed,
+            "scenarios_not_applicable": self.scenarios_not_applicable,
+            "scenarios_unsupported": self.scenarios_unsupported,
+            "stop_reason": self.stop_reason,
+        }
+
+
+@dataclass
 class MultiFamilyCampaignResult:
     campaign_id: str
     families: list[FamilySpec]
@@ -584,8 +819,17 @@ class MultiFamilyCampaignResult:
     reproducible_fingerprint: str
     pipeline_level: str = PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING
     post_wfo_pipeline_complete: bool = False
+    stress_pipeline_complete: bool = False
+    robustness_pipeline_complete: bool = False
+    statistics_pipeline_complete: bool = False
+    clustering_pipeline_complete: bool = False
+    research_shortlist_pipeline_complete: bool = False
+    vault_pipeline_complete: bool = False
+    paper_pipeline_complete: bool = False
+    live_pipeline_complete: bool = False
     score_qualified_meaning: str = SCORE_QUALIFIED_MEANING
     score_qualified_does_not_mean: tuple[str, ...] = SCORE_QUALIFIED_DOES_NOT_MEAN
+    stress_passed_does_not_mean: tuple[str, ...] = STRESS_PASSED_DOES_NOT_MEAN
     post_wfo_blocked_reasons: list[str] = field(
         default_factory=lambda: list(POST_WFO_BLOCKED_REASONS)
     )
@@ -596,6 +840,9 @@ class MultiFamilyCampaignResult:
     vault_candidates: list[Any] = field(default_factory=list)
     paper_candidates: list[Any] = field(default_factory=list)
     generation_records: list[GenerationRecord] = field(default_factory=list)
+    candidate_status_history: list[CandidateStatusEvent] = field(default_factory=list)
+    candidate_stress_summaries: list[CandidateStressSummary] = field(default_factory=list)
+    stress_accounting: CampaignStressAccounting | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -612,8 +859,17 @@ class MultiFamilyCampaignResult:
             },
             "pipeline_level": self.pipeline_level,
             "post_wfo_pipeline_complete": self.post_wfo_pipeline_complete,
+            "stress_pipeline_complete": self.stress_pipeline_complete,
+            "robustness_pipeline_complete": self.robustness_pipeline_complete,
+            "statistics_pipeline_complete": self.statistics_pipeline_complete,
+            "clustering_pipeline_complete": self.clustering_pipeline_complete,
+            "research_shortlist_pipeline_complete": self.research_shortlist_pipeline_complete,
+            "vault_pipeline_complete": self.vault_pipeline_complete,
+            "paper_pipeline_complete": self.paper_pipeline_complete,
+            "live_pipeline_complete": self.live_pipeline_complete,
             "score_qualified_meaning": self.score_qualified_meaning,
             "score_qualified_does_not_mean": list(self.score_qualified_does_not_mean),
+            "stress_passed_does_not_mean": list(self.stress_passed_does_not_mean),
             "post_wfo_blocked_reasons": list(self.post_wfo_blocked_reasons),
             "empty_collections_reasons": {
                 k: list(v) for k, v in self.empty_collections_reasons.items()
@@ -622,6 +878,11 @@ class MultiFamilyCampaignResult:
             "vault_candidates": list(self.vault_candidates),
             "paper_candidates": list(self.paper_candidates),
             "generation_records": [g.as_dict() for g in self.generation_records],
+            "candidate_status_history": [e.as_dict() for e in self.candidate_status_history],
+            "candidate_stress_summaries": [s.as_dict() for s in self.candidate_stress_summaries],
+            "stress_accounting": (
+                self.stress_accounting.as_dict() if self.stress_accounting is not None else None
+            ),
             # Explicit empty post-WFO surfaces — never silent.
             "finalists": [],
             "promoted": [],
@@ -811,6 +1072,9 @@ class MultiFamilyCampaign:
         system_version: str = "0.12.1-phase12.1",
         discovery_run_id: str | None = None,
         progress_hook: Callable[[str, dict[str, Any]], None] | None = None,
+        research_eligible: bool = True,
+        synthetic_stress_forbidden: bool | None = None,
+        stress_backend_factory: Callable[[str], Any] | None = None,
     ) -> None:
         self.config = config
         self.registry = registry
@@ -819,6 +1083,17 @@ class MultiFamilyCampaign:
         self.discovery_run_id = discovery_run_id or ("mfc_" + uuid4().hex[:16])
         self.progress_hook = progress_hook
         self.family_generator = StrategyFamilyGenerator(seed=config.seed)
+        self.research_eligible = bool(research_eligible)
+        self.synthetic_stress_forbidden = (
+            bool(synthetic_stress_forbidden)
+            if synthetic_stress_forbidden is not None
+            else bool(research_eligible)
+        )
+        self.stress_backend_factory = stress_backend_factory
+        self._status_seq = 0
+        self.candidate_status_history: list[CandidateStatusEvent] = []
+        self.candidate_stress_summaries: list[CandidateStressSummary] = []
+        self.stress_accounting: CampaignStressAccounting | None = None
 
     def _emit(self, name: str, payload: dict[str, Any] | None = None) -> None:
         if self.progress_hook is not None:
@@ -924,12 +1199,12 @@ class MultiFamilyCampaign:
             if is_score_qualified:
                 parent_status[SCORE_QUALIFIED] = parent_status.get(SCORE_QUALIFIED, 0) + 1
             if rec.stress_results:
-                passed = sum(
-                    1
+                executed = [
+                    v
                     for v in rec.stress_results.values()
-                    if isinstance(v, dict) and v.get("passed") is True
-                )
-                if passed and passed == len(rec.stress_results):
+                    if isinstance(v, dict) and v.get("status", "executed") == "executed"
+                ]
+                if executed and all(v.get("passed") is True for v in executed):
                     stress_passed += 1
         fitnesses.sort(key=lambda x: x[0], reverse=True)
         return FamilyStats(
@@ -1006,6 +1281,538 @@ class MultiFamilyCampaign:
             False,
             f"not_parent:unclassified:{rec.outcome.value}:{rec.rejection_reason or 'n/a'}",
         )
+
+    @staticmethod
+    def full_wfo_proof(rec: EvaluationRecord) -> dict[str, Any]:
+        train = dict(rec.train_metrics or {})
+        completed = int(train.get("wfo_completed_folds", len(rec.oos_folds) if rec.oos_folds else 0))
+        signal_source = str(train.get("signal_source") or "signal_source_missing")
+        is_full = bool(train.get("is_full_event_wfo", False))
+        return {
+            "signal_source": signal_source,
+            "is_full_event_wfo": is_full,
+            "completed_fold_count": completed,
+            "outcome": rec.outcome.value,
+            "full_wfo_ok": (
+                signal_source == _REQUIRED_STRESS_SIGNAL_SOURCE
+                and is_full
+                and completed > 0
+            ),
+        }
+
+    @classmethod
+    def stress_entry_eligibility(
+        cls, rec: EvaluationRecord
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Return (may_enter_stress, reason, score_qualified_proof).
+
+        Only Score Qualified candidates with proven Full WFO may enter Stress.
+        """
+        proof = cls.full_wfo_proof(rec)
+        parent_status, is_sq, parent_reason = cls.classify_parent_eligibility(rec)
+        proof["parent_status"] = parent_status
+        proof["parent_reason"] = parent_reason
+        proof["is_score_qualified"] = is_sq
+        proof["fitness_rejected"] = bool(rec.fitness.rejected) if rec.fitness is not None else None
+        proof["fitness_exists"] = rec.fitness is not None
+        proof["rejection_reason"] = rec.rejection_reason
+
+        if rec.outcome in _NOT_PARENT_OUTCOMES:
+            return False, f"{STRESS_NOT_ENTERED}:{rec.outcome.value}", proof
+        if not proof["full_wfo_ok"]:
+            if proof["signal_source"] != _REQUIRED_STRESS_SIGNAL_SOURCE:
+                return False, f"{STRESS_NOT_ENTERED}:{STRESS_SIGNAL_SOURCE_INVALID}", proof
+            return False, f"{STRESS_NOT_ENTERED}:{STRESS_WFO_INCOMPLETE}", proof
+        if rec.fitness is None:
+            return False, f"{STRESS_NOT_ENTERED}:fitness_missing", proof
+        if rec.fitness.rejected:
+            reason = rec.rejection_reason or rec.fitness.rejection_reason or "fitness_rejected"
+            return False, f"{STRESS_NOT_ENTERED}:{reason}", proof
+        if not is_sq:
+            return False, f"{STRESS_NOT_ENTERED}:not_score_qualified", proof
+        return True, SCORE_QUALIFIED, proof
+
+    def _append_status(
+        self,
+        *,
+        candidate_id: str,
+        family_id: str,
+        generation: int,
+        prior_status: str,
+        new_status: str,
+        reason: str,
+        artifact_refs: dict[str, Any] | None = None,
+    ) -> CandidateStatusEvent:
+        self._status_seq += 1
+        event = CandidateStatusEvent(
+            sequence=self._status_seq,
+            candidate_id=candidate_id,
+            family_id=family_id,
+            generation=generation,
+            prior_status=prior_status,
+            new_status=new_status,
+            reason=reason,
+            artifact_refs=dict(artifact_refs or {}),
+        )
+        self.candidate_status_history.append(event)
+        return event
+
+    def _resolve_stress_tester(
+        self, *, budget: SearchBudget, counters: BudgetCounters
+    ) -> tuple[StressTester | None, str | None, str]:
+        """Return (tester, bind_error, backend_kind_label)."""
+        forbid = bool(self.synthetic_stress_forbidden or self.research_eligible)
+        fitness = RobustFitness(
+            min_total_oos_trades=int(self.config.min_oos_trades),
+            min_oos_trades_per_fold=int(self.config.min_oos_trades_per_fold),
+            max_oos_drawdown=float(self.config.max_oos_drawdown),
+        )
+        if self.stress_backend_factory is not None:
+            factory = self.stress_backend_factory
+            kind = str(getattr(factory, "backend_kind", "injected_stress_factory"))
+            tester = StressTester(
+                budget=budget,
+                counters=counters,
+                fitness_model=fitness,
+                backend_factory=factory,
+                research_eligible=bool(self.research_eligible),
+                synthetic_stress_forbidden=forbid,
+            )
+            return tester, None, kind
+
+        if forbid and isinstance(self.backend, SyntheticOOSBackend):
+            return None, SYNTHETIC_STRESS_FORBIDDEN, "synthetic_oos_probe"
+
+        from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
+
+        if forbid and not isinstance(self.backend, EventDrivenDiscoveryBackend):
+            return None, REAL_STRESS_BACKEND_REQUIRED, type(self.backend).__name__
+
+        factory = make_stress_backend_factory(
+            self.backend,
+            research_eligible=bool(self.research_eligible),
+            synthetic_stress_forbidden=forbid,
+        )
+        kind = STRESS_BACKEND_KIND
+        tester = StressTester(
+            budget=budget,
+            counters=counters,
+            fitness_model=fitness,
+            backend_factory=factory,
+            research_eligible=bool(self.research_eligible),
+            synthetic_stress_forbidden=forbid,
+        )
+        return tester, None, kind
+
+    def _decide_stress_outcome(
+        self,
+        results: list[StressResult],
+        *,
+        required_pass_rate: float,
+        fail_closed_unsupported: bool,
+    ) -> tuple[str, str, dict[str, Any]]:
+        executed = [r for r in results if r.status == "executed"]
+        not_applicable = [r for r in results if r.status == "not_applicable"]
+        unsupported = [r for r in results if r.status == "unsupported"]
+        baseline_unavail = [r for r in results if r.status == "baseline_unavailable"]
+        passed = [r for r in executed if r.passed]
+        failed = [r for r in executed if not r.passed]
+        denom = len(executed)
+        pass_rate = (len(passed) / denom) if denom > 0 else 0.0
+        stats = {
+            "configured": [r.scenario for r in results],
+            "executed": [r.scenario for r in executed],
+            "passed": [r.scenario for r in passed],
+            "failed": [r.scenario for r in failed],
+            "not_applicable": [r.scenario for r in not_applicable],
+            "unsupported": [r.scenario for r in unsupported],
+            "baseline_unavailable": [r.scenario for r in baseline_unavail],
+            "denominator": denom,
+            "pass_rate": pass_rate,
+            "required_pass_rate": required_pass_rate,
+        }
+        if fail_closed_unsupported and unsupported:
+            return STRESS_FAILED, STRESS_UNSUPPORTED_REQUIRED, stats
+        if fail_closed_unsupported and baseline_unavail:
+            return STRESS_FAILED, STRESS_BASELINE_UNAVAILABLE_REQUIRED, stats
+        if denom <= 0:
+            return STRESS_FAILED, STRESS_NO_EXECUTED_SCENARIOS, stats
+        # Integrity: every executed scenario must prove DSL signal source + folds.
+        for r in executed:
+            if r.signal_source != _REQUIRED_STRESS_SIGNAL_SOURCE:
+                return STRESS_FAILED, STRESS_SIGNAL_SOURCE_INVALID, stats
+            if int(r.completed_fold_count) <= 0:
+                return STRESS_FAILED, STRESS_WFO_INCOMPLETE, stats
+        if pass_rate < float(required_pass_rate):
+            return STRESS_FAILED, STRESS_PASS_RATE_LOW, stats
+        return STRESS_PASSED, "stress_pass_rate_ok", stats
+
+    def _build_stress_summary(
+        self,
+        *,
+        cand: StrategyCandidate,
+        family_id: str,
+        rec: EvaluationRecord,
+        proof: dict[str, Any],
+        results: list[StressResult],
+        backend_kind: str,
+        decision: str,
+        reason: str,
+        stats: dict[str, Any],
+        required_pass_rate: float,
+        budget_before: int,
+        budget_after: int,
+    ) -> CandidateStressSummary:
+        executed = [r for r in results if r.status == "executed"]
+        worst_scenario = None
+        worst_exp = None
+        worst_pf = None
+        worst_dd = None
+        if executed:
+            worst = min(executed, key=lambda r: (r.median_expectancy, r.fitness))
+            worst_scenario = worst.scenario
+            worst_exp = float(worst.median_expectancy)
+            worst_dd = float(worst.max_drawdown)
+            pfs: list[float] = []
+            for r in executed:
+                for fm in r.fold_metrics:
+                    if isinstance(fm, dict) and "profit_factor" in fm:
+                        pfs.append(float(fm["profit_factor"]))
+            worst_pf = float(min(pfs)) if pfs else None
+
+        signal_proof = {
+            r.scenario: r.signal_source for r in results if r.status == "executed"
+        }
+        fold_proof = {
+            r.scenario: int(r.completed_fold_count)
+            for r in results
+            if r.status == "executed"
+        }
+        return CandidateStressSummary(
+            candidate_id=cand.candidate_id,
+            family_id=family_id,
+            generation=int(cand.generation),
+            lineage={
+                "lineage_id": cand.lineage_id,
+                "parent_ids": list(cand.parent_ids),
+                "creation_method": (
+                    cand.creation_method.value
+                    if hasattr(cand.creation_method, "value")
+                    else str(cand.creation_method)
+                ),
+            },
+            score_qualified_proof=dict(proof),
+            backend_kind=backend_kind,
+            research_eligible=bool(self.research_eligible),
+            scenario_names=[r.scenario for r in results],
+            scenario_statuses={r.scenario: r.status for r in results},
+            scenario_artifact_refs={
+                r.scenario: {
+                    "signal_source": r.signal_source,
+                    "backend_kind": r.backend_kind,
+                    "completed_fold_count": r.completed_fold_count,
+                    "passed": r.passed,
+                    "failure_reason": r.failure_reason,
+                    "integrity_ok": r.integrity_ok,
+                }
+                for r in results
+            },
+            total_scenarios_configured=len(results),
+            total_scenarios_executed=len(executed),
+            passed_count=len(stats.get("passed") or []),
+            failed_count=len(stats.get("failed") or []),
+            not_applicable_count=len(stats.get("not_applicable") or []),
+            unsupported_count=len(stats.get("unsupported") or []),
+            denominator=int(stats.get("denominator") or 0),
+            pass_rate=float(stats.get("pass_rate") or 0.0),
+            required_pass_rate=float(required_pass_rate),
+            worst_scenario=worst_scenario,
+            worst_expectancy=worst_exp,
+            worst_pf=worst_pf,
+            worst_drawdown=worst_dd,
+            signal_source_proof=signal_proof,
+            completed_fold_proof=fold_proof,
+            final_decision=decision,
+            final_reason=reason,
+            stress_budget_consumed=max(0, int(budget_after) - int(budget_before)),
+        )
+
+    def _run_stress_phase(
+        self,
+        *,
+        families: list[FamilySpec],
+        records_by_family: dict[str, list[EvaluationRecord]],
+        cand_by_id: dict[str, StrategyCandidate],
+        t0: float,
+    ) -> CampaignStressAccounting:
+        """Connect Score Qualified candidates to the real Stress pipeline."""
+        cfg = self.config
+        scenarios = tuple(
+            cfg.stress_scenarios
+            if cfg.stress_scenarios is not None
+            else DEFAULT_MULTIFAMILY_STRESS_SCENARIOS
+        )
+        per_cand_cap = max(1, int(cfg.max_stress_scenarios_per_candidate))
+        chosen = scenarios[:per_cand_cap]
+        accounting = CampaignStressAccounting(
+            max_stress_evaluations=int(cfg.max_stress_evaluations),
+            scenarios_configured=list(chosen),
+        )
+        self.stress_accounting = accounting
+        budget = SearchBudget(
+            max_generated_candidates=max(1, cfg.total_candidate_budget),
+            max_evaluated_candidates=max(1, cfg.total_candidate_budget),
+            max_full_wfo_evaluations=max(1, cfg.max_full_wfo),
+            max_stress_evaluations=int(cfg.max_stress_evaluations),
+            max_runtime_seconds=float(cfg.max_runtime_seconds),
+            min_oos_trades=int(cfg.min_oos_trades),
+            min_oos_trades_per_fold=int(cfg.min_oos_trades_per_fold),
+            max_oos_drawdown=float(cfg.max_oos_drawdown),
+        )
+        counters = BudgetCounters()
+        tester, bind_error, backend_kind = self._resolve_stress_tester(
+            budget=budget, counters=counters
+        )
+
+        # Deterministic order: family_id then candidate_id.
+        ordered: list[tuple[str, EvaluationRecord, StrategyCandidate]] = []
+        for spec in sorted(families, key=lambda s: s.family_id):
+            for rec in records_by_family.get(spec.family_id, []):
+                cand = cand_by_id.get(rec.candidate_id)
+                if cand is None:
+                    continue
+                ordered.append((spec.family_id, rec, cand))
+        ordered.sort(key=lambda t: (t[0], t[1].candidate_id))
+
+        self._emit(
+            "MULTI_FAMILY_STRESS_STARTED",
+            {
+                "scenarios": list(chosen),
+                "max_stress_evaluations": accounting.max_stress_evaluations,
+                "bind_error": bind_error,
+            },
+        )
+
+        for family_id, rec, cand in ordered:
+            if time.perf_counter() - t0 >= float(cfg.max_runtime_seconds):
+                accounting.stop_reason = "max_runtime_seconds"
+                break
+
+            eligible, entry_reason, proof = self.stress_entry_eligibility(rec)
+            prior = FULL_WFO_COMPLETED if proof.get("full_wfo_ok") else "EVALUATED"
+            gen = int(cand.generation)
+
+            if not eligible:
+                accounting.candidates_stress_not_entered += 1
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=prior,
+                    new_status=STRESS_NOT_ENTERED,
+                    reason=entry_reason,
+                    artifact_refs={"score_qualified_proof": proof},
+                )
+                continue
+
+            accounting.candidates_score_qualified += 1
+            self._append_status(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                prior_status=prior,
+                new_status=SCORE_QUALIFIED,
+                reason=SCORE_QUALIFIED,
+                artifact_refs={"score_qualified_proof": proof},
+            )
+
+            if bind_error is not None:
+                accounting.candidates_stress_entered += 1
+                accounting.candidates_stress_failed += 1
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=SCORE_QUALIFIED,
+                    new_status=STRESS_TESTED,
+                    reason=bind_error,
+                    artifact_refs={"backend_bind_error": bind_error},
+                )
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=STRESS_TESTED,
+                    new_status=STRESS_FAILED,
+                    reason=bind_error,
+                    artifact_refs={"backend_bind_error": bind_error},
+                )
+                summary = CandidateStressSummary(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    lineage={
+                        "lineage_id": cand.lineage_id,
+                        "parent_ids": list(cand.parent_ids),
+                    },
+                    score_qualified_proof=dict(proof),
+                    backend_kind=backend_kind,
+                    research_eligible=bool(self.research_eligible),
+                    scenario_names=list(chosen),
+                    total_scenarios_configured=len(chosen),
+                    required_pass_rate=float(cfg.min_stress_pass_rate),
+                    final_decision=STRESS_FAILED,
+                    final_reason=bind_error,
+                    stress_budget_consumed=0,
+                )
+                self.candidate_stress_summaries.append(summary)
+                continue
+
+            assert tester is not None
+            if counters.stress >= budget.max_stress_evaluations:
+                accounting.candidates_stress_not_entered += 1
+                accounting.stop_reason = STRESS_BUDGET_EXHAUSTED
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=SCORE_QUALIFIED,
+                    new_status=STRESS_NOT_ENTERED,
+                    reason=STRESS_BUDGET_EXHAUSTED,
+                    artifact_refs={
+                        "stress_consumed": counters.stress,
+                        "max_stress_evaluations": budget.max_stress_evaluations,
+                    },
+                )
+                continue
+
+            budget_before = int(counters.stress)
+            try:
+                results = tester.run(
+                    cand,
+                    base_fitness=float(rec.fitness.fitness) if rec.fitness else 0.0,
+                    scenarios=chosen,
+                )
+            except RuntimeError as exc:
+                msg = str(exc)
+                fail_reason = (
+                    SYNTHETIC_STRESS_FORBIDDEN
+                    if SYNTHETIC_STRESS_FORBIDDEN in msg
+                    else msg
+                )
+                accounting.candidates_stress_entered += 1
+                accounting.candidates_stress_failed += 1
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=SCORE_QUALIFIED,
+                    new_status=STRESS_TESTED,
+                    reason=fail_reason,
+                    artifact_refs={},
+                )
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=STRESS_TESTED,
+                    new_status=STRESS_FAILED,
+                    reason=fail_reason,
+                    artifact_refs={},
+                )
+                self.candidate_stress_summaries.append(
+                    CandidateStressSummary(
+                        candidate_id=cand.candidate_id,
+                        family_id=family_id,
+                        generation=gen,
+                        lineage={
+                            "lineage_id": cand.lineage_id,
+                            "parent_ids": list(cand.parent_ids),
+                        },
+                        score_qualified_proof=dict(proof),
+                        backend_kind=backend_kind,
+                        research_eligible=bool(self.research_eligible),
+                        scenario_names=list(chosen),
+                        total_scenarios_configured=len(chosen),
+                        required_pass_rate=float(cfg.min_stress_pass_rate),
+                        final_decision=STRESS_FAILED,
+                        final_reason=fail_reason,
+                        stress_budget_consumed=max(0, int(counters.stress) - budget_before),
+                    )
+                )
+                continue
+
+            attach_stress(rec, results)
+            budget_after = int(counters.stress)
+            decision, reason, stats = self._decide_stress_outcome(
+                results,
+                required_pass_rate=float(cfg.min_stress_pass_rate),
+                fail_closed_unsupported=bool(cfg.fail_closed_unsupported_stress),
+            )
+            summary = self._build_stress_summary(
+                cand=cand,
+                family_id=family_id,
+                rec=rec,
+                proof=proof,
+                results=results,
+                backend_kind=backend_kind,
+                decision=decision,
+                reason=reason,
+                stats=stats,
+                required_pass_rate=float(cfg.min_stress_pass_rate),
+                budget_before=budget_before,
+                budget_after=budget_after,
+            )
+            self.candidate_stress_summaries.append(summary)
+            accounting.candidates_stress_entered += 1
+            accounting.scenarios_executed += int(summary.total_scenarios_executed)
+            accounting.scenarios_passed += int(summary.passed_count)
+            accounting.scenarios_failed += int(summary.failed_count)
+            accounting.scenarios_not_applicable += int(summary.not_applicable_count)
+            accounting.scenarios_unsupported += int(summary.unsupported_count)
+            if decision == STRESS_PASSED:
+                accounting.candidates_stress_passed += 1
+            else:
+                accounting.candidates_stress_failed += 1
+
+            self._append_status(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                prior_status=SCORE_QUALIFIED,
+                new_status=STRESS_TESTED,
+                reason="stress_scenarios_completed",
+                artifact_refs={
+                    "scenarios": list(summary.scenario_names),
+                    "denominator": summary.denominator,
+                },
+            )
+            self._append_status(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                prior_status=STRESS_TESTED,
+                new_status=decision,
+                reason=reason,
+                artifact_refs={
+                    "pass_rate": summary.pass_rate,
+                    "required_pass_rate": summary.required_pass_rate,
+                    "summary": summary.as_dict(),
+                },
+            )
+
+        accounting.stress_evaluations_consumed = int(counters.stress)
+        if (
+            accounting.stop_reason is None
+            and counters.stress >= budget.max_stress_evaluations
+            and accounting.candidates_stress_not_entered > 0
+        ):
+            accounting.stop_reason = STRESS_BUDGET_EXHAUSTED
+        self._emit(
+            "MULTI_FAMILY_STRESS_COMPLETED",
+            accounting.as_dict(),
+        )
+        return accounting
 
     @staticmethod
     def candidate_within_family_grammar(cand: StrategyCandidate, grammar: Grammar) -> bool:
@@ -1166,7 +1973,7 @@ class MultiFamilyCampaign:
         """Deterministic per-family generation queues with mutation/crossover."""
         cfg = self.config
         t0 = time.perf_counter()
-        pipeline = PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING
+        pipeline = PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING
         family_ids = [f.family_id for f in families]
         records_by_family: dict[str, list[EvaluationRecord]] = {fid: [] for fid in family_ids}
         full_wfo_counts: dict[str, int] = {fid: 0 for fid in family_ids}
@@ -1183,7 +1990,7 @@ class MultiFamilyCampaign:
             if cfg.max_evaluated_candidates is not None
             else int(cfg.total_candidate_budget)
         )
-        stop_reason = "multi_family_evolutionary_wfo_screening_completed"
+        stop_reason = "multi_family_evolutionary_stress_screening_completed"
         completed_generation_count = 0
 
         self._emit(
@@ -1627,6 +2434,19 @@ class MultiFamilyCampaign:
             ):
                 pass  # stop_reason already recorded on last greg when possible
 
+        # Phase 3B.1: Score Qualified → real Stress (stop before robustness/etc.).
+        stress_accounting = self._run_stress_phase(
+            families=families,
+            records_by_family=records_by_family,
+            cand_by_id=cand_by_id,
+            t0=t0,
+        )
+        stress_passed_ids = {
+            s.candidate_id
+            for s in self.candidate_stress_summaries
+            if s.final_decision == STRESS_PASSED
+        }
+
         family_stats = []
         for spec in families:
             st = self._stats_from_records(
@@ -1639,6 +2459,11 @@ class MultiFamilyCampaign:
             )
             for reason, count in descendant_reject_counts.get(spec.family_id, {}).items():
                 st.rejection_reasons[reason] = st.rejection_reasons.get(reason, 0) + int(count)
+            st.stress_passed = sum(
+                1
+                for cid in stress_passed_ids
+                if cid in {r.candidate_id for r in records_by_family[spec.family_id]}
+            )
             family_stats.append(st)
 
         # Budget invariant assertions (soft: encode into stop / payload).
@@ -1660,7 +2485,9 @@ class MultiFamilyCampaign:
                         "family": st.family_id,
                     }
                 )
-        empty_reasons = {k: list(v) for k, v in EMPTY_COLLECTIONS_REASONS.items()}
+        empty_reasons = {
+            k: list(v) for k, v in EMPTY_COLLECTIONS_REASONS_AFTER_STRESS.items()
+        }
         discovery = DiscoveryRunResult(
             discovery_run_id=self.discovery_run_id,
             budget_id="budget_multi_family",
@@ -1696,10 +2523,12 @@ class MultiFamilyCampaign:
             "allow_cross_family_crossover": False,
             "pipeline_level": pipeline,
             "post_wfo_pipeline_complete": False,
+            "stress_pipeline_complete": True,
             "completed_generations": completed_generation_count,
             "campaign_generated": campaign_generated,
             "campaign_evaluated": campaign_evaluated,
             "campaign_full_wfo": campaign_full_wfo,
+            "stress_accounting": stress_accounting.as_dict(),
         }
         fingerprint = sha256_json(
             {
@@ -1708,6 +2537,9 @@ class MultiFamilyCampaign:
                 "config": cfg.as_dict(),
                 "pipeline_level": pipeline,
                 "generation_records": [g.as_dict() for g in generation_records],
+                "candidate_stress_summaries": [
+                    s.as_dict() for s in self.candidate_stress_summaries
+                ],
             }
         )
         discovery.reproducible_fingerprint = fingerprint
@@ -1721,14 +2553,26 @@ class MultiFamilyCampaign:
             reproducible_fingerprint=fingerprint,
             pipeline_level=pipeline,
             post_wfo_pipeline_complete=False,
+            stress_pipeline_complete=True,
+            robustness_pipeline_complete=False,
+            statistics_pipeline_complete=False,
+            clustering_pipeline_complete=False,
+            research_shortlist_pipeline_complete=False,
+            vault_pipeline_complete=False,
+            paper_pipeline_complete=False,
+            live_pipeline_complete=False,
             score_qualified_meaning=SCORE_QUALIFIED_MEANING,
             score_qualified_does_not_mean=SCORE_QUALIFIED_DOES_NOT_MEAN,
-            post_wfo_blocked_reasons=list(POST_WFO_BLOCKED_REASONS),
+            stress_passed_does_not_mean=STRESS_PASSED_DOES_NOT_MEAN,
+            post_wfo_blocked_reasons=list(POST_STRESS_BLOCKED_REASONS),
             empty_collections_reasons=empty_reasons,
             research_shortlist=[],
             vault_candidates=[],
             paper_candidates=[],
             generation_records=generation_records,
+            candidate_status_history=list(self.candidate_status_history),
+            candidate_stress_summaries=list(self.candidate_stress_summaries),
+            stress_accounting=stress_accounting,
         )
 
     def run(self) -> MultiFamilyCampaignResult:
@@ -2040,4 +2884,17 @@ def family_campaign_from_config(raw: dict[str, Any] | None) -> FamilyCampaignCon
         evolution_generations=int(raw.get("evolution_generations", 2)),
         allow_cross_family_crossover=bool(raw.get("allow_cross_family_crossover", False)),
         minimum_improvement=float(raw.get("minimum_improvement", 1e-4)),
+        max_stress_evaluations=int(raw.get("max_stress_evaluations", 24)),
+        max_stress_scenarios_per_candidate=int(
+            raw.get("max_stress_scenarios_per_candidate", 10)
+        ),
+        min_stress_pass_rate=float(raw.get("min_stress_pass_rate", 0.5)),
+        stress_scenarios=(
+            tuple(str(s) for s in raw["stress_scenarios"])
+            if raw.get("stress_scenarios") is not None
+            else None
+        ),
+        fail_closed_unsupported_stress=bool(
+            raw.get("fail_closed_unsupported_stress", True)
+        ),
     )

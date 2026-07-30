@@ -15,7 +15,7 @@ from discovery.multi_family_campaign import (
     CROSS_FAMILY_CROSSOVER_UNSUPPORTED,
     FAMILY_STAGNATION,
     NOT_PARENT_ELIGIBLE,
-    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING,
+    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING,
     SCORE_QUALIFIED,
     STRUCTURAL_PARENT_ELIGIBLE,
     FamilyCampaignConfig,
@@ -239,8 +239,9 @@ class TestPhase3AFamilyLocalEvolution:
 
     def test_structural_parent_does_not_imply_score_qualified(self, tmp_path: Path) -> None:
         result, _ = _run(tmp_path)
-        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING
+        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING
         assert result.post_wfo_pipeline_complete is False
+        assert result.stress_pipeline_complete is True
         structural = 0
         score_q = 0
         for g in result.generation_records:
