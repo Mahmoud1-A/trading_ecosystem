@@ -34,6 +34,8 @@ NUMERIC_TYPES = frozenset(
         ValueType.RANK,
         ValueType.SCALAR,
         ValueType.TIME,
+        # Numeric regime codes in [-1, 1] (trend / vol state) — comparable & ABS-able.
+        ValueType.REGIME,
     }
 )
 

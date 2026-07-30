@@ -16,6 +16,7 @@ from features.definitions import build_default_catalog
 from features.liquidity import compute_liquidity_features
 from features.microstructure import compute_microstructure_features
 from features.price import compute_price_features
+from features.regime_features import compute_regime_features
 from features.temporal import compute_temporal_features
 from features.validation import assert_no_vault_columns
 from features.volatility import compute_volatility_features
@@ -97,6 +98,7 @@ class FeatureGenerator:
             compute_liquidity_features(work),
             compute_volatility_features(work),
             compute_temporal_features(work, calendar=self.config.calendar),
+            compute_regime_features(work),
         ]
         micro, micro_disabled = compute_microstructure_features(
             quotes=quotes, book=book, available_capabilities=caps

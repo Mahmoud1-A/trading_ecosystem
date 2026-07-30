@@ -471,6 +471,28 @@ def build_default_catalog() -> FeatureCatalog:
             deps=("vol.atr_14",),
             complexity=2.0,
         ),
+        _bar_feature(
+            "regime.trend_state",
+            "causal_trend_state",
+            FeatureCategory.REGIME,
+            "Causal EMA slope/separation normalized by ATR, clipped to [-1,1]. "
+            "+1 strong uptrend, -1 strong downtrend, ~0 range. |x|>=0.25 trending.",
+            "Executable regime gate for require_trend_regime / prefer_range_regime",
+            lookback=30,
+            units="regime_code",
+            complexity=2.0,
+        ),
+        _bar_feature(
+            "regime.volatility_state",
+            "causal_volatility_state",
+            FeatureCategory.REGIME,
+            "Causal realized-vol vs rolling median, clipped to [-1,1]. "
+            "+1 expansion, -1 compression, ~0 normal. x>=0.25 expansion.",
+            "Executable regime gate for prefer_vol_expansion",
+            lookback=40,
+            units="regime_code",
+            complexity=2.0,
+        ),
     ]
     for spec in specs:
         cat.register(spec)

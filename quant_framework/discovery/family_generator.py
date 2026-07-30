@@ -13,6 +13,7 @@ from discovery.family_spec import (
     assert_diverse_family_grammars,
     dedupe_family_specs,
 )
+from discovery.stable_hash import stable_int_hash, stable_seed
 
 
 def _jitter_ranges(
@@ -41,7 +42,7 @@ def materialize_family_spec(
     if family_id not in FAMILY_BLUEPRINTS:
         raise KeyError(f"unknown family blueprint {family_id!r}")
     bp = FAMILY_BLUEPRINTS[family_id]
-    rng = np.random.default_rng(int(seed) ^ (hash(family_id) & 0xFFFFFFFF))
+    rng = np.random.default_rng(int(seed) ^ (stable_int_hash(family_id, bits=32) & 0xFFFFFFFF))
     limits = dict(bp["complexity_limits"])
     # Light per-seed complexity jitter that stays family-distinct.
     limits["max_nodes"] = int(max(10, limits.get("max_nodes", 18) + int(rng.integers(-1, 2))))
@@ -92,7 +93,7 @@ class StrategyFamilyGenerator:
         selected = order[: int(count)]
         families: list[FamilySpec] = []
         for i, fid in enumerate(selected):
-            fam_seed = int(self.seed) + 17 * i + (hash(fid) & 0xFFFF)
+            fam_seed = stable_seed(self.seed, fid, i, salt=17)
             families.append(
                 materialize_family_spec(
                     fid,

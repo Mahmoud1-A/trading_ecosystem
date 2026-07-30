@@ -15,9 +15,15 @@ from discovery.expression_tree import (
     op_node,
     parameter_node,
 )
+from discovery.feature_domains import (
+    INVALID_FEATURE_THRESHOLD_DOMAIN,
+    sample_threshold_for_leaf,
+    validate_tree_threshold_domains,
+)
 from discovery.grammar import GRAMMAR_VERSION, Grammar
 from discovery.operators import OPERATOR_REGISTRY, OperatorId
 from discovery.prechecks import structural_precheck
+from discovery.regime_gates import compile_regime_constraints
 from discovery.repair import clamp_lookbacks, repair_entry
 from discovery.typecheck import check_ast_types, check_strategy_trees, parse_dsl_validation_error
 from discovery.types import CreationMethod, NUMERIC_TYPES, ValueType
@@ -75,6 +81,7 @@ class CandidateGenerator:
             "allowed_features": list(self.family_spec.allowed_features),
             "allowed_operators": list(self.family_spec.allowed_operators),
             "regime_constraints": list(self.family_spec.regime_constraints),
+            "direction_support": ["ENTRY_LONG", "ENTRY_SHORT"],
             **dict(self.family_spec.provenance),
         }
 
@@ -116,15 +123,19 @@ class CandidateGenerator:
         leaf = leaves[int(rng.integers(0, len(leaves)))]
         return feature_node(leaf.feature_id, leaf.value_type)
 
-    def _random_const(self, rng: np.random.Generator) -> ExprNode:
-        return constant_node(float(rng.normal(0, 1)))
+    def _random_const(self, rng: np.random.Generator, leaf=None) -> ExprNode:
+        if leaf is not None:
+            return constant_node(sample_threshold_for_leaf(leaf, rng))
+        # Untyped fallback: mild ratio-scale noise (not N(0,1) for arbitrary features).
+        return constant_node(float(rng.uniform(-0.05, 0.05)))
 
-    def _random_param(self, rng: np.random.Generator, idx: int) -> ExprNode:
+    def _random_param(self, rng: np.random.Generator, idx: int, leaf=None) -> ExprNode:
+        if leaf is not None:
+            return parameter_node(f"p{idx}", sample_threshold_for_leaf(leaf, rng))
         return parameter_node(f"p{idx}", float(rng.uniform(-2, 2)))
 
     def _allowed_ops(self, target_type: ValueType) -> list[OperatorId]:
-        ops = self.grammar.operators_returning(target_type)
-        return [oid for oid in ops if oid not in {OperatorId.ENTRY_SHORT}]
+        return list(self.grammar.operators_returning(target_type))
 
     def _boolean_leaf(self, rng: np.random.Generator, param_counter: list[int]) -> ExprNode:
         numeric_leaves = [l for l in self.grammar.feature_leaves if l.value_type in NUMERIC_TYPES]
@@ -133,9 +144,9 @@ class CandidateGenerator:
         leaf = numeric_leaves[int(rng.integers(0, len(numeric_leaves)))]
         left = feature_node(leaf.feature_id, leaf.value_type)
         right = (
-            self._random_const(rng)
+            self._random_const(rng, leaf)
             if rng.random() < 0.7
-            else self._random_param(rng, param_counter[0])
+            else self._random_param(rng, param_counter[0], leaf)
         )
         if right.kind.value == "PARAMETER":
             param_counter[0] += 1
@@ -290,11 +301,18 @@ class CandidateGenerator:
             feat = self._pick_feature(rng, "price.rolling_z_20", "liq.dist_session_vwap")
             thr = self._sample_param(rng, "entry_threshold", -2.5, -1.0)
             return op_node(OperatorId.LESS_THAN, feat, thr)
-        if pattern in {"dist_mean_threshold", "pullback_to_ema", "vwap_deviation"}:
+        if pattern == "pullback_to_ema":
+            feat = self._pick_feature(rng, "price.dist_rolling_mean_20", "liq.dist_session_vwap")
+            thr = self._sample_param(rng, "entry_threshold", -0.04, -0.002)
+            return op_node(OperatorId.LESS_THAN, feat, thr)
+        if pattern in {"dist_mean_threshold", "vwap_deviation"}:
             feat = self._pick_feature(
                 rng, "price.dist_rolling_mean_20", "liq.dist_session_vwap", "price.rolling_z_20"
             )
-            thr = self._sample_param(rng, "entry_threshold", -1.5, -0.2)
+            if feat.name == "price.rolling_z_20":
+                thr = self._sample_param(rng, "entry_threshold", -2.5, -1.0)
+            else:
+                thr = self._sample_param(rng, "entry_threshold", -0.04, -0.002)
             return op_node(OperatorId.LESS_THAN, feat, thr)
         if pattern in {"return_persistence", "cross_momentum", "trend_resume_cross"}:
             feat = self._pick_feature(rng, "price.return_5", "price.simple_return_1")
@@ -310,24 +328,48 @@ class CandidateGenerator:
             thr = self._sample_param(rng, "entry_threshold", 0.0, 0.05)
             return op_node(OperatorId.GREATER_THAN, feat, thr)
         if pattern in {"vol_expansion_break", "compression_then_move"}:
-            feat = self._pick_feature(rng, "vol.realized_20", "vol.norm_atr_14", "vol.range_compression_20")
-            thr = self._sample_param(rng, "entry_threshold", 0.0, 2.0)
+            feat = self._pick_feature(
+                rng, "vol.range_compression_20", "vol.realized_20", "vol.norm_atr_14"
+            )
+            vol_thr = self._sample_param(rng, "vol_threshold", 0.15, 0.85)
             move = self._pick_feature(rng, "price.simple_return_1", "price.return_5")
-            left = op_node(OperatorId.GREATER_THAN, feat, thr)
-            right = op_node(OperatorId.GREATER_THAN, move, self._sample_param(rng, "exit_threshold", 0.0, 0.01))
-            if self.grammar.allows_operator(OperatorId.AND):
+            ret_thr = self._sample_param(rng, "directional_return_threshold", 0.0002, 0.008)
+            left = op_node(OperatorId.GREATER_THAN, feat, vol_thr)
+            # Directional confirmation uses return-scale threshold (not exit_vol).
+            right = op_node(OperatorId.GREATER_THAN, op_node(OperatorId.ABS, move), ret_thr)
+            if self.grammar.allows_operator(OperatorId.AND) and rng.random() < 0.7:
                 return op_node(OperatorId.AND, left, right)
             return left
-        if pattern in {"session_extreme", "open_fade", "gap_fade_entry", "vwap_gap_reversion"}:
+        if pattern in {"gap_fade_entry", "vwap_gap_reversion"}:
+            # Normalized overnight gap (instrument-independent), not one-bar return.
+            gap = self._pick_feature(rng, "price.close_to_open")
+            thr = self._sample_param(rng, "entry_threshold", 0.0005, 0.012)
+            core = op_node(OperatorId.GREATER_THAN, op_node(OperatorId.ABS, gap), thr)
+            if pattern == "vwap_gap_reversion" and self.grammar.allows_operator(OperatorId.OR):
+                vwap = self._pick_feature(rng, "liq.dist_session_vwap")
+                vwap_cond = op_node(
+                    OperatorId.GREATER_THAN,
+                    op_node(OperatorId.ABS, vwap),
+                    self._sample_param(rng, "exit_threshold", 0.001, 0.01),
+                )
+                # OR keeps the gate economically meaningful without always-false AND.
+                core = op_node(OperatorId.OR, core, vwap_cond)
+            elif self.grammar.allows_operator(OperatorId.AND) and rng.random() < 0.5:
+                minutes = self._pick_feature(rng, "temp.minutes_since_open")
+                tmax = self._sample_param(rng, "minutes_open_max", 90.0, 390.0)
+                window = op_node(OperatorId.LESS_THAN, minutes, tmax)
+                core = op_node(OperatorId.AND, core, window)
+            return core
+        if pattern in {"session_extreme", "open_fade"}:
             feat = self._pick_feature(
-                rng, "price.rolling_z_20", "price.simple_return_1", "liq.dist_session_vwap"
+                rng, "price.rolling_z_20", "liq.dist_session_vwap", "price.simple_return_1"
             )
             thr = self._sample_param(rng, "entry_threshold", -2.5, -1.0)
-            minutes = self._pick_feature(rng, "temp.minutes_since_open")
-            tmax = self._sample_param(rng, "minutes_open_max", 5.0, 120.0)
             core = op_node(OperatorId.LESS_THAN, feat, thr)
-            window = op_node(OperatorId.LESS_THAN, minutes, tmax)
-            if self.grammar.allows_operator(OperatorId.AND):
+            if self.grammar.allows_operator(OperatorId.AND) and rng.random() < 0.4:
+                minutes = self._pick_feature(rng, "temp.minutes_since_open")
+                tmax = self._sample_param(rng, "minutes_open_max", 60.0, 390.0)
+                window = op_node(OperatorId.LESS_THAN, minutes, tmax)
                 return op_node(OperatorId.AND, core, window)
             return core
         # Fallback: family-constrained boolean leaf
@@ -356,7 +398,17 @@ class CandidateGenerator:
             "vol.realized_20",
         )
         thr = self._sample_param(rng, "exit_threshold", -0.5, 0.5)
-        if pattern in {"zscore_normalize", "mean_reentry", "vwap_reentry", "gap_filled", "vwap_touch"}:
+        if pattern in {"vol_mean_revert", "realized_collapse"}:
+            feat = self._pick_feature(rng, "vol.range_compression_20", "vol.realized_20")
+            thr = self._sample_param(rng, "exit_vol_threshold", 0.2, 0.9)
+            cond = op_node(OperatorId.LESS_THAN, feat, thr)
+            return op_node(OperatorId.EXIT_SIGNAL, cond)
+        if pattern == "gap_filled":
+            feat = self._pick_feature(rng, "price.close_to_open", "liq.dist_session_vwap")
+            thr = self._sample_param(rng, "exit_threshold", 0.0, 0.005)
+            cond = op_node(OperatorId.LESS_THAN, op_node(OperatorId.ABS, feat), thr)
+            return op_node(OperatorId.EXIT_SIGNAL, cond)
+        if pattern in {"zscore_normalize", "mean_reentry", "vwap_reentry", "vwap_touch"}:
             cond = op_node(OperatorId.GREATER_THAN, feat, thr)
         elif pattern in {"momentum_fade", "trend_exhaustion", "ema_loss", "breakout_failure"}:
             cond = op_node(OperatorId.LESS_THAN, feat, thr)
@@ -366,12 +418,19 @@ class CandidateGenerator:
 
     def generate_entry(self, seed: int) -> ExprNode:
         rng = self._rng(seed)
+        prefer_short = bool(rng.random() < 0.45) and self.grammar.allows_operator(OperatorId.ENTRY_SHORT)
+        entry_op = OperatorId.ENTRY_SHORT if prefer_short else OperatorId.ENTRY_LONG
         if self.family_spec is not None and self.family_spec.entry_patterns:
             pattern = self.family_spec.entry_patterns[
                 int(rng.integers(0, len(self.family_spec.entry_patterns)))
             ]
             cond = self._pattern_entry_cond(pattern, rng)
-            entry = op_node(OperatorId.ENTRY_LONG, cond)
+            # Gap fade: fade direction opposite the gap sign → short after up-gap.
+            if pattern in {"gap_fade_entry", "vwap_gap_reversion"} and self.grammar.allows_operator(
+                OperatorId.ENTRY_SHORT
+            ):
+                entry_op = OperatorId.ENTRY_SHORT if rng.random() < 0.5 else OperatorId.ENTRY_LONG
+            entry = op_node(entry_op, cond)
             entry = repair_entry(clamp_lookbacks(entry, self.grammar), self.grammar)
             check_ast_types(entry, path="entry", operation="generate")
             return entry
@@ -383,6 +442,10 @@ class CandidateGenerator:
             param_counter=counter,
         )
         entry = repair_entry(clamp_lookbacks(raw, self.grammar), self.grammar)
+        if entry.name == OperatorId.ENTRY_LONG.value and prefer_short:
+            entry = op_node(OperatorId.ENTRY_SHORT, entry.children[0]) if entry.children else entry
+        elif entry.value_type is ValueType.BOOLEAN:
+            entry = op_node(entry_op, entry)
         check_ast_types(entry, path="entry", operation="generate")
         return entry
 
@@ -425,29 +488,60 @@ class CandidateGenerator:
                 target = None
                 if with_stop:
                     atr = feature_node("vol.atr_14", ValueType.VOLATILITY)
-                    # Ensure ATR feature is in grammar; otherwise skip stops.
                     if any(l.feature_id == "vol.atr_14" for l in self.grammar.feature_leaves):
-                        stop = op_node(OperatorId.ATR_STOP, atr, constant_node(1.5))
-                        target = op_node(OperatorId.ATR_TARGET, atr, constant_node(2.0))
-                check_strategy_trees(entry, exit_tree, stop, target, operation="generate")
+                        stop_mult = self._sample_param(
+                            self._rng(s + 3), "atr_stop_mult", 1.0, 2.5
+                        )
+                        target_mult = self._sample_param(
+                            self._rng(s + 5), "atr_target_mult", 1.5, 4.0
+                        )
+                        stop = op_node(OperatorId.ATR_STOP, atr, stop_mult)
+                        target = op_node(OperatorId.ATR_TARGET, atr, target_mult)
+                regime_gates: tuple = ()
+                if self.family_spec is not None and self.family_spec.regime_constraints:
+                    regime_gates = compile_regime_constraints(self.family_spec.regime_constraints)
+                domain_reason = validate_tree_threshold_domains(entry, self.grammar)
+                if domain_reason is None and exit_tree is not None:
+                    domain_reason = validate_tree_threshold_domains(exit_tree, self.grammar)
+                if domain_reason is not None:
+                    last_reason = domain_reason
+                    continue
+                check_strategy_trees(
+                    entry, exit_tree, stop, target, *regime_gates, operation="generate"
+                )
                 check = structural_precheck(
-                    entry=entry, exit=exit_tree, regime_gates=(), grammar=self.grammar, seed=s
+                    entry=entry,
+                    exit=exit_tree,
+                    regime_gates=regime_gates,
+                    grammar=self.grammar,
+                    seed=s,
                 )
                 if not check.accepted:
                     last_reason = check.reason
                     continue
+                direction = (
+                    "ENTRY_SHORT"
+                    if entry.name == OperatorId.ENTRY_SHORT.value
+                    else "ENTRY_LONG"
+                )
+                prov = {
+                    **self._family_provenance(),
+                    "direction": direction,
+                    "regime_gates_compiled": [c for c in (self.family_spec.regime_constraints if self.family_spec else ())],
+                }
                 cand = build_candidate(
                     entry_tree=entry,
                     exit_tree=exit_tree,
                     stop=stop,
                     target=target,
+                    regime_gates=regime_gates,
                     strategy_family=self.strategy_family,
                     creation_method=CreationMethod.RANDOM,
                     grammar_version=self.grammar.version,
                     feature_set_version=self.feature_set_version,
                     cost_model_version=self.cost_model_version,
                     random_seed=s,
-                    family_provenance=self._family_provenance(),
+                    family_provenance=prov,
                 )
                 check_strategy_trees(
                     cand.entry_tree,

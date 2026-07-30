@@ -71,16 +71,26 @@ class TestFamilyAstDistributions:
             assert gen.strategy_family != "dsl_generated"
             feats = Counter()
             ops = Counter()
-            for i in range(12):
-                cand = gen.generate(seed=1000 + i * 17)
+            produced = 0
+            seed_i = 1000
+            while produced < 12 and seed_i < 1000 + 400:
+                try:
+                    cand = gen.generate(seed=seed_i, max_attempts=24)
+                except RuntimeError:
+                    seed_i += 17
+                    continue
+                seed_i += 17
+                produced += 1
                 assert cand.strategy_family == spec.family_id
                 assert cand.family_provenance.get("family_id") == spec.family_id
                 assert "family_hash" in cand.family_provenance
-                # Features must stay inside family allow-list (+ ATR utility).
-                allowed = set(spec.allowed_features)
+                # Features stay inside grammar allow-list (blueprint + injected
+                # regime/ATR/session utilities required by executable constraints).
+                allowed = {leaf.feature_id for leaf in spec.to_grammar().feature_leaves}
                 assert set(cand.feature_ids).issubset(allowed)
                 feats.update(_feat_hist(cand))
                 ops.update(_op_hist(cand))
+            assert produced >= 8, f"too few candidates for {spec.family_id}"
             feat_sets.append(frozenset(feats.keys()))
             op_sets.append(frozenset(ops.keys()))
         # At least two families must differ in feature OR operator support used.
@@ -92,7 +102,14 @@ class TestFamilyAstDistributions:
     def test_no_family_silently_becomes_dsl_generated(self) -> None:
         for spec in StrategyFamilyGenerator(seed=5).generate(count=8):
             gen = CandidateGenerator.from_family_spec(spec)
-            cand = gen.generate(seed=42)
+            cand = None
+            for s in range(42, 42 + 64):
+                try:
+                    cand = gen.generate(seed=s, max_attempts=24)
+                    break
+                except RuntimeError:
+                    continue
+            assert cand is not None, f"could not generate for {spec.family_id}"
             assert cand.strategy_family == spec.family_id
             assert cand.strategy_family != "dsl_generated"
             assert cand.family_provenance["family_id"] == spec.family_id

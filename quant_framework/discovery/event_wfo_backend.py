@@ -269,6 +269,8 @@ class EventDrivenDiscoveryBackend:
     silver_resolution: dict[str, Any] = field(default_factory=dict)
     _context: EventWFOContext | None = field(default=None, repr=False)
     last_run_artifacts: dict[str, Any] = field(default_factory=dict)
+    available_feature_ids: frozenset[str] | None = None
+    dataset_capabilities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.bars is None:
@@ -332,6 +334,25 @@ class EventDrivenDiscoveryBackend:
                 freq=freq,
                 bars_per_year=252 * bpd,
             )
+        if self.available_feature_ids is None and self.bars is not None:
+            try:
+                from features.generator import FeatureGenerator
+
+                fg = FeatureGenerator()
+                frame = self.bars
+                if "timestamp" in frame.columns and not isinstance(frame.index, pd.DatetimeIndex):
+                    work = frame.set_index(pd.to_datetime(frame["timestamp"], utc=True))
+                else:
+                    work = frame.copy()
+                    if work.index.tz is None and isinstance(work.index, pd.DatetimeIndex):
+                        work.index = work.index.tz_localize("UTC")
+                ff = fg.generate(work)
+                self.available_feature_ids = frozenset(ff.feature_ids)
+                self.dataset_capabilities = tuple(
+                    sorted(str(c) for c in (ff.meta or {}).get("capabilities", []))
+                )
+            except Exception:  # noqa: BLE001 — leave None; evaluator skips check
+                self.available_feature_ids = None
 
     def evaluate(self, candidate: StrategyCandidate) -> tuple[list[FoldOOSMetrics], dict[str, float]]:
         assert self.bars is not None and self.wfo_config is not None and self._context is not None

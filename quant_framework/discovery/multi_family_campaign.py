@@ -12,10 +12,16 @@ from discovery.family_generator import StrategyFamilyGenerator
 from discovery.family_spec import FamilySpec, assert_diverse_family_grammars
 from discovery.fitness import RobustFitness
 from discovery.generator import CandidateGenerator
+from discovery.mutation import Mutator
 from discovery.search_budget import BudgetCounters, SearchBudget
 from discovery.search_controller import DiscoveryRunResult
+from discovery.stable_hash import stable_seed
 from registry.experiment_registry import ExperimentRegistry
 from registry.hashing import sha256_json
+
+STRUCTURAL_PARENT_ELIGIBLE = "STRUCTURAL_PARENT_ELIGIBLE"
+SCORE_QUALIFIED = "SCORE_QUALIFIED"
+NOT_PARENT_ELIGIBLE = "NOT_PARENT_ELIGIBLE"
 
 
 @dataclass
@@ -34,6 +40,9 @@ class FamilyCampaignConfig:
     max_oos_drawdown: float = 0.20
     population_size: int = 2
     stagnation_generations: int = 99
+    family_local_evolution: bool = False
+    evolution_generations: int = 2
+    allow_cross_family_crossover: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -51,6 +60,9 @@ class FamilyCampaignConfig:
             "max_oos_drawdown": self.max_oos_drawdown,
             "population_size": self.population_size,
             "stagnation_generations": self.stagnation_generations,
+            "family_local_evolution": self.family_local_evolution,
+            "evolution_generations": self.evolution_generations,
+            "allow_cross_family_crossover": self.allow_cross_family_crossover,
         }
 
 
@@ -73,6 +85,8 @@ class FamilyStats:
     rejection_reasons: dict[str, int] = field(default_factory=dict)
     best_candidate_ids: list[str] = field(default_factory=list)
     constraints: dict[str, Any] = field(default_factory=dict)
+    parent_status_counts: dict[str, int] = field(default_factory=dict)
+    allocation_detail: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +107,8 @@ class FamilyStats:
             "rejection_reasons": dict(self.rejection_reasons),
             "best_candidate_ids": list(self.best_candidate_ids),
             "constraints": dict(self.constraints),
+            "parent_status_counts": dict(self.parent_status_counts),
+            "allocation_detail": dict(self.allocation_detail),
         }
 
 
@@ -183,7 +199,17 @@ def adaptive_reallocate_wfo(
     max_full_wfo: int,
     early_scores: dict[str, float],
     min_quota: int,
+    early_counts: dict[str, int] | None = None,
+    temperature: float = 1.0,
 ) -> dict[str, int]:
+    """
+    Deterministic softmax-weighted allocation of remaining WFO slots.
+
+    Every family keeps ``min_quota``. Remainder favors stronger but uncertain
+    families (UCB-style bonus for low early sample counts).
+    """
+    import math
+
     n = len(family_ids)
     if n == 0:
         return {}
@@ -194,17 +220,89 @@ def adaptive_reallocate_wfo(
     remainder = max_full_wfo - reserved
     if remainder <= 0:
         return alloc
-    ranked = sorted(
+
+    counts = early_counts or {fid: min_quota for fid in family_ids}
+    finite_scores = [early_scores.get(fid, 0.0) for fid in family_ids]
+    # Replace -inf with slightly below min finite score.
+    finite_vals = [s for s in finite_scores if math.isfinite(s)]
+    floor = (min(finite_vals) - 1.0) if finite_vals else 0.0
+    raw: dict[str, float] = {}
+    total_n = max(1, sum(max(1, int(counts.get(fid, 1))) for fid in family_ids))
+    for fid in family_ids:
+        score = early_scores.get(fid, float("-inf"))
+        if not math.isfinite(score):
+            score = floor
+        n_i = max(1, int(counts.get(fid, 1)))
+        # UCB exploration bonus — prevents one noisy early candidate from killing a family.
+        uncertainty = math.sqrt(2.0 * math.log(total_n + 1.0) / n_i)
+        raw[fid] = float(score) + uncertainty
+
+    # Softmax weights (deterministic).
+    tmax = max(1e-6, float(temperature))
+    peak = max(raw.values())
+    exps = {fid: math.exp((raw[fid] - peak) / tmax) for fid in family_ids}
+    z = sum(exps.values()) or 1.0
+    weights = {fid: exps[fid] / z for fid in family_ids}
+
+    # Largest-remainder method for integer slots.
+    exact = {fid: remainder * weights[fid] for fid in family_ids}
+    base = {fid: int(math.floor(exact[fid])) for fid in family_ids}
+    used = sum(base.values())
+    leftover = remainder - used
+    order = sorted(
         family_ids,
-        key=lambda fid: early_scores.get(fid, float("-inf")),
+        key=lambda fid: (exact[fid] - base[fid], weights[fid], fid),
         reverse=True,
     )
-    i = 0
-    while remainder > 0:
-        alloc[ranked[i % n]] += 1
-        remainder -= 1
-        i += 1
+    for i in range(leftover):
+        base[order[i % n]] += 1
+    for fid in family_ids:
+        alloc[fid] += base[fid]
     return alloc
+
+
+def adaptive_allocation_report(
+    *,
+    family_ids: list[str],
+    initial_quota: dict[str, int],
+    final_quota: dict[str, int],
+    early_scores: dict[str, float],
+    early_candidate_ids: dict[str, list[str]],
+    early_counts: dict[str, int],
+) -> dict[str, dict[str, Any]]:
+    import math
+
+    total_n = max(1, sum(max(1, int(early_counts.get(fid, 1))) for fid in family_ids))
+    out: dict[str, dict[str, Any]] = {}
+    for fid in family_ids:
+        score = early_scores.get(fid, float("-inf"))
+        n_i = max(1, int(early_counts.get(fid, 1)))
+        unc = math.sqrt(2.0 * math.log(total_n + 1.0) / n_i) if math.isfinite(score) else 1.0
+        out[fid] = {
+            "initial_quota": int(initial_quota.get(fid, 0)),
+            "early_candidate_ids": list(early_candidate_ids.get(fid, [])),
+            "early_scores": float(score) if math.isfinite(score) else None,
+            "uncertainty": float(unc),
+            "allocation_weight": None,
+            "final_wfo_quota": int(final_quota.get(fid, 0)),
+            "allocation_reason": (
+                "softmax_ucb_remainder"
+                if final_quota.get(fid, 0) > initial_quota.get(fid, 0)
+                else "min_quota_floor"
+            ),
+        }
+    # Fill weights consistent with adaptive_reallocate_wfo.
+    final = adaptive_reallocate_wfo(
+        family_ids=family_ids,
+        max_full_wfo=sum(final_quota.values()) or 1,
+        early_scores=early_scores,
+        min_quota=0,
+        early_counts=early_counts,
+    )
+    total = sum(final.values()) or 1
+    for fid in family_ids:
+        out[fid]["allocation_weight"] = float(final.get(fid, 0)) / float(total)
+    return out
 
 
 class MultiFamilyCampaign:
@@ -291,18 +389,38 @@ class MultiFamilyCampaign:
         score_qualified = 0
         stress_passed = 0
         evaluated = 0
+        parent_status: dict[str, int] = {
+            STRUCTURAL_PARENT_ELIGIBLE: 0,
+            SCORE_QUALIFIED: 0,
+            NOT_PARENT_ELIGIBLE: 0,
+        }
         for rec in records:
             evaluated += 1
             if rec.rejection_reason:
                 rejections[rec.rejection_reason] = rejections.get(rec.rejection_reason, 0) + 1
-            if rec.outcome is EvalOutcome.REGISTERED and rec.fitness is not None:
+            status = NOT_PARENT_ELIGIBLE
+            if rec.outcome is EvalOutcome.REGISTERED and rec.fitness is not None and not rec.fitness.rejected:
                 score_qualified += 1
+                status = SCORE_QUALIFIED
                 fitnesses.append((float(rec.fitness.fitness), rec.candidate_id))
                 comps = rec.fitness.components or {}
                 if "pos_median_oos_expectancy" in comps:
                     expectancies.append(float(comps["pos_median_oos_expectancy"]))
                 if "pos_oos_profit_factor" in comps:
                     pfs.append(float(comps["pos_oos_profit_factor"]))
+            elif rec.fitness is not None and not rec.fitness.rejected:
+                status = STRUCTURAL_PARENT_ELIGIBLE
+            elif rec.outcome is EvalOutcome.REGISTERED:
+                status = STRUCTURAL_PARENT_ELIGIBLE
+            elif rec.rejection_reason in {
+                "NEGATIVE_EXPECTANCY",
+                "PF_BELOW_ONE",
+                "INSUFFICIENT_OOS_TRADES",
+                "MAX_DRAWDOWN_EXCEEDED",
+            }:
+                # Structural parent may still be eligible without Score Qualified.
+                status = STRUCTURAL_PARENT_ELIGIBLE
+            parent_status[status] = parent_status.get(status, 0) + 1
             if rec.stress_results:
                 passed = sum(
                     1
@@ -340,6 +458,7 @@ class MultiFamilyCampaign:
                 },
                 "complexity_limits": dict(spec.complexity_limits),
             },
+            parent_status_counts=parent_status,
         )
 
     def run(self) -> MultiFamilyCampaignResult:
@@ -385,7 +504,7 @@ class MultiFamilyCampaign:
             seen: set[str] = set()
             while len(pool[fid]) < target and attempts < target * 8:
                 attempts += 1
-                seed_i = int(cfg.seed) + 997 * attempts + (hash(fid) & 0xFFFF)
+                seed_i = stable_seed(cfg.seed, fid, attempts, salt=997)
                 try:
                     cand = generator.generate(seed=seed_i)
                 except Exception:  # noqa: BLE001 — keep generating under budget
@@ -425,16 +544,31 @@ class MultiFamilyCampaign:
                     },
                 )
 
-        # --- Early WFO (equal floor) then optional adaptive remainder ---
+        # --- Early WFO: >=2 candidates/family when budget permits ---
+        early_floor = wfo_floor
+        if cfg.adaptive_reallocation and cfg.max_full_wfo >= len(family_ids) * 2:
+            early_floor = 2
+        elif cfg.max_full_wfo >= len(family_ids):
+            early_floor = max(wfo_floor, 1)
         early_wfo = (
-            {fid: wfo_floor for fid in family_ids}
-            if cfg.adaptive_reallocation and cfg.max_full_wfo > len(family_ids) * wfo_floor
+            {fid: early_floor for fid in family_ids}
+            if cfg.adaptive_reallocation and cfg.max_full_wfo > len(family_ids) * early_floor
             else dict(initial_wfo)
         )
+        # Cap early total to max_full_wfo.
+        early_total = sum(early_wfo.values())
+        if early_total > cfg.max_full_wfo:
+            early_wfo = equal_wfo_allocation(
+                family_ids=family_ids,
+                max_full_wfo=cfg.max_full_wfo,
+                min_per_family=wfo_floor,
+            )
+
         records_by_family: dict[str, list[Any]] = {fid: [] for fid in family_ids}
         evaluated_ids: dict[str, set[str]] = {fid: set() for fid in family_ids}
         full_wfo_counts: dict[str, int] = {fid: 0 for fid in family_ids}
         early_scores: dict[str, float] = {fid: float("-inf") for fid in family_ids}
+        early_candidate_ids: dict[str, list[str]] = {fid: [] for fid in family_ids}
 
         def _evaluate_quota(fid: str, spec: FamilySpec, quota: int) -> None:
             if quota <= 0:
@@ -446,17 +580,28 @@ class MultiFamilyCampaign:
             ev = self._make_evaluator(
                 spec=spec, wfo_cap=quota, gen_cap=max(len(pool[fid]), 1)
             )
+            avail = getattr(self.backend, "available_feature_ids", None)
+            if avail is not None:
+                ev.available_feature_ids = frozenset(avail)
+                ev.dataset_capabilities = tuple(
+                    getattr(self.backend, "dataset_capabilities", ()) or ()
+                )
             for cand in take:
                 rec = ev.evaluate(cand)
                 records_by_family[fid].append(rec)
                 evaluated_ids[fid].add(cand.candidate_id)
+                # FEATURE_UNAVAILABLE must not consume Full WFO budget.
+                if rec.outcome is EvalOutcome.FEATURE_UNAVAILABLE:
+                    continue
                 if bool(getattr(self.backend, "is_full_event_wfo", False)):
                     full_wfo_counts[fid] += 1
                 elif rec.outcome is not EvalOutcome.DUPLICATE_SKIPPED:
-                    # Synthetic probe still counts as an evaluation slot.
                     full_wfo_counts[fid] += 1
-                if rec.fitness is not None:
+                early_candidate_ids[fid].append(cand.candidate_id)
+                if rec.fitness is not None and not rec.fitness.rejected:
                     early_scores[fid] = max(early_scores[fid], float(rec.fitness.fitness))
+                elif rec.fitness is not None:
+                    early_scores[fid] = max(early_scores[fid], float(rec.fitness.fitness) - 1e6)
 
         for spec in families:
             _evaluate_quota(spec.family_id, spec, int(early_wfo[spec.family_id]))
@@ -465,13 +610,56 @@ class MultiFamilyCampaign:
                 {"family_id": spec.family_id, "phase": 1, "full_wfo": full_wfo_counts[spec.family_id]},
             )
 
+        # Optional family-local evolution (same FamilySpec grammar only).
+        if cfg.family_local_evolution:
+            for spec in families:
+                fid = spec.family_id
+                parents = [
+                    c
+                    for c in pool[fid]
+                    if c.candidate_id in evaluated_ids[fid]
+                ]
+                # Prefer structural / score-qualified parents from records.
+                parent_ids = {
+                    rec.candidate_id
+                    for rec in records_by_family[fid]
+                    if rec.outcome
+                    not in {EvalOutcome.FEATURE_UNAVAILABLE, EvalOutcome.INVALID_DSL_TYPE}
+                }
+                parents = [c for c in parents if c.candidate_id in parent_ids] or pool[fid][:2]
+                mutator = Mutator(grammar=spec.to_grammar())
+                for gen_i in range(int(cfg.evolution_generations)):
+                    if len(pool[fid]) >= int(gen_alloc[fid]) + 4:
+                        break
+                    for pi, parent in enumerate(parents[: max(1, cfg.population_size)]):
+                        child_seed = stable_seed(cfg.seed, fid, gen_i, pi, salt=333)
+                        try:
+                            child = mutator.mutate(parent, seed=child_seed)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if child.strategy_family not in {fid, spec.family_id}:
+                            continue
+                        if child.candidate_id in {c.candidate_id for c in pool[fid]}:
+                            continue
+                        pool[fid].append(child)
+
         final_wfo = dict(initial_wfo)
+        alloc_report: dict[str, dict[str, Any]] = {}
         if cfg.adaptive_reallocation and cfg.max_full_wfo > len(family_ids) * wfo_floor:
             final_wfo = adaptive_reallocate_wfo(
                 family_ids=family_ids,
                 max_full_wfo=cfg.max_full_wfo,
                 early_scores=early_scores,
                 min_quota=wfo_floor,
+                early_counts=full_wfo_counts,
+            )
+            alloc_report = adaptive_allocation_report(
+                family_ids=family_ids,
+                initial_quota=early_wfo,
+                final_quota=final_wfo,
+                early_scores=early_scores,
+                early_candidate_ids=early_candidate_ids,
+                early_counts=full_wfo_counts,
             )
             for spec in families:
                 fid = spec.family_id
@@ -483,8 +671,9 @@ class MultiFamilyCampaign:
                     {"family_id": fid, "phase": 2, "full_wfo": full_wfo_counts[fid]},
                 )
 
-        family_stats = [
-            self._stats_from_records(
+        family_stats = []
+        for spec in families:
+            st = self._stats_from_records(
                 spec=spec,
                 records=records_by_family[spec.family_id],
                 generated=len(pool[spec.family_id]),
@@ -492,8 +681,8 @@ class MultiFamilyCampaign:
                 allocation_wfo=final_wfo[spec.family_id],
                 full_wfo=full_wfo_counts[spec.family_id],
             )
-            for spec in families
-        ]
+            st.allocation_detail = dict(alloc_report.get(spec.family_id) or {})
+            family_stats.append(st)
 
         rankings: list[dict[str, Any]] = []
         for st in family_stats:
@@ -523,11 +712,14 @@ class MultiFamilyCampaign:
         allocation_payload = {
             "generated": gen_alloc,
             "full_wfo_initial": initial_wfo,
+            "full_wfo_early": early_wfo,
             "full_wfo_final": final_wfo,
             "adaptive_reallocation": cfg.adaptive_reallocation,
+            "allocation_detail": alloc_report,
             "min_candidates_per_family": cfg.min_candidates_per_family,
             "total_candidate_budget": cfg.total_candidate_budget,
             "max_full_wfo": cfg.max_full_wfo,
+            "family_local_evolution": cfg.family_local_evolution,
         }
         fingerprint = sha256_json(
             {
@@ -570,4 +762,7 @@ def family_campaign_from_config(raw: dict[str, Any] | None) -> FamilyCampaignCon
         max_oos_drawdown=float(raw.get("max_oos_drawdown", raw.get("max_drawdown_limit", 0.20))),
         population_size=int(raw.get("population_size", 2)),
         stagnation_generations=int(raw.get("stagnation_generations", 99)),
+        family_local_evolution=bool(raw.get("family_local_evolution", False)),
+        evolution_generations=int(raw.get("evolution_generations", 2)),
+        allow_cross_family_crossover=bool(raw.get("allow_cross_family_crossover", False)),
     )

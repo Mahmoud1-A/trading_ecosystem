@@ -30,11 +30,15 @@ from discovery.typecheck import (
 from registry.experiment_registry import ExperimentRegistry, TrialStatus
 
 
+FEATURE_UNAVAILABLE = "FEATURE_UNAVAILABLE"
+
+
 class EvalOutcome(str, Enum):
     REGISTERED = "REGISTERED"
     DUPLICATE_SKIPPED = "DUPLICATE_SKIPPED"
     PRECHECK_FAILED = "PRECHECK_FAILED"
     INVALID_DSL_TYPE = "INVALID_DSL_TYPE"
+    FEATURE_UNAVAILABLE = "FEATURE_UNAVAILABLE"
     EVAL_FAILED = "EVAL_FAILED"
     RISK_FAILED = "RISK_FAILED"
     WFO_FAILED = "WFO_FAILED"
@@ -157,6 +161,9 @@ class CandidateEvaluator:
     discovery_run_id: str = "run_unknown"
     grammar: Grammar = field(default_factory=Grammar)
     progress_hook: Callable[[str, dict[str, Any]], None] | None = None
+    # When set, reject candidates whose feature_ids are not subset before Full WFO.
+    available_feature_ids: frozenset[str] | None = None
+    dataset_capabilities: tuple[str, ...] = ()
     _seen_candidate_ids: set[str] = field(default_factory=set)
     _records: list[EvaluationRecord] = field(default_factory=list)
 
@@ -383,6 +390,51 @@ class CandidateEvaluator:
                 {"candidate_id": candidate.candidate_id, "reason": f"precheck:{pre.reason}"},
             )
             return rec
+
+        # Fail before Full WFO when required features are unavailable.
+        avail = self.available_feature_ids
+        if avail is None:
+            avail = getattr(self.backend, "available_feature_ids", None)
+        if avail is not None:
+            required = tuple(candidate.feature_ids)
+            missing = sorted(set(required) - set(avail))
+            if missing:
+                artifact = {
+                    "required_features": list(required),
+                    "available_features": sorted(avail),
+                    "missing_features": missing,
+                    "dataset_capabilities": list(self.dataset_capabilities),
+                }
+                # Do NOT consume Full WFO budget for feature-unavailable candidates.
+                trial_id = self._register(
+                    candidate,
+                    rejection_reason=FEATURE_UNAVAILABLE,
+                    ranking_score=None,
+                    net_metrics={"feature_unavailable": True, **artifact},
+                    trial_status=TrialStatus.FAILED,
+                    failure_reason=FEATURE_UNAVAILABLE,
+                    extra_snapshot={"feature_availability": artifact},
+                )
+                rec = EvaluationRecord(
+                    outcome=EvalOutcome.FEATURE_UNAVAILABLE,
+                    candidate_id=candidate.candidate_id,
+                    lineage_id=candidate.lineage_id,
+                    trial_id=trial_id,
+                    fitness=None,
+                    rejection_reason=FEATURE_UNAVAILABLE,
+                    runtime_seconds=time.perf_counter() - t0,
+                    meta=artifact,
+                )
+                self._records.append(rec)
+                self._emit_progress(
+                    "CANDIDATE_REJECTED",
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "reason": FEATURE_UNAVAILABLE,
+                        **artifact,
+                    },
+                )
+                return rec
 
         try:
             self._emit_progress(

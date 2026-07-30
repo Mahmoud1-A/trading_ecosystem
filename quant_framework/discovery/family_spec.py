@@ -76,7 +76,24 @@ class FamilySpec:
     def to_grammar(self) -> Grammar:
         leaf_by_id = {leaf.feature_id: leaf for leaf in DEFAULT_FEATURE_LEAVES}
         leaves: list[FeatureLeaf] = []
-        for fid in self.allowed_features:
+        feature_ids = list(self.allowed_features)
+        # Inject features required by executable regime constraints.
+        for constraint in self.regime_constraints:
+            if constraint in {"require_trend_regime", "prefer_range_regime"}:
+                feature_ids.append("regime.trend_state")
+            elif constraint == "prefer_vol_expansion":
+                feature_ids.append("regime.volatility_state")
+            elif constraint == "intraday_session_only":
+                feature_ids.append("temp.minutes_since_open")
+            elif constraint == "prefer_liquid_session":
+                feature_ids.append("liq.volume_pct_20")
+        # ATR always available for family stops/targets.
+        feature_ids.append("vol.atr_14")
+        seen: set[str] = set()
+        for fid in feature_ids:
+            if fid in seen:
+                continue
+            seen.add(fid)
             if fid not in leaf_by_id:
                 raise KeyError(f"FamilySpec {self.family_id!r} references unknown feature {fid!r}")
             leaves.append(leaf_by_id[fid])
@@ -94,7 +111,7 @@ class FamilySpec:
             if oid not in OPERATOR_REGISTRY:
                 raise KeyError(f"FamilySpec {self.family_id!r}: operator {name!r} not in registry")
             op_ids.add(oid)
-        # Always permit structural wrappers used by generator/repair.
+        # Always permit structural wrappers used by generator/repair/regime gates.
         for required in (
             OperatorId.ENTRY_LONG,
             OperatorId.ENTRY_SHORT,
@@ -104,6 +121,12 @@ class FamilySpec:
             OperatorId.NOT,
             OperatorId.ATR_STOP,
             OperatorId.ATR_TARGET,
+            OperatorId.REGIME_GATE,
+            OperatorId.ABS,
+            OperatorId.GREATER_THAN,
+            OperatorId.LESS_THAN,
+            OperatorId.GREATER_EQUAL,
+            OperatorId.LESS_EQUAL,
         ):
             if required in OPERATOR_REGISTRY:
                 op_ids.add(required)

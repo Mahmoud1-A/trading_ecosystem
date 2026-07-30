@@ -32,6 +32,7 @@ from discovery.search_budget import (
 )
 from discovery.selection import DiverseSelector, ScoredCandidate
 from discovery.stress import StressTester, attach_stress
+from discovery.stress_backend import make_stress_backend_factory
 from discovery.expression_tree import DSLValidationError
 from discovery.typecheck import InvalidDslTypeError
 from discovery.vault_gateway import MinerVaultError
@@ -100,6 +101,8 @@ class SearchController:
     # UI canary: skip seed template; generate exactly canary_generate_seed once.
     canary_generate_seed: int | None = None
     skip_seed_template: bool = False
+    research_eligible: bool = False
+    synthetic_stress_forbidden: bool = False
 
     def __post_init__(self) -> None:
         trade_fitness = RobustFitness(
@@ -119,12 +122,43 @@ class SearchController:
             grammar=self.generator.grammar,
             progress_hook=self.progress_hook,
         )
+        forbid = bool(self.synthetic_stress_forbidden or self.research_eligible)
         self.stress_tester = StressTester(
             budget=self.budget,
             counters=self.counters,
             fitness_model=trade_fitness,
+            research_eligible=bool(self.research_eligible),
+            synthetic_stress_forbidden=forbid,
         )
-        self.robustness = ParameterRobustness(fitness_model=trade_fitness)
+        self.robustness = ParameterRobustness(
+            fitness_model=trade_fitness,
+            research_eligible=bool(self.research_eligible),
+            synthetic_robustness_forbidden=forbid,
+        )
+
+    def bind_evaluation_backend(self, backend: Any, *, research_eligible: bool | None = None) -> None:
+        """Wire real event backend into evaluator, stress, and robustness."""
+        if research_eligible is not None:
+            self.research_eligible = bool(research_eligible)
+        forbid = bool(self.synthetic_stress_forbidden or self.research_eligible)
+        self.evaluator.backend = backend
+        avail = getattr(backend, "available_feature_ids", None)
+        if avail is not None:
+            self.evaluator.available_feature_ids = frozenset(avail)
+            self.evaluator.dataset_capabilities = tuple(
+                getattr(backend, "dataset_capabilities", ()) or ()
+            )
+        self.stress_tester.research_eligible = bool(self.research_eligible)
+        self.stress_tester.synthetic_stress_forbidden = forbid
+        self.stress_tester.backend_factory = make_stress_backend_factory(
+            backend,
+            research_eligible=bool(self.research_eligible),
+            synthetic_stress_forbidden=forbid,
+        )
+        self.robustness.research_eligible = bool(self.research_eligible)
+        self.robustness.synthetic_robustness_forbidden = forbid
+        self.robustness.backend = backend
+        self.robustness.fitness_model = self.evaluator.fitness_model
 
     def _emit_progress(self, event_name: str, payload: dict[str, Any] | None = None) -> None:
         if self.progress_hook is not None:
@@ -569,7 +603,13 @@ class SearchController:
                     "wider_spread",
                     "worse_slippage",
                     "delayed_execution",
+                    "conservative_intrabar",
+                    "reduced_participation",
                     "removed_best_day",
+                    "removed_best_trades",
+                    "alt_wfo_alignment",
+                    "alt_start_dates",
+                    "regime_exclusion",
                     "parameter_perturbation",
                 ),
             )

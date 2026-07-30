@@ -632,7 +632,9 @@ def run_alpha_miner_job(
                     canary_cfg.get("skip_seed_template") or canary_cfg.get("enabled")
                 ),
             )
-            ctrl.evaluator.backend = backend
+            ctrl.research_eligible = bool(research_eligible)
+            ctrl.synthetic_stress_forbidden = bool(research_eligible)
+            ctrl.bind_evaluation_backend(backend, research_eligible=bool(research_eligible))
 
             def _single_progress(name: str, payload: dict[str, Any]) -> None:
                 counter_proxy.generated = ctrl.counters.generated

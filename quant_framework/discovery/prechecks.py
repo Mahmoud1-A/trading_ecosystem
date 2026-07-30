@@ -117,12 +117,23 @@ def probe_always_same(
 ) -> bool | None:
     """
     Return True if all probes are truthy, False if all falsy, None if mixed/non-boolean.
+
+    Bindings are sampled from feature domains (not N(0,1) for every feature) so
+    TIME / RANK / RETURN probes are economically meaningful.
     """
+    from discovery.feature_domains import domain_for_feature
+
     rng = np.random.default_rng(seed)
     values: list[float] = []
     for _ in range(n_probes):
-        bindings = {f: float(rng.normal()) for f in feature_names}
-        # also bind parameters to defaults via eval_scalar
+        bindings: dict[str, float] = {}
+        for f in feature_names:
+            if f == "_none":
+                continue
+            try:
+                bindings[f] = domain_for_feature(f).sample_threshold(rng)
+            except Exception:  # noqa: BLE001
+                bindings[f] = float(rng.normal())
         values.append(eval_scalar(tree, bindings=bindings))
     arr = np.asarray(values)
     if not np.isfinite(arr).all():
