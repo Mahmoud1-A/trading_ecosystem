@@ -14,6 +14,7 @@ from discovery.evaluator import CandidateEvaluator, EvalOutcome, EvaluationRecor
 from discovery.expression_tree import ExprNode
 from discovery.family_generator import StrategyFamilyGenerator
 from discovery.family_spec import FamilySpec, assert_diverse_family_grammars
+from discovery.feature_domains import validate_tree_threshold_domains
 from discovery.fitness import RobustFitness
 from discovery.generator import CandidateGenerator
 from discovery.grammar import Grammar
@@ -29,6 +30,55 @@ from registry.hashing import sha256_json
 STRUCTURAL_PARENT_ELIGIBLE = "STRUCTURAL_PARENT_ELIGIBLE"
 SCORE_QUALIFIED = "SCORE_QUALIFIED"
 NOT_PARENT_ELIGIBLE = "NOT_PARENT_ELIGIBLE"
+FAMILY_DIRECTION_INCOHERENT = "FAMILY_DIRECTION_INCOHERENT"
+
+# Families whose entry condition sign must economically match ENTRY_LONG/SHORT.
+_DIRECTION_LINKED_FAMILY_IDS = frozenset(
+    {
+        "mean_reversion",
+        "VWAP_reversion",
+        "momentum",
+        "breakout",
+        "gap_fade",
+    }
+)
+
+_FADE_FEATURES = frozenset(
+    {
+        "price.rolling_z_20",
+        "liq.dist_session_vwap",
+        "price.dist_rolling_mean_20",
+        "price.close_to_open",
+    }
+)
+_FOLLOW_FEATURES = frozenset(
+    {
+        "price.return_5",
+        "price.simple_return_1",
+        "price.log_return_1",
+        "price.breakout_distance_20",
+    }
+)
+# Breakout context features inherit follow economics only inside breakout families.
+_BREAKOUT_CONTEXT_FEATURES = frozenset(
+    {
+        "vol.range_compression_20",
+        "liq.volume_pct_20",
+    }
+)
+_UP_OPS = frozenset(
+    {
+        OperatorId.GREATER_THAN.value,
+        OperatorId.CROSS_ABOVE.value,
+    }
+)
+_DOWN_OPS = frozenset(
+    {
+        OperatorId.LESS_THAN.value,
+        OperatorId.CROSS_BELOW.value,
+    }
+)
+_CMP_OPS = _UP_OPS | _DOWN_OPS
 
 # Honest capability declaration: MultiFamily currently screens via Full WFO only.
 PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING = "MULTI_FAMILY_WFO_SCREENING"
@@ -53,6 +103,252 @@ NOT_RESEARCH_SHORTLISTED = "NOT_RESEARCH_SHORTLISTED"
 FAMILY_LOCAL_EVOLUTION_NOT_READY = "FAMILY_LOCAL_EVOLUTION_NOT_READY"
 CROSS_FAMILY_CROSSOVER_UNSUPPORTED = "CROSS_FAMILY_CROSSOVER_UNSUPPORTED"
 FAMILY_STAGNATION = "FAMILY_STAGNATION"
+
+
+@dataclass(frozen=True)
+class DirectionCoherenceResult:
+    """Outcome of :func:`validate_family_direction_coherence`."""
+
+    coherent: bool
+    rejection_reason: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return self.coherent
+
+
+def _numeric_threshold(node: ExprNode | None) -> float | None:
+    if node is None:
+        return None
+    if node.kind is NodeKind.CONSTANT:
+        return float(node.meta.get("value", 0.0))
+    if node.kind is NodeKind.PARAMETER:
+        return float(node.meta.get("default", 0.0))
+    return None
+
+
+def _unwrap_abs_feature(node: ExprNode) -> tuple[str | None, bool]:
+    """Return ``(feature_id, wrapped_in_abs)`` for a comparison left-hand side."""
+    if node.kind is NodeKind.FEATURE:
+        return node.name, False
+    if (
+        node.kind is NodeKind.OPERATOR
+        and node.name == OperatorId.ABS.value
+        and node.children
+        and node.children[0].kind is NodeKind.FEATURE
+    ):
+        return node.children[0].name, True
+    return None, False
+
+
+def _mechanism_for_feature(family_id: str, feature_id: str) -> str | None:
+    """Return ``'fade'``, ``'follow'``, or ``None`` if feature is not directional."""
+    if feature_id in _FADE_FEATURES:
+        # Gap and displacement features are fade economics regardless of family label.
+        return "fade"
+    if feature_id in _FOLLOW_FEATURES:
+        return "follow"
+    if feature_id in _BREAKOUT_CONTEXT_FEATURES and family_id == "breakout":
+        return "follow"
+    return None
+
+
+def _expected_direction_from_comparison(
+    *,
+    mechanism: str,
+    op_name: str,
+    threshold: float | None,
+) -> tuple[str | None, str]:
+    """Map a signed comparison onto the economically required entry direction."""
+    is_up = op_name in _UP_OPS
+    if mechanism == "fade":
+        expected = "ENTRY_SHORT" if is_up else "ENTRY_LONG"
+        if threshold is not None:
+            if expected == "ENTRY_LONG" and threshold > 0:
+                return None, "fade_long_requires_non_positive_threshold"
+            if expected == "ENTRY_SHORT" and threshold < 0:
+                return None, "fade_short_requires_non_negative_threshold"
+        return expected, "fade_signed_condition"
+    if mechanism == "follow":
+        expected = "ENTRY_LONG" if is_up else "ENTRY_SHORT"
+        if threshold is not None:
+            if expected == "ENTRY_LONG" and threshold < 0:
+                return None, "follow_long_requires_non_negative_threshold"
+            if expected == "ENTRY_SHORT" and threshold > 0:
+                return None, "follow_short_requires_non_positive_threshold"
+        return expected, "follow_signed_condition"
+    return None, "unknown_mechanism"
+
+
+def validate_family_direction_coherence(
+    candidate: StrategyCandidate,
+    family_spec: FamilySpec,
+) -> DirectionCoherenceResult:
+    """Prove ENTRY_LONG/SHORT remains economically coherent with the entry condition.
+
+    Direction-linked families (mean reversion, VWAP reversion, momentum, breakout,
+    gap fade) must keep wrapper direction aligned with the signed feature condition.
+    Ambiguous evidence (e.g. ABS(gap) without a signed directional condition) is
+    rejected rather than guessed. Non-direction-linked families pass through.
+    """
+    family_id = str(family_spec.family_id)
+    prov = dict(candidate.family_provenance or {})
+    creation = (
+        candidate.creation_method.value
+        if hasattr(candidate.creation_method, "value")
+        else str(candidate.creation_method)
+    )
+    base_details: dict[str, Any] = {
+        "candidate_id": candidate.candidate_id,
+        "family_id": family_id,
+        "creation_method": creation,
+        "entry_direction": None,
+        "condition_feature": None,
+        "comparison_operator": None,
+        "threshold_value": None,
+        "expected_direction": None,
+        "coherence_reason": None,
+    }
+
+    if family_id not in _DIRECTION_LINKED_FAMILY_IDS:
+        base_details["coherence_reason"] = "family_not_direction_linked"
+        return DirectionCoherenceResult(coherent=True, details=base_details)
+
+    entry = candidate.entry_tree
+    if entry is None or entry.kind is not NodeKind.OPERATOR:
+        base_details["coherence_reason"] = "missing_entry_wrapper"
+        return DirectionCoherenceResult(
+            coherent=False,
+            rejection_reason=FAMILY_DIRECTION_INCOHERENT,
+            details=base_details,
+        )
+    if entry.name not in {
+        OperatorId.ENTRY_LONG.value,
+        OperatorId.ENTRY_SHORT.value,
+    }:
+        base_details["coherence_reason"] = "missing_entry_wrapper"
+        return DirectionCoherenceResult(
+            coherent=False,
+            rejection_reason=FAMILY_DIRECTION_INCOHERENT,
+            details=base_details,
+        )
+
+    entry_direction = entry.name
+    base_details["entry_direction"] = entry_direction
+    if not entry.children:
+        base_details["coherence_reason"] = "missing_entry_condition"
+        return DirectionCoherenceResult(
+            coherent=False,
+            rejection_reason=FAMILY_DIRECTION_INCOHERENT,
+            details=base_details,
+        )
+
+    condition = entry.children[0]
+    # Provenance pattern is advisory; family_id + features are authoritative.
+    _ = prov.get("entry_pattern") or prov.get("pattern")
+
+    expected_votes: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    abs_only_directional = False
+
+    for node in condition.walk():
+        if node.kind is not NodeKind.OPERATOR or node.name not in _CMP_OPS:
+            continue
+        if len(node.children) < 2:
+            continue
+        left, right = node.children[0], node.children[1]
+        feature_id, wrapped_abs = _unwrap_abs_feature(left)
+        if feature_id is None:
+            continue
+        mechanism = _mechanism_for_feature(family_id, feature_id)
+        if mechanism is None:
+            continue
+        if wrapped_abs:
+            # ABS(signed_feature) alone cannot prove trade direction.
+            abs_only_directional = True
+            evidence.append(
+                {
+                    "condition_feature": feature_id,
+                    "comparison_operator": node.name,
+                    "threshold_value": _numeric_threshold(right),
+                    "coherence_reason": "abs_signed_feature_ambiguous",
+                }
+            )
+            continue
+        thr = _numeric_threshold(right)
+        expected, reason = _expected_direction_from_comparison(
+            mechanism=mechanism,
+            op_name=node.name,
+            threshold=thr,
+        )
+        evidence.append(
+            {
+                "condition_feature": feature_id,
+                "comparison_operator": node.name,
+                "threshold_value": thr,
+                "expected_direction": expected,
+                "coherence_reason": reason,
+            }
+        )
+        if expected is None:
+            details = {**base_details, **evidence[-1]}
+            details["coherence_reason"] = reason
+            return DirectionCoherenceResult(
+                coherent=False,
+                rejection_reason=FAMILY_DIRECTION_INCOHERENT,
+                details=details,
+            )
+        expected_votes.append(expected)
+
+    if not expected_votes:
+        reason = (
+            "abs_signed_feature_without_directional_proof"
+            if abs_only_directional
+            else "no_provable_directional_condition"
+        )
+        details = {**base_details, "coherence_reason": reason}
+        if evidence:
+            details.update(evidence[0])
+            details["coherence_reason"] = reason
+        return DirectionCoherenceResult(
+            coherent=False,
+            rejection_reason=FAMILY_DIRECTION_INCOHERENT,
+            details=details,
+        )
+
+    if len(set(expected_votes)) != 1:
+        details = {
+            **base_details,
+            **(evidence[0] if evidence else {}),
+            "expected_direction": sorted(set(expected_votes)),
+            "coherence_reason": "conflicting_directional_conditions",
+        }
+        return DirectionCoherenceResult(
+            coherent=False,
+            rejection_reason=FAMILY_DIRECTION_INCOHERENT,
+            details=details,
+        )
+
+    expected_direction = expected_votes[0]
+    primary = evidence[0] if evidence else {}
+    details = {
+        **base_details,
+        **primary,
+        "expected_direction": expected_direction,
+    }
+    if entry_direction != expected_direction:
+        details["coherence_reason"] = (
+            f"entry_{entry_direction}_conflicts_with_expected_{expected_direction}"
+        )
+        return DirectionCoherenceResult(
+            coherent=False,
+            rejection_reason=FAMILY_DIRECTION_INCOHERENT,
+            details=details,
+        )
+
+    details["coherence_reason"] = "direction_coherent"
+    return DirectionCoherenceResult(coherent=True, details=details)
 
 # Outcomes that must never be used as evolutionary parents.
 _NOT_PARENT_OUTCOMES = frozenset(
@@ -201,6 +497,7 @@ class GenerationRecord:
     minimum_required_improvement: float | None = None
     parent_selection_reasons: dict[str, str] = field(default_factory=dict)
     parent_eligibility: dict[str, str] = field(default_factory=dict)
+    rejected_descendants: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -226,6 +523,7 @@ class GenerationRecord:
             "minimum_required_improvement": self.minimum_required_improvement,
             "parent_selection_reasons": dict(self.parent_selection_reasons),
             "parent_eligibility": dict(self.parent_eligibility),
+            "rejected_descendants": [dict(r) for r in self.rejected_descendants],
         }
 
 
@@ -690,6 +988,25 @@ class MultiFamilyCampaign:
                         return False
         return True
 
+    def _record_rejected_descendant(
+        self,
+        *,
+        greg: GenerationRecord,
+        child: StrategyCandidate,
+        kind: str,
+        rejection_reason: str,
+        details: dict[str, Any],
+        reject_counts: dict[str, int],
+    ) -> None:
+        payload = {
+            "rejection_reason": rejection_reason,
+            "creation_kind": kind,
+            **dict(details),
+        }
+        greg.rejected_descendants.append(payload)
+        reject_counts[rejection_reason] = reject_counts.get(rejection_reason, 0) + 1
+        self._emit("DESCENDANT_REJECTED", payload)
+
     def _bind_evaluator_features(self, ev: CandidateEvaluator) -> None:
         avail = getattr(self.backend, "available_feature_ids", None)
         if avail is not None:
@@ -808,6 +1125,7 @@ class MultiFamilyCampaign:
         records_by_family: dict[str, list[EvaluationRecord]] = {fid: [] for fid in family_ids}
         full_wfo_counts: dict[str, int] = {fid: 0 for fid in family_ids}
         generated_counts: dict[str, int] = {fid: 0 for fid in family_ids}
+        descendant_reject_counts: dict[str, dict[str, int]] = {fid: {} for fid in family_ids}
         cand_by_id: dict[str, StrategyCandidate] = {}
         generation_records: list[GenerationRecord] = []
         seen_ids: set[str] = set()
@@ -1117,7 +1435,61 @@ class MultiFamilyCampaign:
                         return False
                     if child.strategy_family != family_ref:
                         return False
+                    # Type / structural validity already enforced by Mutator/Crossover
+                    # strict mode. Re-check semantic domain, family grammar, and
+                    # family-direction coherence before enqueue; never rewrite.
                     if not self.candidate_within_family_grammar(child, grammar):
+                        self._record_rejected_descendant(
+                            greg=greg,
+                            child=child,
+                            kind=kind,
+                            rejection_reason="FAMILY_GRAMMAR_VIOLATION",
+                            details={
+                                "candidate_id": child.candidate_id,
+                                "family_id": fid,
+                                "creation_method": (
+                                    child.creation_method.value
+                                    if hasattr(child.creation_method, "value")
+                                    else str(child.creation_method)
+                                ),
+                                "coherence_reason": "outside_family_grammar",
+                            },
+                            reject_counts=descendant_reject_counts[fid],
+                        )
+                        return False
+                    domain_reason = validate_tree_threshold_domains(child.entry_tree, grammar)
+                    if domain_reason is None and child.exit_tree is not None:
+                        domain_reason = validate_tree_threshold_domains(child.exit_tree, grammar)
+                    if domain_reason is not None:
+                        self._record_rejected_descendant(
+                            greg=greg,
+                            child=child,
+                            kind=kind,
+                            rejection_reason="INVALID_FEATURE_THRESHOLD_DOMAIN",
+                            details={
+                                "candidate_id": child.candidate_id,
+                                "family_id": fid,
+                                "creation_method": (
+                                    child.creation_method.value
+                                    if hasattr(child.creation_method, "value")
+                                    else str(child.creation_method)
+                                ),
+                                "coherence_reason": domain_reason,
+                            },
+                            reject_counts=descendant_reject_counts[fid],
+                        )
+                        return False
+                    coherence = validate_family_direction_coherence(child, spec)
+                    if not coherence.coherent:
+                        self._record_rejected_descendant(
+                            greg=greg,
+                            child=child,
+                            kind=kind,
+                            rejection_reason=coherence.rejection_reason
+                            or FAMILY_DIRECTION_INCOHERENT,
+                            details=dict(coherence.details),
+                            reject_counts=descendant_reject_counts[fid],
+                        )
                         return False
                     seen_ids.add(child.candidate_id)
                     next_queue.append(child)
@@ -1219,6 +1591,8 @@ class MultiFamilyCampaign:
                 allocation_wfo=wfo_alloc[spec.family_id],
                 full_wfo=full_wfo_counts[spec.family_id],
             )
+            for reason, count in descendant_reject_counts.get(spec.family_id, {}).items():
+                st.rejection_reasons[reason] = st.rejection_reasons.get(reason, 0) + int(count)
             family_stats.append(st)
 
         # Budget invariant assertions (soft: encode into stop / payload).

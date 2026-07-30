@@ -105,6 +105,10 @@ class Mutator:
 
         if choice == 2 and node.kind is NodeKind.OPERATOR:
             spec = OPERATOR_REGISTRY[OperatorId(node.name)]
+            # Never swap ENTRY_LONG <-> ENTRY_SHORT: that inverts economic direction
+            # while leaving the signed condition unchanged.
+            entry_wrappers = {OperatorId.ENTRY_LONG, OperatorId.ENTRY_SHORT}
+            current_op = OperatorId(node.name)
             alts = [
                 oid
                 for oid, s in OPERATOR_REGISTRY.items()
@@ -112,6 +116,11 @@ class Mutator:
                 and s.output_type is spec.output_type
                 and s.input_types == spec.input_types
                 and self.grammar.allows_operator(oid)
+                and not (
+                    current_op in entry_wrappers
+                    and oid in entry_wrappers
+                    and oid is not current_op
+                )
             ]
             if alts:
                 new_op = alts[int(rng.integers(0, len(alts)))]
@@ -144,6 +153,12 @@ class Mutator:
         if node.value_type is ValueType.ORDER_INTENT:
             from discovery.types import NUMERIC_TYPES
 
+            # Preserve the existing ENTRY_LONG / ENTRY_SHORT wrapper; only rebuild
+            # the condition. Campaign-level direction coherence still rejects
+            # economically inverted signed conditions.
+            entry_op = OperatorId(node.name) if node.kind is NodeKind.OPERATOR else OperatorId.ENTRY_LONG
+            if entry_op not in {OperatorId.ENTRY_LONG, OperatorId.ENTRY_SHORT}:
+                entry_op = OperatorId.ENTRY_LONG
             numeric = [l for l in self.grammar.feature_leaves if l.value_type in NUMERIC_TYPES]
             leaf = numeric[int(rng.integers(0, len(numeric)))] if numeric else self.grammar.feature_leaves[0]
             cond = op_node(
@@ -151,7 +166,7 @@ class Mutator:
                 feature_node(leaf.feature_id, leaf.value_type),
                 constant_node(float(rng.normal())),
             )
-            return self._replace(tree, idx, op_node(OperatorId.ENTRY_LONG, cond))
+            return self._replace(tree, idx, op_node(entry_op, cond))
         return tree
 
     def mutate(
