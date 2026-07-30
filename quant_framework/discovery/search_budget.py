@@ -69,6 +69,7 @@ def search_budget_from_config(budget_cfg: dict[str, Any] | None = None) -> Searc
         max_evaluated_candidates=int(cfg.get("max_evaluated_candidates", 10)),
         max_full_wfo_evaluations=int(cfg.get("max_full_wfo_evaluations", 10)),
         max_stress_evaluations=int(cfg.get("max_stress_evaluations", 4)),
+        max_robustness_evaluations=int(cfg.get("max_robustness_evaluations", 40)),
         population_size=pop_size,
         elite_count=int(cfg.get("elite_count", 1)),
         stagnation_limit=int(stag_gens),
@@ -108,6 +109,7 @@ class SearchBudget:
     max_candidates_per_feature_family: int = 64
     max_full_wfo_evaluations: int = 32
     max_stress_evaluations: int = 8
+    max_robustness_evaluations: int = 40
     max_vault_submissions: int = 2
     # Closed OOS trade floors — zero-trade candidates cannot score-qualify.
     min_oos_trades: int = 8
@@ -162,6 +164,7 @@ class BudgetCounters:
     full_wfo: int = 0
     invalid: int = 0
     stress: int = 0
+    robustness: int = 0
     vault_submissions: int = 0
     stagnant_generations: int = 0
     generations_completed: int = 0
@@ -264,6 +267,9 @@ class BudgetCounters:
             return "max_full_wfo_evaluations"
         if self.stress >= budget.max_stress_evaluations:
             return "max_stress_evaluations"
+        max_rob = int(getattr(budget, "max_robustness_evaluations", 0) or 0)
+        if max_rob > 0 and self.robustness >= max_rob:
+            return "max_robustness_evaluations"
         if self.vault_submissions >= budget.max_vault_submissions:
             return "max_vault_submissions"
         if self.runtime_seconds >= budget.max_runtime_seconds:

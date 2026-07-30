@@ -15,7 +15,7 @@ from discovery.multi_family_campaign import (
     CROSS_FAMILY_CROSSOVER_UNSUPPORTED,
     EMPTY_COLLECTIONS_REASONS,
     NOT_RESEARCH_SHORTLISTED,
-    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING,
+    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING,
     PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING,
     POST_WFO_BLOCKED_REASONS,
     POST_WFO_PIPELINE_NOT_RUN,
@@ -182,7 +182,7 @@ class TestIncompleteEvolutionGuards:
             discovery_run_id="test_evo_ready",
         )
         result = campaign.run()
-        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING
+        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING
         assert result.post_wfo_pipeline_complete is False
         assert result.discovery_results[0].finalists == []
         assert result.discovery_results[0].promoted == []
@@ -191,8 +191,9 @@ class TestIncompleteEvolutionGuards:
         assert result.generation_records
         assert result.discovery_results[0].generations == len(result.generation_records)
         assert result.stress_pipeline_complete is True
+        assert result.robustness_pipeline_complete is True
         assert STRESS_NOT_RUN not in result.post_wfo_blocked_reasons
-        assert ROBUSTNESS_NOT_RUN in result.post_wfo_blocked_reasons
+        assert ROBUSTNESS_NOT_RUN not in result.post_wfo_blocked_reasons
 
     def test_cross_family_crossover_fails_fast(self, tmp_path: Path) -> None:
         registry = ExperimentRegistry(tmp_path / "reg_xover")

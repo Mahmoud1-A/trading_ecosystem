@@ -11,10 +11,8 @@ import pytest
 from discovery.evaluator import EvalOutcome, EvaluationRecord, SyntheticOOSBackend
 from discovery.fitness import FitnessResult, FoldOOSMetrics
 from discovery.multi_family_campaign import (
-    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING,
-    POST_STRESS_BLOCKED_REASONS,
+    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING,
     REAL_STRESS_BACKEND_REQUIRED,
-    ROBUSTNESS_NOT_RUN,
     SCORE_QUALIFIED,
     STATISTICS_NOT_RUN,
     STRESS_BUDGET_EXHAUSTED,
@@ -452,7 +450,7 @@ class TestStatusHistoryAndGates:
         assert result.research_shortlist == []
         assert result.vault_candidates == []
         assert result.paper_candidates == []
-        assert result.robustness_pipeline_complete is False
+        assert result.robustness_pipeline_complete is True
         assert result.statistics_pipeline_complete is False
         assert result.clustering_pipeline_complete is False
 
@@ -470,15 +468,17 @@ class TestStatusHistoryAndGates:
         assert payload["research_shortlist"] == []
         assert payload["vault_candidates"] == []
         assert payload["paper_candidates"] == []
-        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING
+        assert result.pipeline_level == (
+            "MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING"
+        )
         assert result.stress_pipeline_complete is True
+        assert result.robustness_pipeline_complete is True
         assert result.post_wfo_pipeline_complete is False
         for reason in (
-            ROBUSTNESS_NOT_RUN,
             STATISTICS_NOT_RUN,
         ):
             assert reason in result.post_wfo_blocked_reasons
-        assert list(result.post_wfo_blocked_reasons) == list(POST_STRESS_BLOCKED_REASONS)
+        assert "ROBUSTNESS_NOT_RUN" not in result.post_wfo_blocked_reasons
         for claim in (
             "finalist",
             "promoted",
@@ -487,6 +487,7 @@ class TestStatusHistoryAndGates:
             "paper eligible",
         ):
             assert claim in payload["stress_passed_does_not_mean"]
+        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING
 
 
 class TestStressBudget:

@@ -28,6 +28,25 @@ from discovery.operators import OperatorId
 from discovery.search_budget import BudgetCounters, SearchBudget
 from discovery.search_controller import DiscoveryRunResult
 from discovery.stable_hash import stable_seed
+from discovery.parameter_robustness import (
+    PARAMETER_BUDGET_NOT_REACHED,
+    PARAMETER_INSUFFICIENT_NEIGHBORHOOD,
+    PARAMETER_INTEGRITY_FAILED,
+    PARAMETER_NOT_BOUND,
+    PARAMETER_ROBUST,
+    PARAMETER_UNSTABLE,
+    ParameterRobustness,
+    ParameterRobustnessSummary,
+    REAL_ROBUSTNESS_BACKEND_REQUIRED,
+    ROBUSTNESS_BACKEND_KIND_INVALID,
+    ROBUSTNESS_BUDGET_EXHAUSTED,
+    ROBUSTNESS_INSUFFICIENT_VALID_NEIGHBORHOOD,
+    ROBUSTNESS_INTEGRITY_FAILED,
+    ROBUSTNESS_PARAMETER_NOT_BOUND,
+    ROBUSTNESS_SIGNAL_SOURCE_INVALID,
+    ROBUSTNESS_WFO_INCOMPLETE,
+    SYNTHETIC_ROBUSTNESS_FORBIDDEN,
+)
 from discovery.stress import StressResult, StressTester, attach_stress
 from discovery.stress_backend import (
     STRESS_BACKEND_KIND,
@@ -49,6 +68,10 @@ STRESS_TESTED = "STRESS_TESTED"
 STRESS_PASSED = "STRESS_PASSED"
 STRESS_FAILED = "STRESS_FAILED"
 STRESS_NOT_ENTERED = "STRESS_NOT_ENTERED"
+ROBUSTNESS_TESTED = "ROBUSTNESS_TESTED"
+ROBUSTNESS_PASSED = "ROBUSTNESS_PASSED"
+ROBUSTNESS_FAILED = "ROBUSTNESS_FAILED"
+ROBUSTNESS_NOT_ENTERED = "ROBUSTNESS_NOT_ENTERED"
 
 # Explicit Stress integrity / entry failures.
 REAL_STRESS_BACKEND_REQUIRED = "REAL_STRESS_BACKEND_REQUIRED"
@@ -62,8 +85,14 @@ STRESS_UNSUPPORTED_REQUIRED = "STRESS_UNSUPPORTED_REQUIRED"
 STRESS_BASELINE_UNAVAILABLE_REQUIRED = "STRESS_BASELINE_UNAVAILABLE_REQUIRED"
 STRESS_PASS_RATE_LOW = "STRESS_PASS_RATE_LOW"
 
+# Explicit Robustness integrity / entry failures.
+ROBUSTNESS_INCOMPLETE = "ROBUSTNESS_INCOMPLETE"
+ROBUSTNESS_PARAMETER_UNSTABLE = "ROBUSTNESS_PARAMETER_UNSTABLE"
+
 _REQUIRED_STRESS_SIGNAL_SOURCE = "candidate_dsl_trees"
 _REQUIRED_STRESS_BACKEND_KIND = STRESS_BACKEND_KIND
+_REQUIRED_ROBUSTNESS_SIGNAL_SOURCE = "candidate_dsl_trees"
+_REQUIRED_ROBUSTNESS_BACKEND_KIND = "event_driven_wfo"
 BASELINE_ARTIFACT_SOURCE_ORIGINAL_WFO = "original_qualifying_wfo"
 
 DEFAULT_MULTIFAMILY_STRESS_SCENARIOS: tuple[str, ...] = (
@@ -135,6 +164,9 @@ PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_WFO_SCREENING = (
 PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING = (
     "MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING"
 )
+PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING = (
+    "MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING"
+)
 SCORE_QUALIFIED_MEANING = "passed economic WFO qualification"
 SCORE_QUALIFIED_DOES_NOT_MEAN = (
     "finalist",
@@ -150,6 +182,14 @@ STRESS_PASSED_DOES_NOT_MEAN = (
     "research shortlisted",
     "vault eligible",
     "paper eligible",
+)
+ROBUSTNESS_PASSED_DOES_NOT_MEAN = (
+    "finalist",
+    "promoted",
+    "research shortlisted",
+    "vault eligible",
+    "paper eligible",
+    "live eligible",
 )
 
 POST_WFO_PIPELINE_NOT_RUN = "POST_WFO_PIPELINE_NOT_RUN"
@@ -494,6 +534,17 @@ POST_STRESS_BLOCKED_REASONS: tuple[str, ...] = (
     LIVE_NOT_RUN,
 )
 
+# After Phase 3B.2 Robustness orchestration: Robustness ran; later stages blocked.
+POST_ROBUSTNESS_BLOCKED_REASONS: tuple[str, ...] = (
+    POST_WFO_PIPELINE_NOT_RUN,
+    STATISTICS_NOT_RUN,
+    CLUSTERING_NOT_RUN,
+    NOT_RESEARCH_SHORTLISTED,
+    VAULT_NOT_RUN,
+    PAPER_NOT_RUN,
+    LIVE_NOT_RUN,
+)
+
 EMPTY_COLLECTIONS_REASONS: dict[str, list[str]] = {
     "finalists": [
         POST_WFO_PIPELINE_NOT_RUN,
@@ -516,6 +567,20 @@ EMPTY_COLLECTIONS_REASONS_AFTER_STRESS: dict[str, list[str]] = {
         NOT_RESEARCH_SHORTLISTED,
     ],
     "promoted": [POST_WFO_PIPELINE_NOT_RUN, ROBUSTNESS_NOT_RUN],
+    "clusters": [POST_WFO_PIPELINE_NOT_RUN, CLUSTERING_NOT_RUN],
+    "research_shortlist": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
+    "vault_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED, VAULT_NOT_RUN],
+    "paper_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED, PAPER_NOT_RUN],
+}
+
+EMPTY_COLLECTIONS_REASONS_AFTER_ROBUSTNESS: dict[str, list[str]] = {
+    "finalists": [
+        POST_WFO_PIPELINE_NOT_RUN,
+        STATISTICS_NOT_RUN,
+        CLUSTERING_NOT_RUN,
+        NOT_RESEARCH_SHORTLISTED,
+    ],
+    "promoted": [POST_WFO_PIPELINE_NOT_RUN, STATISTICS_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
     "clusters": [POST_WFO_PIPELINE_NOT_RUN, CLUSTERING_NOT_RUN],
     "research_shortlist": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
     "vault_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED, VAULT_NOT_RUN],
@@ -549,6 +614,13 @@ class FamilyCampaignConfig:
     min_stress_pass_rate: float = 0.5
     stress_scenarios: tuple[str, ...] | None = None
     fail_closed_unsupported_stress: bool = True
+    # Phase 3B.2 Robustness orchestration (evolutionary path).
+    max_robustness_candidates: int = 2
+    max_robustness_evaluations: int = 30
+    max_parameters_per_candidate: int = 2
+    max_points_per_parameter: int = 5
+    allow_one_sided_neighborhood: bool = False
+    min_valid_neighborhood_points: int = 3
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -577,6 +649,12 @@ class FamilyCampaignConfig:
                 list(self.stress_scenarios) if self.stress_scenarios is not None else None
             ),
             "fail_closed_unsupported_stress": self.fail_closed_unsupported_stress,
+            "max_robustness_candidates": self.max_robustness_candidates,
+            "max_robustness_evaluations": self.max_robustness_evaluations,
+            "max_parameters_per_candidate": self.max_parameters_per_candidate,
+            "max_points_per_parameter": self.max_points_per_parameter,
+            "allow_one_sided_neighborhood": self.allow_one_sided_neighborhood,
+            "min_valid_neighborhood_points": self.min_valid_neighborhood_points,
         }
 
 
@@ -825,6 +903,100 @@ class CampaignStressAccounting:
 
 
 @dataclass
+class CandidateRobustnessSummary:
+    """Deterministic candidate-level Robustness summary (Phase 3B.2)."""
+
+    candidate_id: str
+    family_id: str
+    generation: int
+    lineage: dict[str, Any]
+    stress_passed_proof: dict[str, Any]
+    backend_kind: str
+    research_eligible: bool
+    selected_parameter_names: list[str] = field(default_factory=list)
+    parameter_selection_reason: str = ""
+    parameter_summaries: list[dict[str, Any]] = field(default_factory=list)
+    total_planned_points: int = 0
+    real_evaluated_points: int = 0
+    not_applicable_points: int = 0
+    integrity_failed_points: int = 0
+    robustness_backend_calls: int = 0
+    robustness_counter_delta: int = 0
+    budget_consumed: int = 0
+    max_robustness_evaluations: int = 0
+    robustness_budget_remaining: int = 0
+    accepted_parameter_count: int = 0
+    failed_parameter_count: int = 0
+    final_decision: str = ROBUSTNESS_NOT_ENTERED
+    final_reason: str = ""
+    stop_reason: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "family_id": self.family_id,
+            "generation": self.generation,
+            "lineage": dict(self.lineage),
+            "stress_passed_proof": dict(self.stress_passed_proof),
+            "backend_kind": self.backend_kind,
+            "research_eligible": self.research_eligible,
+            "selected_parameter_names": list(self.selected_parameter_names),
+            "parameter_selection_reason": self.parameter_selection_reason,
+            "parameter_summaries": [dict(p) for p in self.parameter_summaries],
+            "total_planned_points": self.total_planned_points,
+            "real_evaluated_points": self.real_evaluated_points,
+            "not_applicable_points": self.not_applicable_points,
+            "integrity_failed_points": self.integrity_failed_points,
+            "robustness_backend_calls": self.robustness_backend_calls,
+            "robustness_counter_delta": self.robustness_counter_delta,
+            "budget_consumed": self.budget_consumed,
+            "max_robustness_evaluations": self.max_robustness_evaluations,
+            "robustness_budget_remaining": self.robustness_budget_remaining,
+            "accepted_parameter_count": self.accepted_parameter_count,
+            "failed_parameter_count": self.failed_parameter_count,
+            "final_decision": self.final_decision,
+            "final_reason": self.final_reason,
+            "stop_reason": self.stop_reason,
+        }
+
+
+@dataclass
+class CampaignRobustnessAccounting:
+    """Campaign-level Robustness budget and evaluation counters."""
+
+    max_robustness_candidates: int = 0
+    max_robustness_evaluations: int = 0
+    max_parameters_per_candidate: int = 0
+    max_points_per_parameter: int = 0
+    robustness_evaluations_consumed: int = 0
+    candidates_stress_passed: int = 0
+    candidates_robustness_entered: int = 0
+    candidates_robustness_passed: int = 0
+    candidates_robustness_failed: int = 0
+    candidates_robustness_not_entered: int = 0
+    robustness_backend_calls: int = 0
+    robustness_counter_delta: int = 0
+    stop_reason: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "max_robustness_candidates": self.max_robustness_candidates,
+            "max_robustness_evaluations": self.max_robustness_evaluations,
+            "max_parameters_per_candidate": self.max_parameters_per_candidate,
+            "max_points_per_parameter": self.max_points_per_parameter,
+            "robustness_evaluations_consumed": self.robustness_evaluations_consumed,
+            "candidates_stress_passed": self.candidates_stress_passed,
+            "candidates_robustness_entered": self.candidates_robustness_entered,
+            "candidates_robustness_passed": self.candidates_robustness_passed,
+            "candidates_robustness_failed": self.candidates_robustness_failed,
+            "candidates_robustness_not_entered": self.candidates_robustness_not_entered,
+            "robustness_backend_calls": self.robustness_backend_calls,
+            "robustness_counter_delta": self.robustness_counter_delta,
+            "stop_reason": self.stop_reason,
+        }
+
+
+@dataclass
 class MultiFamilyCampaignResult:
     campaign_id: str
     families: list[FamilySpec]
@@ -846,6 +1018,7 @@ class MultiFamilyCampaignResult:
     score_qualified_meaning: str = SCORE_QUALIFIED_MEANING
     score_qualified_does_not_mean: tuple[str, ...] = SCORE_QUALIFIED_DOES_NOT_MEAN
     stress_passed_does_not_mean: tuple[str, ...] = STRESS_PASSED_DOES_NOT_MEAN
+    robustness_passed_does_not_mean: tuple[str, ...] = ROBUSTNESS_PASSED_DOES_NOT_MEAN
     post_wfo_blocked_reasons: list[str] = field(
         default_factory=lambda: list(POST_WFO_BLOCKED_REASONS)
     )
@@ -859,6 +1032,10 @@ class MultiFamilyCampaignResult:
     candidate_status_history: list[CandidateStatusEvent] = field(default_factory=list)
     candidate_stress_summaries: list[CandidateStressSummary] = field(default_factory=list)
     stress_accounting: CampaignStressAccounting | None = None
+    candidate_robustness_summaries: list[CandidateRobustnessSummary] = field(
+        default_factory=list
+    )
+    robustness_accounting: CampaignRobustnessAccounting | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -886,6 +1063,7 @@ class MultiFamilyCampaignResult:
             "score_qualified_meaning": self.score_qualified_meaning,
             "score_qualified_does_not_mean": list(self.score_qualified_does_not_mean),
             "stress_passed_does_not_mean": list(self.stress_passed_does_not_mean),
+            "robustness_passed_does_not_mean": list(self.robustness_passed_does_not_mean),
             "post_wfo_blocked_reasons": list(self.post_wfo_blocked_reasons),
             "empty_collections_reasons": {
                 k: list(v) for k, v in self.empty_collections_reasons.items()
@@ -898,6 +1076,14 @@ class MultiFamilyCampaignResult:
             "candidate_stress_summaries": [s.as_dict() for s in self.candidate_stress_summaries],
             "stress_accounting": (
                 self.stress_accounting.as_dict() if self.stress_accounting is not None else None
+            ),
+            "candidate_robustness_summaries": [
+                s.as_dict() for s in self.candidate_robustness_summaries
+            ],
+            "robustness_accounting": (
+                self.robustness_accounting.as_dict()
+                if self.robustness_accounting is not None
+                else None
             ),
             # Explicit empty post-WFO surfaces — never silent.
             "finalists": [],
@@ -1091,6 +1277,7 @@ class MultiFamilyCampaign:
         research_eligible: bool = True,
         synthetic_stress_forbidden: bool | None = None,
         stress_backend_factory: Callable[[str], Any] | None = None,
+        synthetic_robustness_forbidden: bool | None = None,
     ) -> None:
         self.config = config
         self.registry = registry
@@ -1105,11 +1292,18 @@ class MultiFamilyCampaign:
             if synthetic_stress_forbidden is not None
             else bool(research_eligible)
         )
+        self.synthetic_robustness_forbidden = (
+            bool(synthetic_robustness_forbidden)
+            if synthetic_robustness_forbidden is not None
+            else bool(research_eligible)
+        )
         self.stress_backend_factory = stress_backend_factory
         self._status_seq = 0
         self.candidate_status_history: list[CandidateStatusEvent] = []
         self.candidate_stress_summaries: list[CandidateStressSummary] = []
         self.stress_accounting: CampaignStressAccounting | None = None
+        self.candidate_robustness_summaries: list[CandidateRobustnessSummary] = []
+        self.robustness_accounting: CampaignRobustnessAccounting | None = None
 
     def _emit(self, name: str, payload: dict[str, Any] | None = None) -> None:
         if self.progress_hook is not None:
@@ -1880,6 +2074,457 @@ class MultiFamilyCampaign:
         )
         return accounting
 
+    @classmethod
+    def robustness_entry_eligibility(
+        cls,
+        cand: StrategyCandidate,
+        stress_summary: CandidateStressSummary | None,
+        *,
+        stress_pipeline_complete: bool,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Return (may_enter_robustness, reason, stress_passed_proof)."""
+        proof: dict[str, Any] = {
+            "stress_pipeline_complete": bool(stress_pipeline_complete),
+            "candidate_id": cand.candidate_id,
+        }
+        if stress_summary is None:
+            proof["final_decision"] = STRESS_NOT_ENTERED
+            return False, f"{ROBUSTNESS_NOT_ENTERED}:did_not_enter_stress", proof
+
+        proof.update(
+            {
+                "final_decision": stress_summary.final_decision,
+                "total_scenarios_executed": stress_summary.total_scenarios_executed,
+                "denominator": stress_summary.denominator,
+                "integrity_failures": list(stress_summary.integrity_failures),
+                "scenario_backend_calls": stress_summary.scenario_backend_calls,
+                "stress_counter_delta": stress_summary.stress_counter_delta,
+                "baseline_candidate_id": stress_summary.baseline_candidate_id,
+                "hidden_baseline_rerun": stress_summary.hidden_baseline_rerun,
+                "baseline_artifact_source": stress_summary.baseline_artifact_source,
+            }
+        )
+        if stress_summary.final_decision != STRESS_PASSED:
+            return (
+                False,
+                f"{ROBUSTNESS_NOT_ENTERED}:{stress_summary.final_decision}",
+                proof,
+            )
+        if not stress_pipeline_complete:
+            return False, f"{ROBUSTNESS_NOT_ENTERED}:stress_pipeline_incomplete", proof
+        if int(stress_summary.total_scenarios_executed) <= 0:
+            return False, f"{ROBUSTNESS_NOT_ENTERED}:{STRESS_NO_EXECUTED_SCENARIOS}", proof
+        if int(stress_summary.denominator) <= 0:
+            return False, f"{ROBUSTNESS_NOT_ENTERED}:{STRESS_NO_EXECUTED_SCENARIOS}", proof
+        if stress_summary.integrity_failures:
+            return False, f"{ROBUSTNESS_NOT_ENTERED}:{STRESS_INTEGRITY_FAILED}", proof
+        if int(stress_summary.scenario_backend_calls) != int(stress_summary.stress_counter_delta):
+            return False, f"{ROBUSTNESS_NOT_ENTERED}:stress_budget_accounting_mismatch", proof
+        baseline_cid = stress_summary.baseline_candidate_id
+        if baseline_cid is not None and str(baseline_cid) != str(cand.candidate_id):
+            return False, f"{ROBUSTNESS_NOT_ENTERED}:baseline_candidate_mismatch", proof
+        if bool(stress_summary.hidden_baseline_rerun):
+            return False, f"{ROBUSTNESS_NOT_ENTERED}:hidden_baseline_rerun", proof
+        proof["stress_passed"] = True
+        return True, STRESS_PASSED, proof
+
+    def _resolve_robustness_probe(
+        self, *, counters: BudgetCounters
+    ) -> tuple[ParameterRobustness | None, str | None, str]:
+        """Return (probe, bind_error, backend_kind_label)."""
+        forbid = bool(self.synthetic_robustness_forbidden or self.research_eligible)
+        cfg = self.config
+        default_steps = (-0.2, -0.1, 0.0, 0.1, 0.2)
+        steps = default_steps[: max(1, int(cfg.max_points_per_parameter))]
+        fitness = RobustFitness(
+            min_total_oos_trades=int(cfg.min_oos_trades),
+            min_oos_trades_per_fold=int(cfg.min_oos_trades_per_fold),
+            max_oos_drawdown=float(cfg.max_oos_drawdown),
+        )
+        if forbid and isinstance(self.backend, SyntheticOOSBackend):
+            return None, SYNTHETIC_ROBUSTNESS_FORBIDDEN, "synthetic_oos_probe"
+
+        from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
+
+        kind = str(getattr(self.backend, "backend_kind", type(self.backend).__name__))
+        if forbid and not isinstance(self.backend, EventDrivenDiscoveryBackend):
+            if kind != _REQUIRED_ROBUSTNESS_BACKEND_KIND:
+                return None, REAL_ROBUSTNESS_BACKEND_REQUIRED, kind
+
+        probe = ParameterRobustness(
+            relative_steps=steps,
+            backend=self.backend,
+            fitness_model=fitness,
+            research_eligible=bool(self.research_eligible),
+            synthetic_robustness_forbidden=forbid,
+            expected_backend_kind=_REQUIRED_ROBUSTNESS_BACKEND_KIND,
+            min_valid_neighborhood_points=int(cfg.min_valid_neighborhood_points),
+            allow_one_sided_neighborhood=bool(cfg.allow_one_sided_neighborhood),
+        )
+        _ = counters
+        return probe, None, kind if kind else _REQUIRED_ROBUSTNESS_BACKEND_KIND
+
+    def _select_robustness_parameters(
+        self, cand: StrategyCandidate
+    ) -> tuple[list[str], str]:
+        names = sorted(str(n) for n in cand.parameters.keys())
+        cap = max(0, int(self.config.max_parameters_per_candidate))
+        selected = names[:cap] if cap else names
+        reason = f"deterministic_sorted_name_cap_{cap}"
+        return selected, reason
+
+    def _decide_candidate_robustness(
+        self,
+        *,
+        param_summaries: list[ParameterRobustnessSummary],
+        selected_names: list[str],
+        budget_truncated: bool,
+    ) -> tuple[str, str]:
+        if not selected_names:
+            return ROBUSTNESS_FAILED, ROBUSTNESS_INCOMPLETE
+        by_name = {p.parameter: p for p in param_summaries}
+        if any(n not in by_name for n in selected_names):
+            return ROBUSTNESS_FAILED, ROBUSTNESS_INCOMPLETE
+        for name in selected_names:
+            p = by_name[name]
+            if p.final_parameter_decision == PARAMETER_NOT_BOUND:
+                return ROBUSTNESS_FAILED, ROBUSTNESS_PARAMETER_NOT_BOUND
+            if p.final_parameter_decision == PARAMETER_INTEGRITY_FAILED:
+                return ROBUSTNESS_FAILED, ROBUSTNESS_INTEGRITY_FAILED
+            if p.final_parameter_decision == PARAMETER_INSUFFICIENT_NEIGHBORHOOD:
+                return ROBUSTNESS_FAILED, ROBUSTNESS_INSUFFICIENT_VALID_NEIGHBORHOOD
+            if p.final_parameter_decision == PARAMETER_BUDGET_NOT_REACHED:
+                return ROBUSTNESS_FAILED, ROBUSTNESS_BUDGET_EXHAUSTED
+            if p.final_parameter_decision == PARAMETER_UNSTABLE:
+                return ROBUSTNESS_FAILED, ROBUSTNESS_PARAMETER_UNSTABLE
+            if p.final_parameter_decision != PARAMETER_ROBUST:
+                return ROBUSTNESS_FAILED, p.final_reason or ROBUSTNESS_INCOMPLETE
+        if budget_truncated:
+            return ROBUSTNESS_FAILED, ROBUSTNESS_BUDGET_EXHAUSTED
+        return ROBUSTNESS_PASSED, "all_required_parameters_robust"
+
+    def _run_robustness_phase(
+        self,
+        *,
+        families: list[FamilySpec],
+        records_by_family: dict[str, list[EvaluationRecord]],
+        cand_by_id: dict[str, StrategyCandidate],
+        t0: float,
+        stress_pipeline_complete: bool,
+    ) -> CampaignRobustnessAccounting:
+        """Connect STRESS_PASSED candidates to real Parameter Robustness."""
+        cfg = self.config
+        accounting = CampaignRobustnessAccounting(
+            max_robustness_candidates=int(cfg.max_robustness_candidates),
+            max_robustness_evaluations=int(cfg.max_robustness_evaluations),
+            max_parameters_per_candidate=int(cfg.max_parameters_per_candidate),
+            max_points_per_parameter=int(cfg.max_points_per_parameter),
+        )
+        self.robustness_accounting = accounting
+        counters = BudgetCounters()
+        probe, bind_error, backend_kind = self._resolve_robustness_probe(counters=counters)
+        stress_by_id = {s.candidate_id: s for s in self.candidate_stress_summaries}
+        family_by_id = {f.family_id: f for f in families}
+
+        ordered: list[tuple[str, EvaluationRecord, StrategyCandidate]] = []
+        for spec in sorted(families, key=lambda s: s.family_id):
+            for rec in records_by_family.get(spec.family_id, []):
+                cand = cand_by_id.get(rec.candidate_id)
+                if cand is None:
+                    continue
+                ordered.append((spec.family_id, rec, cand))
+        ordered.sort(key=lambda t: (t[0], t[1].candidate_id))
+
+        self._emit(
+            "MULTI_FAMILY_ROBUSTNESS_STARTED",
+            {
+                "max_robustness_candidates": accounting.max_robustness_candidates,
+                "max_robustness_evaluations": accounting.max_robustness_evaluations,
+                "bind_error": bind_error,
+            },
+        )
+
+        for family_id, rec, cand in ordered:
+            if time.perf_counter() - t0 >= float(cfg.max_runtime_seconds):
+                accounting.stop_reason = "max_runtime_seconds"
+                break
+
+            stress_sum = stress_by_id.get(cand.candidate_id)
+            eligible, entry_reason, proof = self.robustness_entry_eligibility(
+                cand,
+                stress_sum,
+                stress_pipeline_complete=stress_pipeline_complete,
+            )
+            gen = int(cand.generation)
+            prior = (
+                STRESS_PASSED
+                if stress_sum is not None and stress_sum.final_decision == STRESS_PASSED
+                else (
+                    STRESS_FAILED
+                    if stress_sum is not None
+                    and stress_sum.final_decision == STRESS_FAILED
+                    else STRESS_NOT_ENTERED
+                )
+            )
+
+            if not eligible:
+                accounting.candidates_robustness_not_entered += 1
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=prior,
+                    new_status=ROBUSTNESS_NOT_ENTERED,
+                    reason=entry_reason,
+                    artifact_refs={"stress_passed_proof": proof},
+                )
+                continue
+
+            accounting.candidates_stress_passed += 1
+            if accounting.candidates_robustness_entered >= accounting.max_robustness_candidates:
+                accounting.candidates_robustness_not_entered += 1
+                accounting.stop_reason = accounting.stop_reason or ROBUSTNESS_BUDGET_EXHAUSTED
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=STRESS_PASSED,
+                    new_status=ROBUSTNESS_NOT_ENTERED,
+                    reason=f"{ROBUSTNESS_NOT_ENTERED}:{ROBUSTNESS_BUDGET_EXHAUSTED}",
+                    artifact_refs={
+                        "max_robustness_candidates": accounting.max_robustness_candidates,
+                        "entered": accounting.candidates_robustness_entered,
+                    },
+                )
+                continue
+
+            if int(counters.robustness) >= int(cfg.max_robustness_evaluations):
+                accounting.candidates_robustness_not_entered += 1
+                accounting.stop_reason = ROBUSTNESS_BUDGET_EXHAUSTED
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=STRESS_PASSED,
+                    new_status=ROBUSTNESS_NOT_ENTERED,
+                    reason=f"{ROBUSTNESS_NOT_ENTERED}:{ROBUSTNESS_BUDGET_EXHAUSTED}",
+                    artifact_refs={
+                        "robustness_consumed": counters.robustness,
+                        "max_robustness_evaluations": cfg.max_robustness_evaluations,
+                    },
+                )
+                continue
+
+            selected, sel_reason = self._select_robustness_parameters(cand)
+            accounting.candidates_robustness_entered += 1
+            self._append_status(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                prior_status=STRESS_PASSED,
+                new_status=ROBUSTNESS_TESTED,
+                reason="robustness_probe_started",
+                artifact_refs={
+                    "selected_parameters": selected,
+                    "parameter_selection_reason": sel_reason,
+                },
+            )
+
+            if bind_error is not None:
+                accounting.candidates_robustness_failed += 1
+                summary = CandidateRobustnessSummary(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    lineage={
+                        "lineage_id": cand.lineage_id,
+                        "parent_ids": list(cand.parent_ids),
+                    },
+                    stress_passed_proof=dict(proof),
+                    backend_kind=backend_kind,
+                    research_eligible=bool(self.research_eligible),
+                    selected_parameter_names=list(selected),
+                    parameter_selection_reason=sel_reason,
+                    final_decision=ROBUSTNESS_FAILED,
+                    final_reason=bind_error,
+                    max_robustness_evaluations=int(cfg.max_robustness_evaluations),
+                    robustness_budget_remaining=max(
+                        0, int(cfg.max_robustness_evaluations) - int(counters.robustness)
+                    ),
+                )
+                self.candidate_robustness_summaries.append(summary)
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=ROBUSTNESS_TESTED,
+                    new_status=ROBUSTNESS_FAILED,
+                    reason=bind_error,
+                    artifact_refs={"backend_bind_error": bind_error},
+                )
+                continue
+
+            assert probe is not None
+            family_spec = family_by_id.get(family_id)
+            if family_spec is not None:
+                probe.grammar = family_spec.to_grammar()
+            budget_before = int(counters.robustness)
+            budget_truncated = False
+            try:
+                results = probe.probe(
+                    cand,
+                    parameter_names=selected,
+                    family_spec=family_spec,
+                    counters=counters,
+                    max_evaluations=int(cfg.max_robustness_evaluations),
+                    require_integrity=True,
+                )
+            except RuntimeError as exc:
+                msg = str(exc)
+                fail_reason = (
+                    SYNTHETIC_ROBUSTNESS_FORBIDDEN
+                    if SYNTHETIC_ROBUSTNESS_FORBIDDEN in msg
+                    else (
+                        REAL_ROBUSTNESS_BACKEND_REQUIRED
+                        if REAL_ROBUSTNESS_BACKEND_REQUIRED in msg
+                        else msg
+                    )
+                )
+                accounting.candidates_robustness_failed += 1
+                delta = max(0, int(counters.robustness) - budget_before)
+                accounting.robustness_backend_calls += delta
+                accounting.robustness_counter_delta += delta
+                self.candidate_robustness_summaries.append(
+                    CandidateRobustnessSummary(
+                        candidate_id=cand.candidate_id,
+                        family_id=family_id,
+                        generation=gen,
+                        lineage={
+                            "lineage_id": cand.lineage_id,
+                            "parent_ids": list(cand.parent_ids),
+                        },
+                        stress_passed_proof=dict(proof),
+                        backend_kind=backend_kind,
+                        research_eligible=bool(self.research_eligible),
+                        selected_parameter_names=list(selected),
+                        parameter_selection_reason=sel_reason,
+                        robustness_backend_calls=delta,
+                        robustness_counter_delta=delta,
+                        budget_consumed=delta,
+                        max_robustness_evaluations=int(cfg.max_robustness_evaluations),
+                        robustness_budget_remaining=max(
+                            0, int(cfg.max_robustness_evaluations) - int(counters.robustness)
+                        ),
+                        final_decision=ROBUSTNESS_FAILED,
+                        final_reason=fail_reason,
+                    )
+                )
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=ROBUSTNESS_TESTED,
+                    new_status=ROBUSTNESS_FAILED,
+                    reason=fail_reason,
+                    artifact_refs={},
+                )
+                continue
+
+            acct = dict(probe.last_probe_accounting or {})
+            delta = int(acct.get("robustness_backend_calls") or 0)
+            # Prefer counter delta for this candidate.
+            counter_delta = max(0, int(counters.robustness) - budget_before)
+            if counter_delta != delta:
+                # Integrity: backend calls must match counter increments.
+                delta = counter_delta
+            accounting.robustness_backend_calls += delta
+            accounting.robustness_counter_delta += counter_delta
+            if acct.get("stop_reason") == ROBUSTNESS_BUDGET_EXHAUSTED:
+                budget_truncated = True
+                accounting.stop_reason = ROBUSTNESS_BUDGET_EXHAUSTED
+
+            param_summaries = list(probe.last_parameter_summaries)
+            decision, reason = self._decide_candidate_robustness(
+                param_summaries=param_summaries,
+                selected_names=selected,
+                budget_truncated=budget_truncated,
+            )
+            # All-required must pass; never "best parameter passed".
+            accepted = sum(
+                1
+                for p in param_summaries
+                if p.final_parameter_decision == PARAMETER_ROBUST
+            )
+            failed = len(param_summaries) - accepted
+            real_pts = sum(len(p.valid_evaluated_steps) for p in param_summaries)
+            na_pts = sum(len(p.not_applicable_steps) for p in param_summaries)
+            integ_pts = sum(len(p.integrity_failed_steps) for p in param_summaries)
+            planned = len(selected) * len(probe.relative_steps)
+
+            summary = CandidateRobustnessSummary(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                lineage={
+                    "lineage_id": cand.lineage_id,
+                    "parent_ids": list(cand.parent_ids),
+                    "creation_method": (
+                        cand.creation_method.value
+                        if hasattr(cand.creation_method, "value")
+                        else str(cand.creation_method)
+                    ),
+                },
+                stress_passed_proof=dict(proof),
+                backend_kind=backend_kind,
+                research_eligible=bool(self.research_eligible),
+                selected_parameter_names=list(selected),
+                parameter_selection_reason=sel_reason,
+                parameter_summaries=[p.as_dict() for p in param_summaries],
+                total_planned_points=planned,
+                real_evaluated_points=real_pts,
+                not_applicable_points=na_pts,
+                integrity_failed_points=integ_pts,
+                robustness_backend_calls=delta,
+                robustness_counter_delta=counter_delta,
+                budget_consumed=counter_delta,
+                max_robustness_evaluations=int(cfg.max_robustness_evaluations),
+                robustness_budget_remaining=max(
+                    0, int(cfg.max_robustness_evaluations) - int(counters.robustness)
+                ),
+                accepted_parameter_count=accepted,
+                failed_parameter_count=failed,
+                final_decision=decision,
+                final_reason=reason,
+                stop_reason=acct.get("stop_reason"),
+            )
+            self.candidate_robustness_summaries.append(summary)
+            if decision == ROBUSTNESS_PASSED:
+                accounting.candidates_robustness_passed += 1
+            else:
+                accounting.candidates_robustness_failed += 1
+
+            # Persist on evaluation record when present.
+            if isinstance(rec.meta, dict):
+                rec.meta["robustness_summary"] = summary.as_dict()
+            rec.robustness_results = {p.parameter: p.as_dict() for p in results}
+
+            self._append_status(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                prior_status=ROBUSTNESS_TESTED,
+                new_status=decision,
+                reason=reason,
+                artifact_refs={"summary": summary.as_dict()},
+            )
+
+        accounting.robustness_evaluations_consumed = int(counters.robustness)
+        # Campaign-level invariant.
+        if accounting.robustness_backend_calls != accounting.robustness_counter_delta:
+            accounting.stop_reason = accounting.stop_reason or "robustness_budget_invariant_failed"
+        self._emit("MULTI_FAMILY_ROBUSTNESS_COMPLETED", accounting.as_dict())
+        return accounting
+
     @staticmethod
     def candidate_within_family_grammar(cand: StrategyCandidate, grammar: Grammar) -> bool:
         allowed_features = {leaf.feature_id for leaf in grammar.feature_leaves}
@@ -2056,7 +2701,7 @@ class MultiFamilyCampaign:
             if cfg.max_evaluated_candidates is not None
             else int(cfg.total_candidate_budget)
         )
-        stop_reason = "multi_family_evolutionary_stress_screening_completed"
+        stop_reason = "multi_family_evolutionary_robustness_screening_completed"
         completed_generation_count = 0
 
         self._emit(
@@ -2500,18 +3145,27 @@ class MultiFamilyCampaign:
             ):
                 pass  # stop_reason already recorded on last greg when possible
 
-        # Phase 3B.1: Score Qualified → real Stress (stop before robustness/etc.).
+        # Phase 3B.1: Score Qualified → real Stress.
         stress_accounting = self._run_stress_phase(
             families=families,
             records_by_family=records_by_family,
             cand_by_id=cand_by_id,
             t0=t0,
         )
+        # Phase 3B.2: STRESS_PASSED → real Parameter Robustness.
+        robustness_accounting = self._run_robustness_phase(
+            families=families,
+            records_by_family=records_by_family,
+            cand_by_id=cand_by_id,
+            t0=t0,
+            stress_pipeline_complete=True,
+        )
         stress_passed_ids = {
             s.candidate_id
             for s in self.candidate_stress_summaries
             if s.final_decision == STRESS_PASSED
         }
+        pipeline = PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING
 
         family_stats = []
         for spec in families:
@@ -2552,7 +3206,7 @@ class MultiFamilyCampaign:
                     }
                 )
         empty_reasons = {
-            k: list(v) for k, v in EMPTY_COLLECTIONS_REASONS_AFTER_STRESS.items()
+            k: list(v) for k, v in EMPTY_COLLECTIONS_REASONS_AFTER_ROBUSTNESS.items()
         }
         discovery = DiscoveryRunResult(
             discovery_run_id=self.discovery_run_id,
@@ -2590,11 +3244,13 @@ class MultiFamilyCampaign:
             "pipeline_level": pipeline,
             "post_wfo_pipeline_complete": False,
             "stress_pipeline_complete": True,
+            "robustness_pipeline_complete": True,
             "completed_generations": completed_generation_count,
             "campaign_generated": campaign_generated,
             "campaign_evaluated": campaign_evaluated,
             "campaign_full_wfo": campaign_full_wfo,
             "stress_accounting": stress_accounting.as_dict(),
+            "robustness_accounting": robustness_accounting.as_dict(),
         }
         fingerprint = sha256_json(
             {
@@ -2605,6 +3261,9 @@ class MultiFamilyCampaign:
                 "generation_records": [g.as_dict() for g in generation_records],
                 "candidate_stress_summaries": [
                     s.as_dict() for s in self.candidate_stress_summaries
+                ],
+                "candidate_robustness_summaries": [
+                    s.as_dict() for s in self.candidate_robustness_summaries
                 ],
             }
         )
@@ -2620,7 +3279,7 @@ class MultiFamilyCampaign:
             pipeline_level=pipeline,
             post_wfo_pipeline_complete=False,
             stress_pipeline_complete=True,
-            robustness_pipeline_complete=False,
+            robustness_pipeline_complete=True,
             statistics_pipeline_complete=False,
             clustering_pipeline_complete=False,
             research_shortlist_pipeline_complete=False,
@@ -2630,7 +3289,8 @@ class MultiFamilyCampaign:
             score_qualified_meaning=SCORE_QUALIFIED_MEANING,
             score_qualified_does_not_mean=SCORE_QUALIFIED_DOES_NOT_MEAN,
             stress_passed_does_not_mean=STRESS_PASSED_DOES_NOT_MEAN,
-            post_wfo_blocked_reasons=list(POST_STRESS_BLOCKED_REASONS),
+            robustness_passed_does_not_mean=ROBUSTNESS_PASSED_DOES_NOT_MEAN,
+            post_wfo_blocked_reasons=list(POST_ROBUSTNESS_BLOCKED_REASONS),
             empty_collections_reasons=empty_reasons,
             research_shortlist=[],
             vault_candidates=[],
@@ -2639,6 +3299,8 @@ class MultiFamilyCampaign:
             candidate_status_history=list(self.candidate_status_history),
             candidate_stress_summaries=list(self.candidate_stress_summaries),
             stress_accounting=stress_accounting,
+            candidate_robustness_summaries=list(self.candidate_robustness_summaries),
+            robustness_accounting=robustness_accounting,
         )
 
     def run(self) -> MultiFamilyCampaignResult:
