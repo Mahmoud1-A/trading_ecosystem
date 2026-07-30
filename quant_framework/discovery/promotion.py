@@ -11,6 +11,9 @@ from discovery.fitness import RANKING_SOURCE_OOS, assert_oos_only_promotion
 from discovery.freezing import FrozenCandidate
 from discovery.stress import StressResult
 
+# MultiFamily WFO screening must not promote until the full post-WFO pipeline exists.
+POST_WFO_PIPELINE_NOT_RUN = "POST_WFO_PIPELINE_NOT_RUN"
+
 
 class PromotionStatus(str, Enum):
     PROMOTED = "PROMOTED"
@@ -48,6 +51,23 @@ class PromotionDecision:
 class PromotionGate:
     min_oos_fitness: float = 0.0
     min_stress_pass_rate: float = 0.5
+
+    def refuse_incomplete_post_wfo_pipeline(
+        self,
+        frozen: FrozenCandidate,
+        *,
+        train_score: float | None = None,
+    ) -> PromotionDecision:
+        """Hard reject when Stress/Robustness/Clustering have not been run."""
+        return PromotionDecision(
+            status=PromotionStatus.REJECTED,
+            frozen_id=frozen.frozen_id,
+            candidate_id=frozen.candidate_id,
+            reason=POST_WFO_PIPELINE_NOT_RUN,
+            oos_fitness=frozen.oos_fitness,
+            train_score_ignored=train_score,
+            stress_pass_rate=0.0,
+        )
 
     def decide(
         self,

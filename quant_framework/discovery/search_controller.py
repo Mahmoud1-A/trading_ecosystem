@@ -54,9 +54,17 @@ class DiscoveryRunResult:
     portfolio_pool: dict[str, Any]
     clusters: list[dict[str, Any]]
     reproducible_fingerprint: str
+    # Optional honesty fields — set by incomplete MultiFamily WFO screening path.
+    pipeline_level: str | None = None
+    post_wfo_pipeline_complete: bool | None = None
+    score_qualified_meaning: str | None = None
+    empty_collections_reasons: dict[str, list[str]] = field(default_factory=dict)
+    research_shortlist: list[Any] = field(default_factory=list)
+    vault_candidates: list[Any] = field(default_factory=list)
+    paper_candidates: list[Any] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "discovery_run_id": self.discovery_run_id,
             "budget_id": self.budget_id,
             "stop_reason": self.stop_reason,
@@ -69,7 +77,21 @@ class DiscoveryRunResult:
             "portfolio_pool": dict(self.portfolio_pool),
             "clusters": list(self.clusters),
             "reproducible_fingerprint": self.reproducible_fingerprint,
+            "research_shortlist": list(self.research_shortlist),
+            "vault_candidates": list(self.vault_candidates),
+            "paper_candidates": list(self.paper_candidates),
         }
+        if self.pipeline_level is not None:
+            out["pipeline_level"] = self.pipeline_level
+        if self.post_wfo_pipeline_complete is not None:
+            out["post_wfo_pipeline_complete"] = self.post_wfo_pipeline_complete
+        if self.score_qualified_meaning is not None:
+            out["score_qualified_meaning"] = self.score_qualified_meaning
+        if self.empty_collections_reasons:
+            out["empty_collections_reasons"] = {
+                k: list(v) for k, v in self.empty_collections_reasons.items()
+            }
+        return out
 
 
 @dataclass

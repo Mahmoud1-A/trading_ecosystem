@@ -12,7 +12,6 @@ from discovery.family_generator import StrategyFamilyGenerator
 from discovery.family_spec import FamilySpec, assert_diverse_family_grammars
 from discovery.fitness import RobustFitness
 from discovery.generator import CandidateGenerator
-from discovery.mutation import Mutator
 from discovery.search_budget import BudgetCounters, SearchBudget
 from discovery.search_controller import DiscoveryRunResult
 from discovery.stable_hash import stable_seed
@@ -22,6 +21,43 @@ from registry.hashing import sha256_json
 STRUCTURAL_PARENT_ELIGIBLE = "STRUCTURAL_PARENT_ELIGIBLE"
 SCORE_QUALIFIED = "SCORE_QUALIFIED"
 NOT_PARENT_ELIGIBLE = "NOT_PARENT_ELIGIBLE"
+
+# Honest capability declaration: MultiFamily currently screens via Full WFO only.
+PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING = "MULTI_FAMILY_WFO_SCREENING"
+SCORE_QUALIFIED_MEANING = "passed economic WFO qualification"
+SCORE_QUALIFIED_DOES_NOT_MEAN = (
+    "finalist",
+    "promoted",
+    "stress passed",
+    "research shortlisted",
+    "vault eligible",
+    "paper eligible",
+)
+
+POST_WFO_PIPELINE_NOT_RUN = "POST_WFO_PIPELINE_NOT_RUN"
+STRESS_NOT_RUN = "STRESS_NOT_RUN"
+ROBUSTNESS_NOT_RUN = "ROBUSTNESS_NOT_RUN"
+CLUSTERING_NOT_RUN = "CLUSTERING_NOT_RUN"
+NOT_RESEARCH_SHORTLISTED = "NOT_RESEARCH_SHORTLISTED"
+FAMILY_LOCAL_EVOLUTION_NOT_READY = "FAMILY_LOCAL_EVOLUTION_NOT_READY"
+CROSS_FAMILY_CROSSOVER_UNSUPPORTED = "CROSS_FAMILY_CROSSOVER_UNSUPPORTED"
+
+POST_WFO_BLOCKED_REASONS: tuple[str, ...] = (
+    POST_WFO_PIPELINE_NOT_RUN,
+    STRESS_NOT_RUN,
+    ROBUSTNESS_NOT_RUN,
+    CLUSTERING_NOT_RUN,
+    NOT_RESEARCH_SHORTLISTED,
+)
+
+EMPTY_COLLECTIONS_REASONS: dict[str, list[str]] = {
+    "finalists": [POST_WFO_PIPELINE_NOT_RUN, STRESS_NOT_RUN, ROBUSTNESS_NOT_RUN, CLUSTERING_NOT_RUN],
+    "promoted": [POST_WFO_PIPELINE_NOT_RUN, STRESS_NOT_RUN, ROBUSTNESS_NOT_RUN],
+    "clusters": [POST_WFO_PIPELINE_NOT_RUN, CLUSTERING_NOT_RUN],
+    "research_shortlist": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
+    "vault_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
+    "paper_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED],
+}
 
 
 @dataclass
@@ -121,6 +157,19 @@ class MultiFamilyCampaignResult:
     discovery_results: list[DiscoveryRunResult]
     aggregated_stop_reason: str
     reproducible_fingerprint: str
+    pipeline_level: str = PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING
+    post_wfo_pipeline_complete: bool = False
+    score_qualified_meaning: str = SCORE_QUALIFIED_MEANING
+    score_qualified_does_not_mean: tuple[str, ...] = SCORE_QUALIFIED_DOES_NOT_MEAN
+    post_wfo_blocked_reasons: list[str] = field(
+        default_factory=lambda: list(POST_WFO_BLOCKED_REASONS)
+    )
+    empty_collections_reasons: dict[str, list[str]] = field(
+        default_factory=lambda: {k: list(v) for k, v in EMPTY_COLLECTIONS_REASONS.items()}
+    )
+    research_shortlist: list[Any] = field(default_factory=list)
+    vault_candidates: list[Any] = field(default_factory=list)
+    paper_candidates: list[Any] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +184,21 @@ class MultiFamilyCampaignResult:
             "best_candidates_per_family": {
                 s.family_id: list(s.best_candidate_ids) for s in self.family_stats
             },
+            "pipeline_level": self.pipeline_level,
+            "post_wfo_pipeline_complete": self.post_wfo_pipeline_complete,
+            "score_qualified_meaning": self.score_qualified_meaning,
+            "score_qualified_does_not_mean": list(self.score_qualified_does_not_mean),
+            "post_wfo_blocked_reasons": list(self.post_wfo_blocked_reasons),
+            "empty_collections_reasons": {
+                k: list(v) for k, v in self.empty_collections_reasons.items()
+            },
+            "research_shortlist": list(self.research_shortlist),
+            "vault_candidates": list(self.vault_candidates),
+            "paper_candidates": list(self.paper_candidates),
+            # Explicit empty post-WFO surfaces — never silent.
+            "finalists": [],
+            "promoted": [],
+            "clusters": [],
         }
 
 
@@ -463,6 +527,12 @@ class MultiFamilyCampaign:
 
     def run(self) -> MultiFamilyCampaignResult:
         cfg = self.config
+        # Incomplete Phase-3 features: fail fast rather than silently partial-run.
+        if cfg.family_local_evolution:
+            raise RuntimeError(FAMILY_LOCAL_EVOLUTION_NOT_READY)
+        if cfg.allow_cross_family_crossover:
+            raise RuntimeError(CROSS_FAMILY_CROSSOVER_UNSUPPORTED)
+
         families = self.family_generator.generate(
             count=cfg.requested_family_count,
             family_ids=cfg.family_ids,
@@ -618,38 +688,8 @@ class MultiFamilyCampaign:
                 {"family_id": spec.family_id, "phase": 1, "full_wfo": full_wfo_counts[spec.family_id]},
             )
 
-        # Optional family-local evolution (same FamilySpec grammar only).
-        if cfg.family_local_evolution:
-            for spec in families:
-                fid = spec.family_id
-                parents = [
-                    c
-                    for c in pool[fid]
-                    if c.candidate_id in evaluated_ids[fid]
-                ]
-                # Prefer structural / score-qualified parents from records.
-                parent_ids = {
-                    rec.candidate_id
-                    for rec in records_by_family[fid]
-                    if rec.outcome
-                    not in {EvalOutcome.FEATURE_UNAVAILABLE, EvalOutcome.INVALID_DSL_TYPE}
-                }
-                parents = [c for c in parents if c.candidate_id in parent_ids] or pool[fid][:2]
-                mutator = Mutator(grammar=spec.to_grammar())
-                for gen_i in range(int(cfg.evolution_generations)):
-                    if len(pool[fid]) >= int(gen_alloc[fid]) + 4:
-                        break
-                    for pi, parent in enumerate(parents[: max(1, cfg.population_size)]):
-                        child_seed = stable_seed(cfg.seed, fid, gen_i, pi, salt=333)
-                        try:
-                            child = mutator.mutate(parent, seed=child_seed)
-                        except Exception:  # noqa: BLE001
-                            continue
-                        if child.strategy_family not in {fid, spec.family_id}:
-                            continue
-                        if child.candidate_id in {c.candidate_id for c in pool[fid]}:
-                            continue
-                        pool[fid].append(child)
+        # Family-local evolution is intentionally not implemented yet.
+        # Enabling it fails at the start of run() with FAMILY_LOCAL_EVOLUTION_NOT_READY.
 
         final_wfo = dict(initial_wfo)
         alloc_report: dict[str, dict[str, Any]] = {}
@@ -703,19 +743,28 @@ class MultiFamilyCampaign:
                         "family": st.family_id,
                     }
                 )
+        empty_reasons = {k: list(v) for k, v in EMPTY_COLLECTIONS_REASONS.items()}
         discovery = DiscoveryRunResult(
             discovery_run_id=self.discovery_run_id,
             budget_id="budget_multi_family",
-            stop_reason="multi_family_completed",
+            stop_reason="multi_family_wfo_screening_completed",
             generations=1,
             evaluated=sum(s.evaluated for s in family_stats),
             registered_trials=len(self.registry.all_trials()),
             rankings=rankings,
+            # Post-WFO pipeline not implemented — keep empty with explicit reasons.
             finalists=[],
             promoted=[],
             portfolio_pool={"members": [], "size": 0},
             clusters=[],
             reproducible_fingerprint="",
+            pipeline_level=PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING,
+            post_wfo_pipeline_complete=False,
+            score_qualified_meaning=SCORE_QUALIFIED_MEANING,
+            empty_collections_reasons=empty_reasons,
+            research_shortlist=[],
+            vault_candidates=[],
+            paper_candidates=[],
         )
         allocation_payload = {
             "generated": gen_alloc,
@@ -727,13 +776,17 @@ class MultiFamilyCampaign:
             "min_candidates_per_family": cfg.min_candidates_per_family,
             "total_candidate_budget": cfg.total_candidate_budget,
             "max_full_wfo": cfg.max_full_wfo,
-            "family_local_evolution": cfg.family_local_evolution,
+            "family_local_evolution": False,
+            "allow_cross_family_crossover": False,
+            "pipeline_level": PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING,
+            "post_wfo_pipeline_complete": False,
         }
         fingerprint = sha256_json(
             {
                 "families": [f.canonical_hash() for f in families],
                 "allocation": allocation_payload,
                 "config": cfg.as_dict(),
+                "pipeline_level": PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING,
             }
         )
         discovery.reproducible_fingerprint = fingerprint
@@ -743,8 +796,17 @@ class MultiFamilyCampaign:
             family_stats=family_stats,
             budget_allocation=allocation_payload,
             discovery_results=[discovery],
-            aggregated_stop_reason="multi_family_completed",
+            aggregated_stop_reason="multi_family_wfo_screening_completed",
             reproducible_fingerprint=fingerprint,
+            pipeline_level=PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING,
+            post_wfo_pipeline_complete=False,
+            score_qualified_meaning=SCORE_QUALIFIED_MEANING,
+            score_qualified_does_not_mean=SCORE_QUALIFIED_DOES_NOT_MEAN,
+            post_wfo_blocked_reasons=list(POST_WFO_BLOCKED_REASONS),
+            empty_collections_reasons=empty_reasons,
+            research_shortlist=[],
+            vault_candidates=[],
+            paper_candidates=[],
         )
 
 
