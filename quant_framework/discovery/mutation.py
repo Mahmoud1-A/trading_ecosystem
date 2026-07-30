@@ -63,6 +63,7 @@ class Mutator:
                 if s.arity == spec.arity
                 and s.output_type is spec.output_type
                 and s.input_types == spec.input_types
+                and self.grammar.allows_operator(oid)
             ]
             if alts:
                 new_op = alts[int(rng.integers(0, len(alts)))]
@@ -161,6 +162,7 @@ class Mutator:
             cost_model_version=parent.cost_model_version,
             asset_universe=parent.asset_universe,
             random_seed=seed,
+            family_provenance=dict(parent.family_provenance or {}),
         )
         try:
             check_strategy_trees(

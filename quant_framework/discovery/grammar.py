@@ -61,9 +61,19 @@ class Grammar:
     limits: GrammarLimits = field(default_factory=GrammarLimits)
     feature_leaves: tuple[FeatureLeaf, ...] = DEFAULT_FEATURE_LEAVES
     version: str = GRAMMAR_VERSION
+    allowed_operators: frozenset[OperatorId] | None = None
+    family_id: str | None = None
 
     def operators_returning(self, value_type: ValueType) -> list[OperatorId]:
-        return [oid for oid, spec in OPERATOR_REGISTRY.items() if spec.output_type is value_type]
+        ops = [oid for oid, spec in OPERATOR_REGISTRY.items() if spec.output_type is value_type]
+        if self.allowed_operators is not None:
+            ops = [oid for oid in ops if oid in self.allowed_operators]
+        return ops
+
+    def allows_operator(self, oid: OperatorId) -> bool:
+        if self.allowed_operators is None:
+            return True
+        return oid in self.allowed_operators
 
     def feature_ids(self) -> tuple[str, ...]:
         return tuple(f.feature_id for f in self.feature_leaves)

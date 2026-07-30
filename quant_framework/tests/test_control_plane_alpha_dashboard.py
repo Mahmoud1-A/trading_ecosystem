@@ -201,10 +201,12 @@ class TestAlphaMinerDashboard:
         run_id = _start_miner(client)
         finished = _wait_terminal(client, run_id)
         cands = client.get(f"/api/runs/{run_id}/candidates").json()
+        from control_plane.alpha_results import _latest_by_candidate
         from registry.experiment_registry import ExperimentRegistry
 
         reg = ExperimentRegistry(Path(finished["artifact_dir"]) / "registry")
-        distinct = {t.candidate_id: t for t in reg.all_trials()}
+        # Prefer richest trial per candidate — later duplicate shells must not win.
+        distinct = _latest_by_candidate(reg.all_trials())
         assert cands["registry_total"] == len(distinct)
         report = client.get(f"/api/runs/{run_id}/alpha_miner").json()
         assert report["generated_candidates"] == len(distinct)

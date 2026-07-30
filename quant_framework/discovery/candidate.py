@@ -39,6 +39,7 @@ class StrategyCandidate:
     creation_timestamp: str = field(
         default_factory=lambda: datetime.now(tz=timezone.utc).isoformat()
     )
+    family_provenance: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +65,7 @@ class StrategyCandidate:
             "asset_universe": list(self.asset_universe),
             "random_seed": self.random_seed,
             "creation_timestamp": self.creation_timestamp,
+            "family_provenance": dict(self.family_provenance),
         }
 
 
@@ -105,6 +107,7 @@ def build_candidate(
     asset_universe: tuple[str, ...] = ("ES",),
     random_seed: int,
     lineage_id: str | None = None,
+    family_provenance: dict[str, Any] | None = None,
 ) -> StrategyCandidate:
     features = collect_features(entry_tree, exit_tree, stop, target, sizing, *regime_gates)
     parameters = collect_parameters(entry_tree, exit_tree, stop, target, sizing, *regime_gates)
@@ -152,4 +155,5 @@ def build_candidate(
         cost_model_version=cost_model_version,
         asset_universe=asset_universe,
         random_seed=random_seed,
+        family_provenance=dict(family_provenance or {}),
     )

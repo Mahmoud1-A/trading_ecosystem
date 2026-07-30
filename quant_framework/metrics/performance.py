@@ -218,6 +218,37 @@ def compute_metrics(
 
     cost_ratio = _safe_div(cost_total, gross_profit) if gross_profit > 0 else 0.0
 
+    # Zero closed trades: do not report mark-to-market equity-path drawdown or
+    # annualized ratios as if they came from completed trading activity.
+    if n_trades == 0:
+        return PerformanceMetrics(
+            total_return_pct=0.0,
+            cagr_pct=0.0,
+            sharpe=0.0,
+            sortino=0.0,
+            calmar=0.0,
+            mar=0.0,
+            max_drawdown_pct=0.0,
+            drawdown_duration_bars=0,
+            profit_factor=0.0,
+            expectancy=0.0,
+            win_rate=0.0,
+            avg_win=0.0,
+            avg_loss=0.0,
+            win_loss_ratio=0.0,
+            tail_ratio=0.0,
+            turnover=0.0,
+            exposure_time_pct=exposure_time_pct,
+            max_consecutive_losses=0,
+            worst_day_pct=0.0,
+            best_day_pct=0.0,
+            cost_to_gross_profit_ratio=0.0,
+            n_trades=0,
+            n_bars=int(len(eq)),
+            final_equity=end_eq,
+            volatility_pct=0.0,
+        )
+
     return PerformanceMetrics(
         total_return_pct=total_return * 100.0,
         cagr_pct=cagr * 100.0,
@@ -236,7 +267,7 @@ def compute_metrics(
         tail_ratio=tail_ratio,
         turnover=turnover,
         exposure_time_pct=exposure_time_pct,
-        max_consecutive_losses=_consecutive_losses(trade_pnls) if n_trades else 0,
+        max_consecutive_losses=_consecutive_losses(trade_pnls),
         worst_day_pct=worst_day,
         best_day_pct=best_day,
         cost_to_gross_profit_ratio=cost_ratio,

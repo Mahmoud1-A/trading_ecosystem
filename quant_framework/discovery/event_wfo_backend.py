@@ -48,27 +48,54 @@ def _synthetic_bars(n: int = 780, seed: int = 0) -> pd.DataFrame:
 
 
 def mark_intraday_session_boundaries(frame: pd.DataFrame) -> pd.DataFrame:
-    """Mark first/last bar of each UTC calendar day for INTRADAY_ONLY flatten."""
+    """Mark first/last bar of each UTC calendar day for INTRADAY_ONLY flatten.
+
+    Always marks the final row of *this* frame as session-close so WFO validation
+    slices (cut from a pre-marked full series) still flatten open lots at window end.
+    """
     work = frame.copy()
-    ts = pd.to_datetime(work["timestamp"], utc=True)
-    day = ts.dt.floor("D")
-    work["is_session_open"] = day != day.shift(1)
-    work["is_session_close"] = day != day.shift(-1)
-    work.loc[work.index[0], "is_session_open"] = True
-    work.loc[work.index[-1], "is_session_close"] = True
+    if "timestamp" in work.columns:
+        ts = pd.to_datetime(work["timestamp"], utc=True)
+    elif isinstance(work.index, pd.DatetimeIndex):
+        ts = pd.to_datetime(work.index, utc=True)
+    else:
+        n = len(work)
+        work["is_session_open"] = [False] * n
+        work["is_session_close"] = [False] * n
+        if n:
+            work.iloc[0, work.columns.get_loc("is_session_open")] = True
+            work.iloc[-1, work.columns.get_loc("is_session_close")] = True
+        return work
+    day = pd.Series(ts).dt.floor("D")
+    # Align boolean masks to work's index
+    open_mask = (day != day.shift(1)).fillna(True).to_numpy()
+    close_mask = (day != day.shift(-1)).fillna(True).to_numpy()
+    work["is_session_open"] = open_mask
+    work["is_session_close"] = close_mask
+    work.iloc[0, work.columns.get_loc("is_session_open")] = True
+    work.iloc[-1, work.columns.get_loc("is_session_close")] = True
     return work
 
 
-def _signal_factory_from_params(params: dict[str, Any], window: pd.DataFrame):
+def _session_close_flags_for_window(window: pd.DataFrame) -> list[bool]:
+    """Per-window session-close flags (recomputed; safe for WFO slices)."""
+    marked = mark_intraday_session_boundaries(window)
+    return marked["is_session_close"].astype(bool).tolist()
+
+
+def mr_param_stub_signal_factory(params: dict[str, Any], window: pd.DataFrame):
+    """TEST FIXTURE ONLY — z-score MR on close. Never used by Alpha Miner evaluate()."""
     lookback = int(params.get("lookback", 20))
-    z_entry = float(params.get("z_entry", 2.0))
+    z_entry = abs(float(params.get("z_entry", 2.0)))
+    if z_entry < 1e-9:
+        z_entry = 2.0
     closes = window["close"].astype(float).tolist() if "close" in window.columns else []
-    # Align session-close flags if present on the window index order
-    session_close = (
-        window["is_session_close"].astype(bool).tolist()
-        if "is_session_close" in window.columns
-        else [False] * len(closes)
-    )
+    if "is_session_close" in window.columns:
+        session_close = _session_close_flags_for_window(window)
+        if len(session_close) < len(closes):
+            session_close = session_close + [False] * (len(closes) - len(session_close))
+    else:
+        session_close = [False] * len(closes)
 
     def signal_fn(bar: BarEvent, portfolio: Portfolio, i: int) -> SignalEvent | None:
         pos = portfolio.get_position(bar.symbol)
@@ -78,7 +105,6 @@ def _signal_factory_from_params(params: dict[str, Any], window: pd.DataFrame):
             availability_timestamp=bar.bar_end,
             decision_timestamp=bar.bar_end,
         )
-        # Prohibit overnight positions — flatten at session close
         if (bar.is_session_close or (i < len(session_close) and session_close[i])) and qty != 0:
             return SignalEvent(
                 timing=timing,
@@ -122,6 +148,105 @@ def _signal_factory_from_params(params: dict[str, Any], window: pd.DataFrame):
         return None
 
     return signal_fn
+
+
+# Back-compat alias for older tests that imported the private name.
+_signal_factory_from_params = mr_param_stub_signal_factory
+
+
+def known_trading_signal_factory(params: dict[str, Any], window: pd.DataFrame):
+    """Deterministic strategy that must open and close at least one trade.
+
+    Buys on ``entry_bar``, flats ``hold_bars`` later. Used as a pipeline probe
+    so zero-trade regressions cannot hide behind weak alpha logic.
+    """
+    entry_bar = int(params.get("entry_bar", params.get("lookback", 5)))
+    hold_bars = int(params.get("hold_bars", 3))
+    qty = float(params.get("quantity", 1.0))
+
+    def signal_fn(bar: BarEvent, portfolio: Portfolio, i: int) -> SignalEvent | None:
+        pos = portfolio.get_position(bar.symbol)
+        open_qty = 0.0 if pos is None or pos.is_flat else float(pos.quantity)
+        timing = InformationTiming(
+            source_timestamp=bar.timestamp,
+            availability_timestamp=bar.bar_end,
+            decision_timestamp=bar.bar_end,
+        )
+        if i == entry_bar and open_qty == 0.0:
+            return SignalEvent(
+                timing=timing,
+                symbol=bar.symbol,
+                side="BUY",
+                quantity=qty,
+                reason="known_trading_entry",
+            )
+        if i == entry_bar + hold_bars and open_qty != 0.0:
+            return SignalEvent(
+                timing=timing,
+                symbol=bar.symbol,
+                side="FLAT",
+                quantity=abs(open_qty),
+                reason="known_trading_exit",
+            )
+        return None
+
+    return signal_fn
+
+
+def trade_funnel_from_window_run(val: Any, signal_stats: dict[str, int] | None = None) -> dict[str, Any]:
+    """Per-fold execution funnel: signals → orders → fills → positions → closes."""
+    orders = list(getattr(val, "orders", None) or [])
+    fills = list(getattr(val, "fills", None) or [])
+    trades = list(getattr(val, "trades", None) or [])
+    rejected_signals = list(getattr(val, "rejected_signals", None) or [])
+    rejected_orders = [
+        o
+        for o in orders
+        if str(o.get("status", "")).upper() in {"REJECTED", "CANCELLED"}
+        or o.get("reject_reason")
+    ]
+    orders_submitted = sum(1 for o in orders if not o.get("reject_reason"))
+    stats = signal_stats or {}
+    return {
+        "entry_true_count": int(stats.get("entry_true_count", 0)),
+        "exit_true_count": int(stats.get("exit_true_count", 0)),
+        "orders_submitted": int(orders_submitted),
+        "fills": len(fills),
+        "positions_opened": sum(
+            1 for o in orders if not o.get("reduce_only") and not o.get("reject_reason")
+        ),
+        "positions_closed": len(trades),
+        "rejected_orders": len(rejected_orders),
+        "rejected_signals": len(rejected_signals),
+        "reject_reasons": sorted(
+            {str(o.get("reject_reason")) for o in orders if o.get("reject_reason")}
+        ),
+    }
+
+
+def fold_oos_metrics_from_net(*, fold_id: int, net: dict[str, Any], fallback_metric: float) -> FoldOOSMetrics:
+    required=("expectancy","sharpe","profit_factor","calmar","max_drawdown_pct","drawdown_duration_bars","worst_day_pct","turnover","n_trades")
+    missing=[k for k in required if k not in net]
+    if missing: raise RuntimeError("PERFORMANCE_METRIC_CONTRACT_MISMATCH: missing "+",".join(missing))
+    n_trades = int(net["n_trades"])
+    sharpe=float(net["sharpe"]); sharpe=sharpe if np.isfinite(sharpe) else float(fallback_metric)
+    # Defense in depth: zero closed trades must not surface manufactured equity-path DD.
+    if n_trades == 0:
+        return FoldOOSMetrics(
+            fold_id=fold_id,
+            expectancy=0.0,
+            sharpe=0.0,
+            profit_factor=0.0,
+            calmar=0.0,
+            max_drawdown=0.0,
+            drawdown_duration=0.0,
+            worst_day=0.0,
+            turnover=0.0,
+            prop_breach_prob=float(net.get("prop_breach_prob", 0.0) or 0.0),
+            regime_entropy=float(net.get("regime_entropy", 1.0) or 1.0),
+            n_trades=0,
+        )
+    return FoldOOSMetrics(fold_id=fold_id, expectancy=float(net["expectancy"]), sharpe=sharpe, profit_factor=float(net["profit_factor"]), calmar=float(net["calmar"]), max_drawdown=float(net["max_drawdown_pct"])/100.0, drawdown_duration=float(net["drawdown_duration_bars"]), worst_day=float(net["worst_day_pct"])/100.0, turnover=float(net["turnover"]), prop_breach_prob=float(net.get("prop_breach_prob",0.0) or 0.0), regime_entropy=float(net.get("regime_entropy",1.0) or 1.0), n_trades=n_trades)
 
 
 @dataclass
@@ -212,10 +337,17 @@ class EventDrivenDiscoveryBackend:
         assert self.bars is not None and self.wfo_config is not None and self._context is not None
         if self.require_real_bars and self.bars is None:
             raise RuntimeError(f"{REAL_DATA_BACKEND_UNAVAILABLE}: empty bars")
-        params = {
-            "lookback": int(candidate.parameters.get("lookback", 15)),
-            "z_entry": float(candidate.parameters.get("z_entry", 2.0)),
-        }
+        if not hasattr(candidate, "entry_tree") or candidate.entry_tree is None:
+            raise RuntimeError(
+                "DSL_SIGNAL_REQUIRED: EventDrivenDiscoveryBackend.evaluate requires "
+                "candidate.entry_tree — MR param stub is not permitted"
+            )
+
+        from discovery.dsl_signal_adapter import DSLCompileStats, make_dsl_signal_fn_factory
+
+        # Single-point grid from candidate parameters (DSL bindings), not MR stub keys.
+        raw_params = dict(getattr(candidate, "parameters", {}) or {})
+        param_grid = {k: [float(v)] for k, v in raw_params.items()} if raw_params else {}
         cfg = WalkForwardConfig(
             train_window_days=self.wfo_config.train_window_days,
             validation_window_days=self.wfo_config.validation_window_days,
@@ -224,13 +356,21 @@ class EventDrivenDiscoveryBackend:
             embargo_gap_bars=self.wfo_config.embargo_gap_bars,
             bars_per_day=self.wfo_config.bars_per_day,
             max_folds=self.wfo_config.max_folds,
-            param_grid={k: [v] for k, v in params.items()},
+            param_grid=param_grid,
             optimize_metric=self.wfo_config.optimize_metric,
+        )
+        dsl_stats = DSLCompileStats()
+        signal_fn_factory = make_dsl_signal_fn_factory(
+            candidate,
+            symbol=str(self._context.symbol),
+            bar_end_offset=str(self._context.freq),
+            intraday_only=bool(self.intraday_only),
+            stats=dsl_stats,
         )
         result = run_event_driven_wfo(
             self.bars,
             cfg,
-            signal_fn_factory=_signal_factory_from_params,
+            signal_fn_factory=signal_fn_factory,
             context=self._context,
             ranking_metric="sharpe",
         )
@@ -238,8 +378,11 @@ class EventDrivenDiscoveryBackend:
         order_count = 0
         fill_count = 0
         trade_count = 0
+        signal_entry_count = 0
+        signal_exit_count = 0
         training_ranges: list[dict[str, str]] = []
         oos_ranges: list[dict[str, str]] = []
+        fold_funnels: list[dict[str, Any]] = []
         for fr in result.folds:
             val = fr.validation_run
             net = val.net_metrics if val else {}
@@ -247,10 +390,20 @@ class EventDrivenDiscoveryBackend:
                 order_count += len(val.orders)
                 fill_count += len(val.fills)
                 trade_count += len(val.trades)
+                funnel = dict(val.trade_funnel) if val.trade_funnel else trade_funnel_from_window_run(val)
+                signal_entry_count += int(funnel.get("entry_true_count", 0))
+                signal_exit_count += int(funnel.get("exit_true_count", 0))
+                fold_funnels.append({"fold_id": fr.fold_id, "phase": "validation_oos", **funnel})
             if fr.train_run:
                 order_count += len(fr.train_run.orders)
                 fill_count += len(fr.train_run.fills)
                 trade_count += len(fr.train_run.trades)
+                train_funnel = (
+                    dict(fr.train_run.trade_funnel)
+                    if fr.train_run.trade_funnel
+                    else trade_funnel_from_window_run(fr.train_run)
+                )
+                fold_funnels.append({"fold_id": fr.fold_id, "phase": "train", **train_funnel})
             training_ranges.append(
                 {"start": fr.train_start_ts, "end": fr.train_end_ts, "fold_id": str(fr.fold_id)}
             )
@@ -261,26 +414,15 @@ class EventDrivenDiscoveryBackend:
                     "fold_id": str(fr.fold_id),
                 }
             )
-            folds.append(
-                FoldOOSMetrics(
-                    fold_id=fr.fold_id,
-                    expectancy=float(net.get("expectancy", fr.validation_metric)),
-                    sharpe=float(net.get("sharpe", fr.validation_metric)),
-                    profit_factor=float(net.get("profit_factor", 1.0)),
-                    calmar=float(net.get("calmar", 0.0)),
-                    max_drawdown=float(net.get("max_drawdown", 0.0)),
-                    drawdown_duration=float(net.get("drawdown_duration", 0.0) or 0.0),
-                    worst_day=float(net.get("worst_day", 0.0) or 0.0),
-                    turnover=float(net.get("turnover", 0.0) or 0.0),
-                    prop_breach_prob=float(net.get("prop_breach_prob", 0.0) or 0.0),
-                    regime_entropy=float(net.get("regime_entropy", 1.0) or 1.0),
-                    n_trades=int(net.get("n_trades", 0) or 0),
-                )
-            )
+            if val is None:
+                raise RuntimeError(f"PERFORMANCE_METRIC_CONTRACT_MISMATCH: fold {fr.fold_id} has no validation run")
+            folds.append(fold_oos_metrics_from_net(fold_id=fr.fold_id, net=net, fallback_metric=fr.validation_metric))
 
         artifact_payload = {
             "candidate_id": candidate.candidate_id,
             "backend_kind": self.backend_kind,
+            "evaluation_path": "dsl_event_driven_wfo",
+            "signal_source": "candidate_dsl_trees",
             "is_full_event_wfo": True,
             "silver_resolution": dict(self.silver_resolution),
             "training_ranges": training_ranges,
@@ -288,6 +430,11 @@ class EventDrivenDiscoveryBackend:
             "orders_count": order_count,
             "fills_count": fill_count,
             "trades_count": trade_count,
+            "signals_entry_count": signal_entry_count,
+            "signals_exit_count": signal_exit_count,
+            "dsl_feature_ids": list(dsl_stats.feature_ids),
+            "dsl_missing_features": list(dsl_stats.missing_features),
+            "fold_trade_funnels": fold_funnels,
             "folds": [f.as_dict() for f in result.folds],
         }
         self.last_run_artifacts = artifact_payload
@@ -317,18 +464,27 @@ class EventDrivenDiscoveryBackend:
                     "orders": len(f.validation_run.orders) if f.validation_run else 0,
                     "fills": len(f.validation_run.fills) if f.validation_run else 0,
                     "trades": len(f.validation_run.trades) if f.validation_run else 0,
+                    "trade_funnel": (
+                        dict(f.validation_run.trade_funnel) if f.validation_run else {}
+                    ),
                 }
                 for f in result.folds
             ],
+            "fold_trade_funnels": fold_funnels,
             "training_ranges": training_ranges,
             "oos_ranges": oos_ranges,
             "orders_count": order_count,
             "fills_count": fill_count,
             "trades_count": trade_count,
+            "signals_entry_count": signal_entry_count,
+            "signals_exit_count": signal_exit_count,
+            "signal_source": "candidate_dsl_trees",
+            "dsl_feature_ids": list(dsl_stats.feature_ids),
+            "dsl_missing_features": list(dsl_stats.missing_features),
             "is_full_event_wfo": True,
             "backend_kind": self.backend_kind,
             "proxy_metric_used": False,
-            "evaluation_path": self.backend_kind,
+            "evaluation_path": "dsl_event_driven_wfo",
             "silver_resolution": dict(self.silver_resolution),
             "intraday_only": self.intraday_only,
             "observed_bid_ask_spread": bool(

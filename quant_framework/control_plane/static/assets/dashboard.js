@@ -35,6 +35,9 @@ const state = {
   sse: null,
   catalog: [],
   constraints: null,
+  alphaRefreshTimer: null,
+  alphaRefreshInFlight: false,
+  alphaRunActive: false,
 };
 
 function $(sel, el = document) { return el.querySelector(sel); }
@@ -53,8 +56,21 @@ function fmtVal(v) {
   if (typeof v === "number") return Number.isFinite(v) ? v.toFixed(4) : "NOT_EVALUATED";
   return String(v);
 }
+function fmtMetric(v, digits = 4) {
+  if (v == null || v === "" || v === "-") return "NOT_AVAILABLE";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return statusText(v, "NOT_AVAILABLE");
+  if (n === 0) return Number(0).toFixed(digits);
+  return Math.abs(n) < 10 ** (-digits) ? n.toExponential(3) : n.toFixed(digits);
+}
+function fmtPercentMetric(v, digits = 3) {
+  if (v == null || v === "" || v === "-") return "NOT_AVAILABLE";
+  const n = Number(v);
+  return Number.isFinite(n) ? `${fmtMetric(n, digits)}%` : statusText(v, "NOT_AVAILABLE");
+}
 async function api(path, opts) {
   const r = await fetch(path, {
+    cache: "no-store",
     headers: { "Content-Type": "application/json", ...(opts && opts.headers) },
     ...opts,
   });
@@ -147,8 +163,33 @@ function newRunForm(datasets) {
         <div><label>Timeframe</label><select id="timeframe"></select></div>
       </div>
       <div class="row">
-        <div><label>Strategy family</label><select id="family"></select></div>
+        <div>
+          <label>Run mode</label>
+          <select id="run_mode">
+            <option value="single">Single Family</option>
+            <option value="multi">Multi-Family Generated</option>
+          </select>
+        </div>
         <div><label>Random seed</label><input id="seed" type="number" value="42" /></div>
+      </div>
+      <div id="single_family_row" class="row">
+        <div><label>Strategy family</label><select id="family"></select></div>
+        <div><label>Asset class (locked)</label><input id="asset_class" readonly /></div>
+      </div>
+      <div id="multi_family_panel" class="panel" style="display:none;margin-top:0.5rem">
+        <h3>Strategy Family Generator</h3>
+        <p class="sub">Hypothesis-driven families with distinct DSL grammars. strategy_family is forced to <span class="mono">multi_family_generated</span>.</p>
+        <div class="row">
+          <div><label>Family count</label><input id="mf_family_count" type="number" min="2" max="8" value="6" /></div>
+          <div><label>Candidates per family</label><input id="mf_per_family" type="number" min="1" max="100" value="10" /></div>
+        </div>
+        <label>Family blueprints (multiselect — hold Ctrl/Cmd)</label>
+        <select id="mf_blueprints" multiple size="8" style="width:100%;min-height:9rem"></select>
+        <div class="confirm" style="margin-top:0.5rem">
+          <input type="checkbox" id="mf_adaptive" checked />
+          <span>Adaptive WFO allocation after early folds</span>
+        </div>
+        <p class="sub" id="mf_hint">Select at least 2 blueprints. Launch fails if fewer than 2 distinct grammar fingerprints.</p>
       </div>
       <div class="row">
         <div><label>Cost model</label><select id="cost"></select></div>
@@ -156,10 +197,10 @@ function newRunForm(datasets) {
       </div>
       <div class="row">
         <div><label>Feature set</label><select id="features"></select></div>
-        <div><label>Asset class (locked)</label><input id="asset_class" readonly /></div>
+        <div id="asset_class_multi_wrap"><label>Asset class (locked)</label><input id="asset_class_mirror" readonly /></div>
       </div>
       <label>Search budget JSON</label>
-      <textarea id="budget" rows="4">{"max_generated_candidates":12,"max_evaluated_candidates":10,"max_full_wfo_evaluations":10,"population_size":4,"max_runtime_seconds":45,"stagnation_generations":8,"minimum_generations_before_stagnation":4}</textarea>
+      <textarea id="budget" rows="6">{"max_generated_candidates":200,"max_evaluated_candidates":200,"max_full_wfo_evaluations":200,"population_size":4,"max_runtime_seconds":45,"stagnation_generations":8,"minimum_generations_before_stagnation":4,"max_candidates_per_family":200,"max_candidates_per_complexity_tier":200,"max_candidates_per_feature_family":200,"max_oos_drawdown":0.2}</textarea>
       <label>WFO JSON</label>
       <textarea id="wfo" rows="2">{"train_window_days":5,"validation_window_days":2,"step_forward_days":5,"max_folds":4}</textarea>
       <div class="confirm"><input type="checkbox" id="c_miner" /><span>Confirm Alpha Miner</span></div>
@@ -265,36 +306,169 @@ async function applyDatasetConstraints() {
   fillSelect($("#cost"), c.compatible_cost_models, c.compatible_cost_models[0]);
   fillSelect($("#risk"), c.compatible_risk_profiles, c.compatible_risk_profiles[0]);
   fillSelect($("#features"), c.compatible_feature_sets, c.compatible_feature_sets[0]);
-  $("#asset_class").value = c.asset_class || "";
+  const ac = c.asset_class || "";
+  if ($("#asset_class")) $("#asset_class").value = ac;
+  if ($("#asset_class_mirror")) $("#asset_class_mirror").value = ac;
   if (c.smoke_test_only) $("#c_smoke").checked = true;
   else if (c.research_eligible) $("#c_smoke").checked = false;
   renderBackendBox(c);
 }
 
+function selectedBlueprintIds() {
+  const sel = $("#mf_blueprints");
+  if (!sel) return [];
+  return Array.from(sel.selectedOptions || []).map(o => o.value).filter(Boolean);
+}
+
+function isMultiFamilyMode() {
+  return ($("#run_mode") && $("#run_mode").value === "multi");
+}
+
+function syncRunModePanels() {
+  const multi = isMultiFamilyMode();
+  const singleRow = $("#single_family_row");
+  const multiPanel = $("#multi_family_panel");
+  if (singleRow) singleRow.style.display = multi ? "none" : "";
+  if (multiPanel) multiPanel.style.display = multi ? "" : "none";
+  const hint = $("#mf_hint");
+  if (hint && multi) {
+    const n = selectedBlueprintIds().length;
+    hint.textContent = n < 2
+      ? "Select at least 2 blueprints. Launch fails if fewer than 2 distinct grammar fingerprints."
+      : `${n} blueprints selected · strategy_family → multi_family_generated`;
+  }
+}
+
+async function loadFamilyBlueprints() {
+  const seed = Number(($("#seed") && $("#seed").value) || 42);
+  const data = await api(`/api/strategy_families/blueprints?seed=${encodeURIComponent(seed)}`);
+  const sel = $("#mf_blueprints");
+  if (!sel) return data;
+  const prev = new Set(selectedBlueprintIds());
+  const rows = data.blueprints || [];
+  sel.innerHTML = rows.map(b => {
+    const selected = prev.size ? prev.has(b.family_id) : true;
+    return `<option value="${b.family_id}" ${selected ? "selected" : ""} title="${b.hypothesis}">${b.family_id} · fp ${String(b.effective_grammar_fingerprint || "").slice(0, 10)}</option>`;
+  }).join("");
+  if (!prev.size) {
+    // Default: select first N matching family count (at least 2).
+    const want = Math.max(2, Number(($("#mf_family_count") && $("#mf_family_count").value) || 6));
+    Array.from(sel.options).forEach((o, i) => { o.selected = i < want; });
+  }
+  syncRunModePanels();
+  return data;
+}
+
+async function fetchMultiFamilyPreview(body) {
+  if (!body.multi_family || !body.multi_family.enabled) return null;
+  try {
+    return await api("/api/strategy_families/preview", {
+      method: "POST",
+      body: JSON.stringify({
+        seed: body.multi_family.seed ?? body.random_seed,
+        requested_family_count: body.multi_family.requested_family_count,
+        family_ids: body.multi_family.family_ids,
+      }),
+    });
+  } catch (e) {
+    return { error: String(e.message || e) };
+  }
+}
+
+function resolveEffectiveBudget(budget) {
+  const maxGen = Number(budget.max_generated_candidates ?? 12);
+  const pick = (key) => (budget[key] == null ? maxGen : Number(budget[key]));
+  const effective = {
+    ...budget,
+    max_candidates_per_family: pick("max_candidates_per_family"),
+    max_candidates_per_complexity_tier: pick("max_candidates_per_complexity_tier"),
+    max_candidates_per_feature_family: pick("max_candidates_per_feature_family"),
+  };
+  const requested = {
+    max_candidates_per_family: budget.max_candidates_per_family ?? null,
+    max_candidates_per_complexity_tier: budget.max_candidates_per_complexity_tier ?? null,
+    max_candidates_per_feature_family: budget.max_candidates_per_feature_family ?? null,
+  };
+  return { requested, effective, max_generated_candidates: maxGen };
+}
+
 async function wireNewRun() {
   await applyDatasetConstraints();
-  const preview = () => {
+  await loadFamilyBlueprints();
+  syncRunModePanels();
+  let previewTimer = null;
+  const preview = async () => {
+    syncRunModePanels();
     const body = collectRunBody();
     if (state.constraints) renderBackendBox(state.constraints);
     const prev = state.constraints ? resolveBackendPreview(state.constraints) : {};
+    let mfBlock = "";
+    let mfSpecs = null;
+    if (body.multi_family && body.multi_family.enabled) {
+      mfSpecs = await fetchMultiFamilyPreview(body);
+      if (mfSpecs && mfSpecs.error) {
+        mfBlock = `<div class="warn-box" style="border-color:#c0392b;color:#c0392b"><strong>Multi-Family:</strong> ${mfSpecs.error}</div>`;
+      } else if (mfSpecs) {
+        body.multi_family = {
+          ...body.multi_family,
+          preview_family_specs: mfSpecs.families,
+          distinct_grammar_fingerprints: mfSpecs.distinct_grammar_fingerprints,
+          grammar_fingerprints: mfSpecs.grammar_fingerprints,
+        };
+        mfBlock = `<div class="panel" style="margin-top:0.5rem"><strong>Generated family specs</strong>
+          <p class="sub">${mfSpecs.family_count} families · ${mfSpecs.distinct_grammar_fingerprints} distinct grammar fingerprints</p>
+          <pre class="mono">${JSON.stringify(mfSpecs.families, null, 2)}</pre></div>`;
+      }
+    }
     const block = prev && prev.ok === false
       ? `<div class="warn-box" style="border-color:#c0392b;color:#c0392b"><strong>Cannot launch:</strong> ${prev.block_reason}</div>`
       : "";
-    $("#preview").innerHTML = `${block}<strong>Frozen config preview</strong><pre class="mono">${JSON.stringify(body, null, 2)}</pre>
+    const caps = resolveEffectiveBudget(body.search_budget || {});
+    $("#preview").innerHTML = `${block}${mfBlock}<strong>Frozen config preview</strong><pre class="mono">${JSON.stringify(body, null, 2)}</pre>
+      <div class="panel" style="margin-top:0.5rem"><strong>Bucket caps (requested → effective)</strong>
+        <pre class="mono">${JSON.stringify({
+          max_generated_candidates: caps.max_generated_candidates,
+          max_candidates_per_family: {
+            requested: caps.requested.max_candidates_per_family,
+            effective: caps.effective.max_candidates_per_family,
+          },
+          max_candidates_per_complexity_tier: {
+            requested: caps.requested.max_candidates_per_complexity_tier,
+            effective: caps.effective.max_candidates_per_complexity_tier,
+          },
+          max_candidates_per_feature_family: {
+            requested: caps.requested.max_candidates_per_feature_family,
+            effective: caps.effective.max_candidates_per_feature_family,
+          },
+        }, null, 2)}</pre>
+        <p class="sub">Omitted family/tier/feature-family caps default to max_generated_candidates (${caps.max_generated_candidates}), not a hidden 20.</p>
+      </div>
       <p class="sub">Resolved backend: ${prev.evaluation_backend || "?"} · research-only · no live orders</p>`;
   };
-  ["run_type","dataset","symbols","timeframe","family","seed","cost","risk","features","budget","wfo","c_miner","c_smoke","c_vault","c_paper"]
+  const schedulePreview = () => {
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => { preview().catch(() => {}); }, 120);
+  };
+  ["run_type","dataset","symbols","timeframe","family","seed","cost","risk","features","budget","wfo","c_miner","c_smoke","c_vault","c_paper","run_mode","mf_family_count","mf_per_family","mf_blueprints","mf_adaptive"]
     .forEach(id => {
       const el = $(`#${id}`);
       if (!el) return;
-      el.addEventListener("input", preview);
-      el.addEventListener("change", preview);
+      el.addEventListener("input", schedulePreview);
+      el.addEventListener("change", schedulePreview);
     });
+  $("#run_mode").addEventListener("change", () => {
+    syncRunModePanels();
+    schedulePreview();
+  });
+  $("#seed").addEventListener("change", async () => {
+    if (isMultiFamilyMode()) await loadFamilyBlueprints();
+    schedulePreview();
+  });
   $("#dataset").addEventListener("change", async () => {
     await applyDatasetConstraints();
-    preview();
+    schedulePreview();
   });
-  preview();
+  await preview();
   $("#start_btn").onclick = async () => {
     try {
       if (state.constraints) {
@@ -304,7 +478,20 @@ async function wireNewRun() {
           return;
         }
       }
-      const run = await api("/api/runs", { method: "POST", body: JSON.stringify(collectRunBody()) });
+      const body = collectRunBody();
+      if (body.multi_family && body.multi_family.enabled) {
+        const mfPrev = await fetchMultiFamilyPreview(body);
+        if (mfPrev && mfPrev.error) {
+          $("#create_msg").textContent = mfPrev.error;
+          return;
+        }
+        if (!mfPrev || Number(mfPrev.distinct_grammar_fingerprints || 0) < 2) {
+          $("#create_msg").textContent =
+            "MULTI_FAMILY_TOO_FEW: fewer than 2 distinct grammar fingerprints";
+          return;
+        }
+      }
+      const run = await api("/api/runs", { method: "POST", body: JSON.stringify(body) });
       setRun(run.run_id);
       $("#create_msg").textContent = `Started ${run.run_id} · state=${run.state}`;
       location.hash = run.run_type === "ALPHA_MINER" ? "#/alpha-miner" : "#/run-detail";
@@ -317,13 +504,18 @@ function collectRunBody() {
   let budget = {}, wfo = {};
   try { budget = JSON.parse($("#budget").value || "{}"); } catch {}
   try { wfo = JSON.parse($("#wfo").value || "{}"); } catch {}
-  return {
+  const multi = isMultiFamilyMode();
+  const seed = Number($("#seed").value);
+  const perFamily = Math.max(1, Number(($("#mf_per_family") && $("#mf_per_family").value) || 10));
+  const familyCount = Math.max(2, Number(($("#mf_family_count") && $("#mf_family_count").value) || 6));
+  const familyIds = selectedBlueprintIds();
+  const body = {
     run_type: $("#run_type").value,
     dataset: $("#dataset").value,
     symbols: [$("#symbols").value].filter(Boolean),
     timeframe: $("#timeframe").value,
-    strategy_family: $("#family").value,
-    random_seed: Number($("#seed").value),
+    strategy_family: multi ? "multi_family_generated" : $("#family").value,
+    random_seed: seed,
     cost_model_version: $("#cost").value,
     risk_profile: $("#risk").value,
     feature_set_version: $("#features").value,
@@ -334,6 +526,27 @@ function collectRunBody() {
     confirm_vault: $("#c_vault").checked,
     confirm_paper: $("#c_paper").checked,
   };
+  if (multi) {
+    const totalBudget = perFamily * familyCount;
+    body.search_budget = {
+      ...budget,
+      max_generated_candidates: budget.max_generated_candidates ?? totalBudget,
+      max_evaluated_candidates: budget.max_evaluated_candidates ?? totalBudget,
+      max_full_wfo_evaluations: budget.max_full_wfo_evaluations ?? Math.max(1, Math.floor(totalBudget * 0.3)),
+    };
+    body.multi_family = {
+      enabled: true,
+      requested_family_count: familyCount,
+      min_candidates_per_family: perFamily,
+      total_candidate_budget: totalBudget,
+      max_full_wfo: Number(body.search_budget.max_full_wfo_evaluations),
+      adaptive_reallocation: !!( $("#mf_adaptive") && $("#mf_adaptive").checked ),
+      family_ids: familyIds,
+      seed,
+      max_oos_drawdown: Number(budget.max_oos_drawdown ?? 0.2),
+    };
+  }
+  return body;
 }
 
 const RUN_TABS = ["DEFAULT", "ALL", "ACTIVE", "QUEUED", "COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"];
@@ -381,6 +594,7 @@ async function wireRuns() {
 
 async function showDetail(id) {
   const run = await api(`/api/runs/${id}`);
+  state.alphaRunActive = ACTIVE.has(run.state);
   const summary = await api(`/api/runs/${id}/summary`);
   const el = $("#detail");
   if (!el) return;
@@ -438,7 +652,10 @@ async function renderAlpha() {
   const run = await api(`/api/runs/${id}`);
   let report = {};
   try { report = await api(`/api/runs/${id}/alpha_miner`); } catch { report = {}; }
-  const cands = await api(`/api/runs/${id}/candidates`);
+  let cands = {candidates: report.candidates || [], tables: report.tables || {}, registry_total: (report.candidates || []).length, rejected_visible: true};
+  if (!Array.isArray(report.candidates) || report.candidates.length === 0) {
+    try { cands = await api(`/api/runs/${id}/candidates`); } catch {}
+  }
   let rows = cands.candidates || [];
   if (state.filter) {
     const f = state.filter.toLowerCase();
@@ -457,6 +674,8 @@ async function renderAlpha() {
   const failures = tables.evaluation_failures || rows.filter(c => ["EVALUATION_ERROR","WFO_FAILED","INVALID"].includes(c.evaluation_stage));
   const noFinalists = Number(report.finalist_count ?? (typeof report.finalists === "number" ? report.finalists : 0)) === 0;
   const isFailed = run.state === "FAILED" || report.software_execution_status === "SOFTWARE_FAILURE" || report.discovery_result === "SOFTWARE_FAILURE" || report.software_failure_banner === true;
+  const provenance = report.runtime_provenance || summary.runtime_provenance || {};
+  const signalSource = report.signal_source || summary.signal_source || "unknown";
   const softwareErr = statusText(report.terminal_reason || run.terminal_reason || report.error, "SOFTWARE_FAILURE");
   const budget = report.search_budget_consumed || {};
   const dist = report.rejection_reason_distribution || {};
@@ -468,7 +687,55 @@ async function renderAlpha() {
       <p class="sub" id="live_status">State: ${run.state} · progress ${(run.progress_pct||0).toFixed(0)}% · stage ${run.current_stage || "IDLE"}</p>
     </div>
     ${isFailed ? `<div class="warn-box" style="border-color:#c0392b;background:rgba(192,57,43,0.12)"><strong style="color:#c0392b">SOFTWARE FAILURE</strong><br/>${softwareErr}<br/><span class="sub">Backend: ${statusText(report.evaluation_backend || run.summary?.evaluation_backend, "unknown")} · path: ${statusText(report.evaluation_path, report.evaluation_backend)}</span></div>` : (noFinalists && run.state === "COMPLETED" ? `<div class="warn-box"><strong>No candidate passed all mandatory Alpha Miner gates.</strong> Status: ${statusText(report.qualified_candidate_status, report.discovery_result || "NO_QUALIFIED_CANDIDATE")}<br/><span class="sub">${statusText(report.generation_cap_explanation, "")}</span></div>` : "")}
-    <p class="sub">Backend: ${statusText(report.evaluation_backend, "unknown")} · path: ${statusText(report.evaluation_path, report.evaluation_backend)} · is_full_event_wfo=${report.is_full_event_wfo === true} · terminal: ${statusText(report.terminal_reason)} · proxy_metric_used=${report.proxy_metric_used === true}</p>
+    <p class="sub">Backend: ${statusText(report.evaluation_backend, "unknown")} · path: ${statusText(report.evaluation_path, report.evaluation_backend)} · signal_source=${statusText(signalSource)} · is_full_event_wfo=${report.is_full_event_wfo === true} · terminal: ${statusText(report.terminal_reason)} · proxy_metric_used=${report.proxy_metric_used === true}</p>
+    ${provenance && provenance.git_commit_sha ? `<div class="panel"><h3>Runtime provenance</h3><pre class="mono">${JSON.stringify({
+      git_commit_sha: provenance.git_commit_sha,
+      python_executable: provenance.python_executable,
+      cwd: provenance.cwd,
+      module_paths: provenance.module_paths,
+      signal_source: signalSource,
+      pid: provenance.pid,
+    }, null, 2)}</pre></div>` : ""}
+    ${Array.isArray(report.family_funnel) && report.family_funnel.length ? `
+    <div class="panel">
+      <h3>Strategy Family Generator</h3>
+      <p class="sub">Hypothesis-driven families above Alpha Miner — distinct DSL search spaces.</p>
+      <h4>Budget allocation</h4>
+      <pre class="mono">${JSON.stringify(report.budget_allocation || {}, null, 2)}</pre>
+      <h4>Family funnel</h4>
+      <table>
+        <thead><tr>
+          <th>Family</th><th>Alloc gen</th><th>Alloc WFO</th><th>Generated</th><th>Evaluated</th>
+          <th>Full WFO</th><th>Score qual</th><th>Stress</th><th>Best fitness</th>
+          <th>Med OOS Exp</th><th>Med PF</th>
+        </tr></thead>
+        <tbody>${report.family_funnel.map(f => `<tr>
+          <td class="mono">${f.family_id}</td>
+          <td>${fmtVal(f.allocation_generated)}</td>
+          <td>${fmtVal(f.allocation_wfo)}</td>
+          <td>${fmtVal(f.generated)}</td>
+          <td>${fmtVal(f.evaluated)}</td>
+          <td>${fmtVal(f.full_wfo)}</td>
+          <td>${fmtVal(f.score_qualified)}</td>
+          <td>${fmtVal(f.stress_passed)}</td>
+          <td>${fmtMetric(f.best_fitness, 4)}</td>
+          <td>${fmtMetric(f.median_oos_expectancy, 6)}</td>
+          <td>${fmtMetric(f.median_pf, 4)}</td>
+        </tr>`).join("")}</tbody>
+      </table>
+      <h4>Hypothesis &amp; constraints</h4>
+      ${report.family_funnel.map(f => `<div style="margin-bottom:0.75rem">
+        <strong class="mono">${f.family_id}</strong> — ${statusText(f.hypothesis, "")}
+        <pre class="mono" style="max-height:10rem;overflow:auto">${JSON.stringify({
+          grammar_fingerprint: f.grammar_fingerprint,
+          best_candidate_ids: f.best_candidate_ids,
+          rejection_reasons: f.rejection_reasons,
+          constraints: f.constraints,
+        }, null, 2)}</pre>
+      </div>`).join("")}
+      <h4>Best candidates per family</h4>
+      <pre class="mono">${JSON.stringify(report.best_candidates_per_family || {}, null, 2)}</pre>
+    </div>` : ""}
     ${(report.evaluation_backend === "synthetic_oos_probe") ? `<div class="warn-box">Synthetic OOS probe — not a real-data institutional evaluation.</div>` : ""}
     ${report.silver_resolution ? `<div class="panel"><h3>Silver artifacts</h3><pre class="mono">${JSON.stringify(report.silver_resolution, null, 2)}</pre></div>` : ""}
     ${report.wfo_summary ? `<div class="panel"><h3>WFO</h3><pre class="mono">${JSON.stringify(report.wfo_summary, null, 2)}</pre></div>` : ""}
@@ -480,6 +747,12 @@ async function renderAlpha() {
       <div class="stat"><div class="label">Evaluated</div><div class="value">${report.evaluated_candidates ?? run.evaluated_count ?? 0}</div></div>
       <div class="stat"><div class="label">Full WFO</div><div class="value">${Number(report.full_wfo_evaluations ?? report.full_wfo_evaluated ?? 0)}</div></div>
       <div class="stat"><div class="label">Score qualified</div><div class="value">${Number(report.score_qualified ?? 0)}</div></div>
+      <div class="stat"><div class="label">MaxDD limit</div><div class="value" style="font-size:0.85rem">${(() => {
+        const lim = report.search_budget_consumed?.max_oos_drawdown
+          ?? report.frozen_search_budget?.effective?.max_oos_drawdown
+          ?? report.frozen_search_budget?.requested?.max_oos_drawdown;
+        return lim == null ? "—" : `${(Number(lim)*100).toFixed(1)}%`;
+      })()}</div></div>
       <div class="stat"><div class="label">Stress passed</div><div class="value">${Number(report.stress_passed ?? 0)}</div></div>
       <div class="stat"><div class="label">Clusters</div><div class="value">${Number(report.behavioral_clusters ?? 0)}</div></div>
       <div class="stat"><div class="label">Shortlisted</div><div class="value">${Number(report.shortlisted ?? 0)}</div></div>
@@ -488,6 +761,9 @@ async function renderAlpha() {
       <div class="stat"><div class="label">Elapsed s</div><div class="value">${Number(report.elapsed_time ?? run.elapsed_seconds ?? 0).toFixed(2)}</div></div>
       <div class="stat"><div class="label">Throughput /s</div><div class="value">${Number(report.throughput_per_second ?? 0).toFixed(2)}</div></div>
       <div class="stat"><div class="label">Budget gen</div><div class="value" style="font-size:0.9rem">${budget.generated ?? 0}/${budget.generated_cap ?? "?"}</div></div>
+      <div class="stat"><div class="label">Family cap</div><div class="value" style="font-size:0.85rem">${budget.max_candidates_per_family_requested ?? "∅"}→${budget.max_candidates_per_family_effective ?? budget.bucket_caps_effective?.max_candidates_per_family ?? "?"}</div></div>
+      <div class="stat"><div class="label">Complexity tier cap</div><div class="value" style="font-size:0.85rem">${budget.max_candidates_per_complexity_tier_requested ?? "∅"}→${budget.max_candidates_per_complexity_tier_effective ?? budget.bucket_caps_effective?.max_candidates_per_complexity_tier ?? "?"}</div></div>
+      <div class="stat"><div class="label">Feature family cap</div><div class="value" style="font-size:0.85rem">${budget.max_candidates_per_feature_family_requested ?? "∅"}→${budget.max_candidates_per_feature_family_effective ?? budget.bucket_caps_effective?.max_candidates_per_feature_family ?? "?"}</div></div>
       <div class="stat"><div class="label">Terminal reason</div><div class="value" style="font-size:0.75rem">${statusText(report.terminal_reason || run.terminal_reason, "NONE")}</div></div>
       <div class="stat"><div class="label">Discovery</div><div class="value" style="font-size:0.8rem">${statusText(report.discovery_result, "NOT_APPLICABLE")}</div></div>
       <div class="stat"><div class="label">Statistical</div><div class="value" style="font-size:0.8rem">${statusText(report.statistical_result)}</div></div>
@@ -520,7 +796,7 @@ async function renderAlpha() {
     <div class="panel">
       <h3>Evaluation failures (count=${failures.length})</h3>
       <table><thead><tr><th>ID</th><th>Stage</th><th>Reason</th></tr></thead>
-      <tbody>${failures.map(c => `<tr><td class="mono">${c.candidate_id}</td><td>${fmtVal(c.evaluation_stage)}</td><td>${fmtVal(c.rejection_reason)}</td></tr>`).join("") || `<tr><td colspan="3">None</td></tr>`}</tbody></table>
+      <tbody>${failures.map(c => `<tr><td class="mono">${c.candidate_id}</td><td>${fmtVal(c.evaluation_stage)}</td><td>${fmtVal(c.evaluation_error_reason || c.rejection_reason)}</td></tr>`).join("") || `<tr><td colspan="3">None</td></tr>`}</tbody></table>
     </div>
     <div class="panel">
       <h3>Rejected candidates</h3>
@@ -555,34 +831,69 @@ async function renderAlpha() {
       <table>
         <thead><tr>
           <th>ID</th><th>Family</th><th>Parents</th><th>Complexity</th><th>Fitness</th>
-          <th>OOS Exp</th><th>PF</th><th>MaxDD</th><th>Calmar</th>
-          <th>DSR</th><th>PBO</th><th>Cluster</th><th>Stage</th>
+          <th>OOS Exp $</th><th>PF</th><th>MaxDD %</th><th>Calmar</th>
+          <th>Entry signals</th><th>Fills</th><th>OOS trades</th>
+          <th>DSR</th><th>PBO</th><th>Cluster</th><th>Stage</th><th>Error / reject</th>
         </tr></thead>
         <tbody>${rows.map(c => `<tr>
           <td class="mono">${c.candidate_id}</td>
           <td>${c.family||c.strategy_family||""}</td>
           <td class="mono">${(c.parent_ids||[]).join(",") || "NONE"}</td>
-          <td>${fmtVal(c.complexity)}</td>
-          <td>${fmtVal(c.fitness)}</td>
-          <td>${fmtVal(c.median_oos_expectancy)}</td>
-          <td>${fmtVal(c.profit_factor)}</td>
-          <td>${fmtVal(c.max_drawdown)}</td>
-          <td>${fmtVal(c.calmar_mar)}</td>
+          <td>${fmtMetric(c.complexity, 4)}</td>
+          <td>${fmtMetric(c.fitness, 4)}</td>
+          <td>${fmtMetric(c.median_oos_expectancy, 6)}</td>
+          <td>${fmtMetric(c.profit_factor, 4)}</td>
+          <td>${fmtPercentMetric(c.max_drawdown_pct, 4)}</td>
+          <td>${fmtMetric(c.calmar ?? c.calmar_mar, 4)}</td>
+          <td>${fmtVal(c.entry_true_count)}</td>
+          <td>${fmtVal(c.fills)}</td>
+          <td>${fmtVal(c.total_oos_trades)}</td>
           <td>${fmtVal(c.dsr)}</td>
           <td>${fmtVal(c.pbo)}</td>
           <td>${fmtVal(c.behavioral_cluster)}</td>
           <td>${fmtVal(c.evaluation_stage)}</td>
-        </tr>`).join("") || `<tr><td colspan="13">No candidates</td></tr>`}</tbody>
+          <td>${c.evaluation_stage === "EVALUATION_ERROR"
+            ? fmtVal(c.evaluation_error_reason || c.rejection_reason)
+            : (c.rejected ? fmtVal(c.rejection_reason) : "—")}</td>
+        </tr>`).join("") || `<tr><td colspan="17">No candidates</td></tr>`}</tbody>
       </table>
       <p class="sub">Registry total ${cands.registry_total} · rejected visible=${cands.rejected_visible}</p>
     </div>
     <div class="row">
-      <div class="panel"><h3>Rejection distribution</h3><pre class="logs">${JSON.stringify(dist, null, 2)}</pre></div>
+      <div class="panel"><h3>Rejection distribution</h3>
+        <p class="sub">SCORE_QUALIFIED requires expectancy&gt;0, PF&gt;1, OOS trades≥min, |MaxDD|≤limit. Rejects: NEGATIVE_EXPECTANCY / PF_BELOW_ONE / INSUFFICIENT_OOS_TRADES / MAX_DRAWDOWN_EXCEEDED (no Stress).</p>
+        <pre class="logs">${JSON.stringify(dist, null, 2)}</pre>
+      </div>
+      <div class="panel"><h3>Frozen search budget / bucket caps</h3><pre class="logs">${JSON.stringify({
+        frozen: report.frozen_search_budget,
+        consumed_caps: {
+          family: {
+            requested: budget.max_candidates_per_family_requested ?? null,
+            effective: budget.max_candidates_per_family_effective ?? budget.bucket_caps_effective?.max_candidates_per_family,
+          },
+          complexity_tier: {
+            requested: budget.max_candidates_per_complexity_tier_requested ?? null,
+            effective: budget.max_candidates_per_complexity_tier_effective ?? budget.bucket_caps_effective?.max_candidates_per_complexity_tier,
+          },
+          feature_family: {
+            requested: budget.max_candidates_per_feature_family_requested ?? null,
+            effective: budget.max_candidates_per_feature_family_effective ?? budget.bucket_caps_effective?.max_candidates_per_feature_family,
+          },
+        },
+      }, null, 2)}</pre></div>
       <div class="panel"><h3>WFO / Stress / Clusters</h3><pre class="logs">${JSON.stringify({
         wfo: report.wfo_summary, stress: report.stress_summary, clusters: report.behavioral_cluster_summary
       }, null, 2)}</pre></div>
     </div>
     <div class="panel"><h3>Event stream</h3><div class="logs" id="miner_events">Connecting…</div></div>`;
+}
+
+function scheduleAlphaRefresh(delay = 900) {
+  if (!["alpha-miner", "registry"].includes(state.page) || state.alphaRefreshTimer || state.alphaRefreshInFlight) return;
+  state.alphaRefreshTimer = setTimeout(async () => {
+    state.alphaRefreshTimer = null; state.alphaRefreshInFlight = true;
+    try { await route({background:true, preserveScroll:true}); } finally { state.alphaRefreshInFlight = false; }
+  }, delay);
 }
 
 function wireAlpha() {
@@ -617,17 +928,18 @@ function wireAlpha() {
           live.textContent = `State: live update · progress ${Number(e.progress).toFixed(0)}% · ${e.event_type}`;
         }
       } catch {}
+        scheduleAlphaRefresh(650);
     };
-    es.addEventListener("end", () => { es.close(); });
+    es.addEventListener("end", () => { es.close(); scheduleAlphaRefresh(50); });
     es.onerror = () => {
       es.close();
-      // Reconnect pull missed events then resume
+      // Pull missed events, refresh, then reconnect
       api(`/api/runs/${id}/events?after_seq=${after}`).then(data => {
         for (const e of (data.events || [])) {
           after = Math.max(after, e.seq || 0);
           box.textContent = `${e.seq} [${e.event_type}] ${e.message}\n` + box.textContent;
         }
-      }).catch(() => {});
+      }).catch(() => {}).finally(() => { scheduleAlphaRefresh(100); if (state.alphaRunActive) setTimeout(connect, 1000); });
     };
   };
   // Seed from persistence first
@@ -636,6 +948,7 @@ function wireAlpha() {
     box.textContent = events.map(e => `${e.seq} [${e.event_type}] ${e.message}`).join("\n") || "No events";
     after = events.reduce((m, e) => Math.max(m, e.seq || 0), 0);
     connect();
+    if (state.alphaRunActive) scheduleAlphaRefresh(1400);
   }).catch(() => { box.textContent = "Failed to load events"; });
 }
 
@@ -1296,18 +1609,22 @@ const WIRES = {
   },
 };
 
-async function route() {
+async function route(options = {}) {
+  const background = options && options.background === true;
+  const preserveScroll = options && options.preserveScroll === true;
+  const savedScrollY = preserveScroll ? window.scrollY : 0;
   stopSSE();
   const raw = location.hash.replace(/^#\/?/, "") || "overview";
   state.page = raw.split("?")[0];
   if (state.page === "active") state.page = "runs";
   nav();
   const app = $("#app");
-  app.innerHTML = `<p class="sub">Loading…</p>`;
+  if (!background) app.innerHTML = `<p class="sub">Loading…</p>`;
   try {
     const html = await (RENDERERS[state.page] || renderOverview)();
     app.innerHTML = html;
     if (WIRES[state.page]) await WIRES[state.page]();
+    if (preserveScroll) requestAnimationFrame(() => window.scrollTo(0, savedScrollY));
   } catch (e) {
     app.innerHTML = `<h1>Error</h1><pre class="logs">${String(e.message || e)}</pre>`;
   }

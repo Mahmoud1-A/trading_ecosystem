@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from control_plane.models import FORBIDDEN_LIVE_MODES, RunType
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 FORBIDDEN_KEYS = frozenset(
@@ -61,6 +61,10 @@ class CreateRunRequest(BaseModel):
     hold_seconds: float = Field(default=0.0, ge=0.0, le=30.0)
     # Explicit smoke-test flag required to use synthetic_demo with Alpha Miner
     smoke_test: bool = False
+    # One-candidate UI canary overrides (research-safe)
+    ui_canary: dict[str, Any] = Field(default_factory=dict)
+    # Multi-family Strategy Family Generator campaign (above Alpha Miner)
+    multi_family: dict[str, Any] = Field(default_factory=dict)
     # Explicitly rejected if present via validator on nested dicts
     environment: str | None = None
     trading_mode: str | None = None
@@ -89,7 +93,7 @@ class CreateRunRequest(BaseModel):
             raise ValueError("live credentials are not accepted")
         return v
 
-    @field_validator("search_budget", "wfo")
+    @field_validator("search_budget", "wfo", "ui_canary", "multi_family")
     @classmethod
     def _no_forbidden_keys(cls, v: dict[str, Any]) -> dict[str, Any]:
         for k in v:
@@ -112,6 +116,36 @@ class CreateRunRequest(BaseModel):
             raise ConfigValidationError("live modes are forbidden")
         if self.trading_mode and self.trading_mode.upper() in FORBIDDEN_LIVE_MODES:
             raise ConfigValidationError("live trading modes are forbidden")
+
+    @model_validator(mode="after")
+    def _multi_family_contract(self) -> CreateRunRequest:
+        mf = dict(self.multi_family or {})
+        if not mf.get("enabled"):
+            return self
+        if self.run_type is not RunType.ALPHA_MINER:
+            raise ValueError("multi_family is only valid for ALPHA_MINER runs")
+        from control_plane.multi_family_ui import validate_multi_family_launch
+
+        try:
+            preview = validate_multi_family_launch(
+                strategy_family=self.strategy_family,
+                multi_family=mf,
+                random_seed=self.random_seed,
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        # Attach preview for run snapshot / frozen config (non-serialized side channel
+        # via multi_family dict copy on the model).
+        if preview is not None:
+            enriched = {
+                **mf,
+                "enabled": True,
+                "preview_family_specs": preview.get("families"),
+                "distinct_grammar_fingerprints": preview.get("distinct_grammar_fingerprints"),
+                "grammar_fingerprints": preview.get("grammar_fingerprints"),
+            }
+            object.__setattr__(self, "multi_family", enriched)
+        return self
 
     def validate_against_catalog(self, catalog: Any) -> None:
         """Enforce dataset eligibility and symbol/timeframe constraints."""
@@ -191,7 +225,12 @@ class CreateRunRequest(BaseModel):
                     f"timeframe {self.timeframe!r} (raw tick rejected for "
                     "mean_reversion_vwap_bb — use 1m or 5m)"
                 )
-            if self.strategy_family not in entry.compatible_strategy_families:
+            multi_enabled = bool((self.multi_family or {}).get("enabled"))
+            from control_plane.multi_family_ui import MULTI_FAMILY_STRATEGY_FAMILY
+
+            if multi_enabled and self.strategy_family == MULTI_FAMILY_STRATEGY_FAMILY:
+                pass  # dedicated multi-family label — not a catalog MR template
+            elif self.strategy_family not in entry.compatible_strategy_families:
                 raise ConfigValidationError(
                     f"strategy_family {self.strategy_family!r} not compatible with dataset"
                 )

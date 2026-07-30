@@ -117,6 +117,8 @@ class RunManager:
             "date_range_start": req.date_range_start,
             "date_range_end": req.date_range_end,
             "hold_seconds": req.hold_seconds,
+            "ui_canary": dict(req.ui_canary or {}),
+            "multi_family": dict(req.multi_family or {}),
             "environment": "research",
             "live_trading_enabled": False,
         }

@@ -46,6 +46,10 @@ class ExecutionConfig:
     accrue_cfd_financing: bool = True
     # Roll futures positions when the bar's tradable contract changes
     auto_roll_futures: bool = True
+    # Research/WFO: close residual open lots after the final bar so window-end
+    # FLAT signals are not stranded by no_next_bar_for_execution.
+    # Default False so unit execution tests can leave intentional open lots.
+    flatten_at_window_end: bool = False
 
 
 @dataclass
@@ -1032,12 +1036,22 @@ class EventExecutionEngine:
                     # Decision should be at this bar's close for close-based signals
                     self.submit_signal(sig, next_bar_open=next_open)
             elif signal_fn is not None and i + 1 >= len(bars):
-                # Last bar: signal may be generated but cannot fill (no next bar)
+                # Last bar: entry signals cannot fill (no next bar). Record and
+                # defer residual flatten to _force_flat_open_positions below.
                 raw = signal_fn(bar, self.portfolio, i)
                 if raw is not None:
                     self._rejected_signals.append(
                         {"reason": "no_next_bar_for_execution", "bar": str(bar.timestamp)}
                     )
+
+        if bars and self.exec_config.flatten_at_window_end:
+            before_fills = len(self.portfolio.fills)
+            self._force_flat_open_positions(bars[-1], reason="window_end_residual_flatten")
+            forced = len(self.portfolio.fills) - before_fills
+            if forced > 0:
+                self._rejected_signals.append(
+                    {"reason": "forced_window_closes", "count": int(forced)}
+                )
 
         return ExecutionResult(
             portfolio=self.portfolio,
@@ -1048,6 +1062,40 @@ class EventExecutionEngine:
             financing_events=list(self.financing_events),
             rollover_decisions=list(self.rollover_decisions),
         )
+
+    def _force_flat_open_positions(self, bar: BarEvent, *, reason: str) -> None:
+        """Close any residual open lots at window end (research/WFO integrity)."""
+        for sym, pos in list(self.portfolio.positions.items()):
+            if pos.is_flat:
+                continue
+            sig = SignalEvent(
+                timing=InformationTiming(
+                    source_timestamp=bar.timestamp,
+                    availability_timestamp=bar.bar_end,
+                    decision_timestamp=bar.bar_end,
+                ),
+                symbol=sym,
+                side="FLAT",
+                quantity=abs(float(pos.quantity)),
+                signal_id=self.id_factory.next_signal_id(
+                    decision_timestamp=str(bar.bar_end), symbol=sym, side="FLAT"
+                ),
+                reason=reason,
+                meta={"window_end_flatten": True},
+            )
+            # Activate on this bar so the market flatten can fill at close.
+            order = self._create_order_from_signal(
+                sig,
+                next_bar_open=bar.timestamp,
+                skip_risk=False,
+            )
+            if order is None:
+                continue
+            fill = self._try_fill_market(order, bar)
+            if fill is not None:
+                self._attach_brackets_after_entry(fill)
+            if order in self._working:
+                self._working = [o for o in self._working if o.order_id != order.order_id]
 
 
 def bars_from_frame(

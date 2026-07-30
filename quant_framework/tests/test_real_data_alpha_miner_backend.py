@@ -193,8 +193,94 @@ class TestRealWFOPath:
         assert payload["training_ranges"]
         assert payload["oos_ranges"]
         assert folds is not None
+        assert train.get("signal_source") == "candidate_dsl_trees"
+        assert train.get("evaluation_path") == "dsl_event_driven_wfo"
 
-    def test_missing_backend_fails_real_data_unavailable(self) -> None:
+    def test_generated_dsl_candidate_trades_on_bounded_2024_slice(
+        self, yearly_entry, tmp_path: Path
+    ) -> None:
+        """Real Silver BID/ASK (bounded): at least one generated DSL candidate must close OOS trades."""
+        resolved = resolve_bid_ask_bars(yearly_entry, timeframe="1m", max_rows=12_000)
+        from config.walk_forward_config import WalkForwardConfig
+        from discovery.generator import CandidateGenerator
+
+        assert "bid" in resolved.frame.columns and "ask" in resolved.frame.columns
+        backend = EventDrivenDiscoveryBackend(
+            bars=resolved.frame,
+            require_real_bars=True,
+            asset_class="cfd",
+            intraday_only=True,
+            artifact_dir=tmp_path,
+            silver_resolution=resolved.as_dict(),
+            wfo_config=WalkForwardConfig(
+                train_window_days=2,
+                validation_window_days=1,
+                step_forward_days=1,
+                purge_gap_bars=1,
+                embargo_gap_bars=1,
+                bars_per_day=1440,
+                max_folds=2,
+                param_grid={},
+            ),
+        )
+        gen = CandidateGenerator()
+        # Known-good generated seed from real-data funnel diagnosis
+        cand = gen.generate(seed=41)
+        folds, diag = backend.evaluate(cand)
+        oos_trades = sum(f.n_trades for f in folds)
+        oos_funnels = [
+            f for f in (diag.get("fold_trade_funnels") or []) if f.get("phase") == "validation_oos"
+        ]
+        assert diag.get("signal_source") == "candidate_dsl_trees"
+        assert diag.get("evaluation_path") == "dsl_event_driven_wfo"
+        assert oos_trades >= 1, (
+            f"expected real-data OOS trades, funnels={oos_funnels} totals="
+            f"entry={diag.get('signals_entry_count')} fills={diag.get('fills_count')}"
+        )
+        assert any(int(f.get("entry_true_count", 0)) >= 1 for f in oos_funnels)
+        assert any(int(f.get("fills", 0)) >= 1 for f in oos_funnels)
+        assert any(int(f.get("positions_closed", 0)) >= 1 for f in oos_funnels)
+        # Funnel schema required for ops diagnosis
+        for f in oos_funnels:
+            for key in (
+                "entry_true_count",
+                "exit_true_count",
+                "orders_submitted",
+                "fills",
+                "positions_opened",
+                "positions_closed",
+                "forced_window_closes",
+                "rejected_orders",
+            ):
+                assert key in f
+
+    def test_seed_template_trades_on_bounded_2024_slice(self, yearly_entry, tmp_path: Path) -> None:
+        resolved = resolve_bid_ask_bars(yearly_entry, timeframe="1m", max_rows=12_000)
+        from config.walk_forward_config import WalkForwardConfig
+        from discovery.generator import CandidateGenerator
+
+        backend = EventDrivenDiscoveryBackend(
+            bars=resolved.frame,
+            require_real_bars=True,
+            asset_class="cfd",
+            intraday_only=True,
+            artifact_dir=tmp_path,
+            silver_resolution=resolved.as_dict(),
+            wfo_config=WalkForwardConfig(
+                train_window_days=2,
+                validation_window_days=1,
+                step_forward_days=1,
+                purge_gap_bars=1,
+                embargo_gap_bars=1,
+                bars_per_day=1440,
+                max_folds=2,
+                param_grid={},
+            ),
+        )
+        cand = CandidateGenerator().seed_template_mean_reversion(seed=42)
+        folds, diag = backend.evaluate(cand)
+        assert sum(f.n_trades for f in folds) >= 1
+        assert diag.get("signal_source") == "candidate_dsl_trees"
         with pytest.raises(RuntimeError) as ei:
             EventDrivenDiscoveryBackend(require_real_bars=True, bars=None)
         assert REAL_DATA_BACKEND_UNAVAILABLE in str(ei.value)

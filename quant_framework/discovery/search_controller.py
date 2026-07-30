@@ -16,13 +16,20 @@ from discovery.behavioral_dedup import (
 from discovery.candidate import StrategyCandidate
 from discovery.crossover import Crossover
 from discovery.evaluator import CandidateEvaluator, EvalOutcome, EvaluationRecord
+from discovery.fitness import RobustFitness
 from discovery.freezing import FrozenCandidate, freeze_candidate
 from discovery.generator import CandidateGenerator
 from discovery.mutation import Mutator
 from discovery.parameter_robustness import ParameterRobustness
 from discovery.portfolio_candidates import PortfolioCandidate, PortfolioCandidatePool
 from discovery.promotion import PromotionDecision, PromotionGate, PromotionStatus
-from discovery.search_budget import BudgetCounters, SearchBudget
+from discovery.search_budget import (
+    BUDGET_BUCKETS_EXHAUSTED,
+    DUPLICATE_CANDIDATE_ID,
+    GENERATION_DIVERSITY_EXHAUSTED,
+    BudgetCounters,
+    SearchBudget,
+)
 from discovery.selection import DiverseSelector, ScoredCandidate
 from discovery.stress import StressTester, attach_stress
 from discovery.expression_tree import DSLValidationError
@@ -90,20 +97,34 @@ class SearchController:
     _vault_touch_attempted: bool = False
     # Optional instrumentation — None preserves quantitative behavior (Phase 12 dashboard)
     progress_hook: Callable[[str, dict[str, Any]], None] | None = None
+    # UI canary: skip seed template; generate exactly canary_generate_seed once.
+    canary_generate_seed: int | None = None
+    skip_seed_template: bool = False
 
     def __post_init__(self) -> None:
+        trade_fitness = RobustFitness(
+            min_total_oos_trades=int(self.budget.min_oos_trades),
+            min_oos_trades_per_fold=int(self.budget.min_oos_trades_per_fold),
+            max_oos_drawdown=float(self.budget.max_oos_drawdown),
+        )
         self.evaluator = CandidateEvaluator(
             registry=self.registry,
             budget=self.budget,
             counters=self.counters,
+            fitness_model=trade_fitness,
             system_version=self.system_version,
             data_hash=self.data_hash,
             code_hash=self.code_hash,
             discovery_run_id=self.discovery_run_id,
+            grammar=self.generator.grammar,
             progress_hook=self.progress_hook,
         )
-        self.stress_tester = StressTester(budget=self.budget, counters=self.counters)
-        self.robustness = ParameterRobustness()
+        self.stress_tester = StressTester(
+            budget=self.budget,
+            counters=self.counters,
+            fitness_model=trade_fitness,
+        )
+        self.robustness = ParameterRobustness(fitness_model=trade_fitness)
 
     def _emit_progress(self, event_name: str, payload: dict[str, Any] | None = None) -> None:
         if self.progress_hook is not None:
@@ -167,40 +188,65 @@ class SearchController:
         best_fitness = float("-inf")
         generations = 0
         stop_reason = "completed"
+        # Seed template has a fixed AST → fixed candidate_id. Attempt it once only;
+        # thereafter always use random generation while the population is empty.
+        seed_template_attempted = False
 
         self._emit_progress("GENERATION_STARTED", {"generation": 0, "phase": "seed"})
 
         # Seed population
+        canary_used = False
         while len(population) < self.budget.population_size:
             self.counters.runtime_seconds = time.perf_counter() - t0
-            if self.counters.stop_reason(self.budget):
+            reason = self.counters.stop_reason(self.budget)
+            if reason:
+                stop_reason = reason
                 break
             if self.counters.invalid >= self.budget.max_generated_candidates:
                 stop_reason = "max_generated_candidates"
                 break
-            seed_i = int(rng.integers(0, 1_000_000))
-            prefer_seed = generations == 0 and len(population) == 0
+            if self.canary_generate_seed is not None and not canary_used:
+                seed_i = int(self.canary_generate_seed)
+                prefer_seed = False
+                canary_used = True
+            else:
+                seed_i = int(rng.integers(0, 1_000_000))
+                prefer_seed = (not seed_template_attempted) and (not self.skip_seed_template)
+                if prefer_seed:
+                    seed_template_attempted = True
             cand = self._safe_generate(seed_i, prefer_seed_template=prefer_seed)
             if cand is None:
                 # Replacement attempt while budget remains
                 continue
-            if not self.counters.record_generated(
+            cap_reason = self.counters.record_generated(
                 self.budget,
                 family=cand.strategy_family,
                 complexity=cand.complexity_score,
                 feature_ids=cand.feature_ids,
-            ):
-                trial = self.evaluator._register(  # noqa: SLF001 — explicit budget reject path
-                    cand,
-                    rejection_reason="budget_family_or_tier_cap",
-                    ranking_score=None,
-                    net_metrics={},
-                )
-                _ = trial
-                self._emit_progress(
-                    "CANDIDATE_REJECTED",
-                    {"candidate_id": cand.candidate_id, "reason": "budget_family_or_tier_cap"},
-                )
+                candidate_id=cand.candidate_id,
+            )
+            if cap_reason is not None:
+                if cap_reason == DUPLICATE_CANDIDATE_ID:
+                    # Visibility in registry; do not consume unique budget.
+                    # Fresh-seed replacement continues on the next loop iteration.
+                    self.evaluator.evaluate(cand)
+                else:
+                    self.evaluator._register(  # noqa: SLF001 — explicit budget reject path
+                        cand,
+                        rejection_reason=cap_reason,
+                        ranking_score=None,
+                        net_metrics={},
+                    )
+                    self._emit_progress(
+                        "CANDIDATE_REJECTED",
+                        {"candidate_id": cand.candidate_id, "reason": cap_reason},
+                    )
+                if self.counters.diversity_exhausted(self.budget):
+                    stop_reason = GENERATION_DIVERSITY_EXHAUSTED
+                    break
+                if self.counters.buckets_exhausted(self.budget):
+                    stop_reason = BUDGET_BUCKETS_EXHAUSTED
+                    break
                 continue
             self._emit_progress(
                 "CANDIDATE_GENERATED",
@@ -209,16 +255,27 @@ class SearchController:
                     "family": cand.strategy_family,
                     "generation": cand.generation,
                     "generated": self.counters.generated,
+                    "generated_attempts": self.counters.generated_attempts,
+                    "unique_generated": self.counters.unique_generated,
+                    "duplicate_attempts": self.counters.duplicate_attempts,
                 },
             )
             rec = self.evaluator.evaluate(cand)
             cand_by_id[cand.candidate_id] = cand
-            rec_by_id[cand.candidate_id] = rec
+            # Keep the first non-duplicate evaluation record for this ID.
+            prev = rec_by_id.get(cand.candidate_id)
+            if prev is None or (
+                prev.outcome is EvalOutcome.DUPLICATE_SKIPPED
+                and rec.outcome is not EvalOutcome.DUPLICATE_SKIPPED
+            ):
+                rec_by_id[cand.candidate_id] = rec
             if rec.fitness is not None and rec.outcome is EvalOutcome.REGISTERED:
                 sig = signature_from_record(cand, rec)
                 population.append(
                     ScoredCandidate(candidate=cand, fitness=rec.fitness.fitness, signature=sig)
                 )
+            # If unique candidate did not enter population, keep generating
+            # random replacements (seed already attempted at most once).
 
         while True:
             self.counters.runtime_seconds = time.perf_counter() - t0
@@ -274,25 +331,36 @@ class SearchController:
                 for child in child_iter:
                     if self.counters.generated >= self.budget.max_generated_candidates:
                         break
-                    if not self.counters.record_generated(
+                    cap_reason = self.counters.record_generated(
                         self.budget,
                         family=child.strategy_family,
                         complexity=child.complexity_score,
                         feature_ids=child.feature_ids,
-                    ):
-                        self.evaluator._register(  # noqa: SLF001
-                            child,
-                            rejection_reason="budget_family_or_tier_cap",
-                            ranking_score=None,
-                            net_metrics={},
-                        )
-                        self._emit_progress(
-                            "CANDIDATE_REJECTED",
-                            {
-                                "candidate_id": child.candidate_id,
-                                "reason": "budget_family_or_tier_cap",
-                            },
-                        )
+                        candidate_id=child.candidate_id,
+                    )
+                    if cap_reason is not None:
+                        if cap_reason == DUPLICATE_CANDIDATE_ID:
+                            self.evaluator.evaluate(child)
+                        else:
+                            self.evaluator._register(  # noqa: SLF001
+                                child,
+                                rejection_reason=cap_reason,
+                                ranking_score=None,
+                                net_metrics={},
+                            )
+                            self._emit_progress(
+                                "CANDIDATE_REJECTED",
+                                {
+                                    "candidate_id": child.candidate_id,
+                                    "reason": cap_reason,
+                                },
+                            )
+                        if self.counters.diversity_exhausted(self.budget):
+                            stop_reason = GENERATION_DIVERSITY_EXHAUSTED
+                            break
+                        if self.counters.buckets_exhausted(self.budget):
+                            stop_reason = BUDGET_BUCKETS_EXHAUSTED
+                            break
                         continue
                     self._emit_progress(
                         "CANDIDATE_GENERATED",
@@ -301,11 +369,19 @@ class SearchController:
                             "family": child.strategy_family,
                             "generation": generations,
                             "generated": self.counters.generated,
+                            "generated_attempts": self.counters.generated_attempts,
+                            "unique_generated": self.counters.unique_generated,
+                            "duplicate_attempts": self.counters.duplicate_attempts,
                         },
                     )
                     rec = self.evaluator.evaluate(child)
                     cand_by_id[child.candidate_id] = child
-                    rec_by_id[child.candidate_id] = rec
+                    prev = rec_by_id.get(child.candidate_id)
+                    if prev is None or (
+                        prev.outcome is EvalOutcome.DUPLICATE_SKIPPED
+                        and rec.outcome is not EvalOutcome.DUPLICATE_SKIPPED
+                    ):
+                        rec_by_id[child.candidate_id] = rec
                     if rec.fitness is not None and rec.outcome is EvalOutcome.REGISTERED:
                         children.append(child)
 
@@ -319,12 +395,14 @@ class SearchController:
                     mutant = self._safe_generate(self.seed + generations * 300 + i)
                 if mutant is None:
                     continue
-                if self.counters.record_generated(
+                mutant_cap_reason = self.counters.record_generated(
                     self.budget,
                     family=mutant.strategy_family,
                     complexity=mutant.complexity_score,
                     feature_ids=mutant.feature_ids,
-                ):
+                    candidate_id=mutant.candidate_id,
+                )
+                if mutant_cap_reason is None:
                     self._emit_progress(
                         "CANDIDATE_GENERATED",
                         {
@@ -332,17 +410,73 @@ class SearchController:
                             "family": mutant.strategy_family,
                             "generation": generations,
                             "generated": self.counters.generated,
+                            "generated_attempts": self.counters.generated_attempts,
+                            "unique_generated": self.counters.unique_generated,
+                            "duplicate_attempts": self.counters.duplicate_attempts,
                         },
                     )
                     rec = self.evaluator.evaluate(mutant)
                     cand_by_id[mutant.candidate_id] = mutant
-                    rec_by_id[mutant.candidate_id] = rec
+                    prev = rec_by_id.get(mutant.candidate_id)
+                    if prev is None or (
+                        prev.outcome is EvalOutcome.DUPLICATE_SKIPPED
+                        and rec.outcome is not EvalOutcome.DUPLICATE_SKIPPED
+                    ):
+                        rec_by_id[mutant.candidate_id] = rec
                     if rec.fitness is not None and rec.outcome is EvalOutcome.REGISTERED:
                         children.append(mutant)
+                elif mutant_cap_reason == DUPLICATE_CANDIDATE_ID:
+                    # Duplicate → attempt a fresh random replacement for this slot.
+                    self.evaluator.evaluate(mutant)
+                    replacement = self._safe_generate(
+                        self.seed + generations * 400 + i + self.counters.generated_attempts
+                    )
+                    if replacement is None:
+                        if self.counters.diversity_exhausted(self.budget):
+                            stop_reason = GENERATION_DIVERSITY_EXHAUSTED
+                            break
+                        continue
+                    repl_reason = self.counters.record_generated(
+                        self.budget,
+                        family=replacement.strategy_family,
+                        complexity=replacement.complexity_score,
+                        feature_ids=replacement.feature_ids,
+                        candidate_id=replacement.candidate_id,
+                    )
+                    if repl_reason is None:
+                        self._emit_progress(
+                            "CANDIDATE_GENERATED",
+                            {
+                                "candidate_id": replacement.candidate_id,
+                                "family": replacement.strategy_family,
+                                "generation": generations,
+                                "generated": self.counters.generated,
+                                "generated_attempts": self.counters.generated_attempts,
+                                "unique_generated": self.counters.unique_generated,
+                                "duplicate_attempts": self.counters.duplicate_attempts,
+                            },
+                        )
+                        rec = self.evaluator.evaluate(replacement)
+                        cand_by_id[replacement.candidate_id] = replacement
+                        rec_by_id[replacement.candidate_id] = rec
+                        if rec.fitness is not None and rec.outcome is EvalOutcome.REGISTERED:
+                            children.append(replacement)
+                    elif repl_reason == DUPLICATE_CANDIDATE_ID:
+                        self.evaluator.evaluate(replacement)
+                    else:
+                        self.evaluator._register(  # noqa: SLF001
+                            replacement,
+                            rejection_reason=repl_reason,
+                            ranking_score=None,
+                            net_metrics={},
+                        )
+                    if self.counters.diversity_exhausted(self.budget):
+                        stop_reason = GENERATION_DIVERSITY_EXHAUSTED
+                        break
                 else:
                     self.evaluator._register(  # noqa: SLF001
                         mutant,
-                        rejection_reason="budget_family_or_tier_cap",
+                        rejection_reason=mutant_cap_reason,
                         ranking_score=None,
                         net_metrics={},
                     )
@@ -350,9 +484,15 @@ class SearchController:
                         "CANDIDATE_REJECTED",
                         {
                             "candidate_id": mutant.candidate_id,
-                            "reason": "budget_family_or_tier_cap",
+                            "reason": mutant_cap_reason,
                         },
                     )
+                    if self.counters.diversity_exhausted(self.budget):
+                        stop_reason = GENERATION_DIVERSITY_EXHAUSTED
+                        break
+                    if self.counters.buckets_exhausted(self.budget):
+                        stop_reason = BUDGET_BUCKETS_EXHAUSTED
+                        break
 
             # Rebuild scored population from children
             new_pop: list[ScoredCandidate] = []
@@ -408,6 +548,15 @@ class SearchController:
             cand = fin.candidate
             rec = rec_by_id[cand.candidate_id]
             assert rec.fitness is not None
+            # SCORE_QUALIFIED gate: never stress fitness-rejected candidates.
+            from discovery.fitness import SCORE_QUALIFIED_REJECT_REASONS
+
+            if (
+                rec.outcome is not EvalOutcome.REGISTERED
+                or rec.rejection_reason in SCORE_QUALIFIED_REJECT_REASONS
+                or (rec.fitness is not None and rec.fitness.rejected)
+            ):
+                continue
 
             # Stress + robustness (persist on record)
             stress = self.stress_tester.run(

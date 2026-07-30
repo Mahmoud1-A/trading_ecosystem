@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from statistics import median
 from typing import Any
 
 from control_plane.stage_machine import CandidateStage, classify_candidate, map_terminal_reason
@@ -18,10 +19,26 @@ STATUS_NOT_APPLICABLE = "NOT_APPLICABLE"
 
 
 def _latest_by_candidate(trials: list[TrialRecord]) -> dict[str, TrialRecord]:
-    """Keep one trial per candidate_id (last write wins) to avoid double-counting."""
+    """Keep the richest trial per candidate, not a later duplicate shell.
+
+    A later duplicate registry entry must not erase completed WFO fold evidence
+    from the original evaluation of the same deterministic candidate ID.
+    """
+
+    def richness(t: TrialRecord) -> tuple[int, int, int, int]:
+        reason = (t.rejection_reason or "").lower()
+        return (
+            0 if "duplicate" in reason else 1,
+            1 if t.fold_records else 0,
+            1 if t.ranking_score is not None else 0,
+            len(t.fold_records or []),
+        )
+
     out: dict[str, TrialRecord] = {}
     for t in trials:
-        out[t.candidate_id] = t
+        prev = out.get(t.candidate_id)
+        if prev is None or richness(t) >= richness(prev):
+            out[t.candidate_id] = t
     return out
 
 
@@ -61,7 +78,7 @@ def _wfo_fold_info(trial: TrialRecord) -> dict[str, Any]:
         "aggregate_oos_metrics": {
             "ranking_score": trial.ranking_score,
             "fold_metrics": [
-                f.get("expectancy") or f.get("oos_metric")
+                f["expectancy"] if "expectancy" in f else f.get("oos_metric")
                 for f in (folds or wfo_folds)
                 if isinstance(f, dict)
             ],
@@ -167,6 +184,14 @@ def build_candidate_row(
         float(f["max_drawdown"]) for f in folds if isinstance(f, dict) and "max_drawdown" in f
     ]
     calmars = [float(f["calmar"]) for f in folds if isinstance(f, dict) and "calmar" in f]
+    trade_counts = [int(f["n_trades"]) for f in folds if isinstance(f, dict) and f.get("n_trades") is not None]
+    total_oos_trades = sum(max(0, n) for n in trade_counts)
+    if "total_oos_trades" in net and net.get("total_oos_trades") is not None:
+        total_oos_trades = int(net["total_oos_trades"])
+    if "fold_trade_counts" in net and isinstance(net.get("fold_trade_counts"), list):
+        trade_counts = [int(x) for x in net["fold_trade_counts"]]
+        total_oos_trades = sum(max(0, n) for n in trade_counts)
+    min_oos_trades = int(net.get("min_oos_trades") or snap.get("min_oos_trades") or 8)
     wfo = _wfo_fold_info(trial)
     enr = enrichment.get(trial.candidate_id, {})
     stress_status = (
@@ -186,6 +211,21 @@ def build_candidate_row(
     if trial.ranking_score is None:
         dsr_status = STATUS_NOT_EVALUATED if trial.rejection_reason else dsr_status
         pbo_status = STATUS_NOT_EVALUATED if trial.rejection_reason else pbo_status
+    # Closed-trade floors: DSR/PBO are not evaluable without enough OOS trades.
+    if (
+        total_oos_trades <= 0
+        or total_oos_trades < min_oos_trades
+        or (trial.rejection_reason or "")
+        in {
+            "NO_OOS_TRADES",
+            "INSUFFICIENT_OOS_TRADES",
+            "NEGATIVE_EXPECTANCY",
+            "PF_BELOW_ONE",
+            "MAX_DRAWDOWN_EXCEEDED",
+        }
+    ):
+        dsr_status = STATUS_NOT_EVALUATED
+        pbo_status = STATUS_NOT_EVALUATED
 
     classified = classify_candidate(
         rejection_reason=trial.rejection_reason,
@@ -199,6 +239,7 @@ def build_candidate_row(
         behavioral_cluster=None if cluster in {STATUS_NOT_EVALUATED, None} else str(cluster),
         is_cluster_representative=trial.candidate_id in representative_ids,
         controller_shortlist=trial.candidate_id in controller_shortlist_ids,
+        total_oos_trades=int(total_oos_trades),
     )
 
     median_oos: Any = (
@@ -215,6 +256,57 @@ def build_candidate_row(
             else STATUS_NOT_EVALUATED
         )
 
+    # Zero-trade hygiene for dashboard/report: never surface manufactured
+    # expectancy / PF / MaxDD / Calmar (or leave them as NOT_EVALUATED).
+    zero_trade = total_oos_trades <= 0 or (trial.rejection_reason or "") == "NO_OOS_TRADES"
+    if zero_trade:
+        median_oos = 0.0
+        profit_factor: Any = 0.0
+        max_drawdown: Any = 0.0
+        max_drawdown_pct: Any = 0.0
+        calmar: Any = 0.0
+        metrics_basis_note = (
+            "n_trades==0: expectancy/PF/MaxDD/Calmar forced to 0 (no manufactured equity-path metrics)"
+        )
+        if fitness not in {STATUS_NOT_APPLICABLE}:
+            fitness = STATUS_NOT_EVALUATED
+    else:
+        profit_factor = float(median(pfs)) if pfs else STATUS_NOT_EVALUATED
+        max_drawdown = float(min(dds)) if dds else STATUS_NOT_EVALUATED
+        max_drawdown_pct = float(min(dds) * 100.0) if dds else STATUS_NOT_EVALUATED
+        calmar = float(median(calmars)) if calmars else STATUS_NOT_EVALUATED
+        metrics_basis_note = net.get("metrics_basis_note") or STATUS_NOT_APPLICABLE
+
+    train_diag = {}
+    if isinstance(net.get("train_diagnostic"), dict):
+        train_diag = dict(net["train_diagnostic"])
+    elif isinstance(getattr(trial, "gross_metrics", None), dict):
+        gd = trial.gross_metrics.get("train_diagnostic")
+        if isinstance(gd, dict):
+            train_diag = dict(gd)
+    oos_funnels = [
+        f
+        for f in list(train_diag.get("fold_trade_funnels") or [])
+        if isinstance(f, dict) and f.get("phase") == "validation_oos"
+    ]
+    entry_true_count = int(
+        sum(int(f.get("entry_true_count", 0) or 0) for f in oos_funnels)
+        or train_diag.get("signals_entry_count")
+        or 0
+    )
+    fills_count = int(
+        sum(int(f.get("fills", 0) or 0) for f in oos_funnels)
+        or train_diag.get("fills_count")
+        or 0
+    )
+    orders_submitted = int(sum(int(f.get("orders_submitted", 0) or 0) for f in oos_funnels))
+    signal_source = (
+        train_diag.get("signal_source")
+        or snap.get("signal_source")
+        or net.get("signal_source")
+        or STATUS_NOT_EVALUATED
+    )
+
     return {
         "candidate_id": trial.candidate_id,
         "lineage_id": trial.lineage_id,
@@ -225,14 +317,30 @@ def build_candidate_row(
         "complexity": snap.get("complexity", STATUS_NOT_EVALUATED),
         "fitness": fitness,
         "median_oos_expectancy": median_oos,
-        "profit_factor": float(sum(pfs) / len(pfs)) if pfs else STATUS_NOT_EVALUATED,
-        "max_drawdown": float(min(dds)) if dds else STATUS_NOT_EVALUATED,
-        "calmar_mar": float(sum(calmars) / len(calmars)) if calmars else STATUS_NOT_EVALUATED,
+        "profit_factor": profit_factor,
+        "max_drawdown": max_drawdown,
+        "max_drawdown_pct": max_drawdown_pct,
+        "calmar": calmar,
+        "calmar_mar": calmar,
+        "total_oos_trades": int(total_oos_trades) if trade_counts or total_oos_trades else 0,
+        "entry_true_count": entry_true_count,
+        "fills": fills_count,
+        "orders_submitted": orders_submitted,
+        "signal_source": signal_source,
+        "fold_trade_counts": trade_counts,
+        "min_oos_trades": min_oos_trades,
         "dsr": dsr_status,
         "pbo": pbo_status,
         "stress_status": stress_status,
         "behavioral_cluster": cluster,
         "rejection_reason": trial.rejection_reason or STATUS_NOT_APPLICABLE,
+        "evaluation_error_reason": (
+            trial.rejection_reason
+            if classified["evaluation_stage"] == CandidateStage.EVALUATION_ERROR.value
+            or (trial.rejection_reason or "").startswith("eval_failed")
+            else STATUS_NOT_APPLICABLE
+        ),
+        "metrics_basis_note": metrics_basis_note,
         "evaluation_stage": classified["evaluation_stage"],
         "last_completed_stage": classified["last_completed_stage"],
         "next_missing_gate": classified["next_missing_gate"],
@@ -247,6 +355,7 @@ def build_candidate_row(
         "backend_kind": snap.get("backend_kind", STATUS_NOT_EVALUATED),
         "is_full_event_wfo": _is_full_event_wfo(trial),
         "evaluation_path": snap.get("evaluation_path", snap.get("backend_kind")),
+        "family_provenance": dict(snap.get("family_provenance") or {}),
         "wfo": wfo,
     }
 
@@ -471,6 +580,25 @@ def build_alpha_miner_report(
             "runtime_seconds": counters.runtime_seconds,
             "runtime_cap": budget.max_runtime_seconds,
             "controller_stop_reason": result.stop_reason,
+            "generated_attempts": counters.generated_attempts,
+            "unique_generated_candidates": counters.unique_generated,
+            "duplicate_attempts": counters.duplicate_attempts,
+            "max_candidates_per_family_effective": budget.max_candidates_per_family,
+            "max_candidates_per_complexity_tier_effective": (
+                budget.max_candidates_per_complexity_tier
+            ),
+            "max_candidates_per_feature_family_effective": (
+                budget.max_candidates_per_feature_family
+            ),
+            "bucket_caps_effective": {
+                "max_candidates_per_family": budget.max_candidates_per_family,
+                "max_candidates_per_complexity_tier": (
+                    budget.max_candidates_per_complexity_tier
+                ),
+                "max_candidates_per_feature_family": (
+                    budget.max_candidates_per_feature_family
+                ),
+            },
         },
         "terminal_reason": terminal,
         "controller_stop_reason": result.stop_reason,

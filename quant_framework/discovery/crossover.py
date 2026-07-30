@@ -109,6 +109,7 @@ class Crossover:
                 cost_model_version=parent_a.cost_model_version,
                 asset_universe=parent_a.asset_universe,
                 random_seed=s,
+                family_provenance=dict(parent_a.family_provenance or {}),
             )
             try:
                 check_strategy_trees(

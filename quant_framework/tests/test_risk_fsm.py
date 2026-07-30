@@ -146,6 +146,33 @@ class TestReduceOnlyGating:
         ok_flat = fsm.evaluate_order(flat, portfolio)
         assert ok_flat.allowed is True
 
+    def test_normal_flat_exit_allowed_when_symbol_exposure_full(self) -> None:
+        """Regression: full max_symbol_exposure must not block reduce-only FLAT.
+
+        Pre-fix, size_by_risk_budget returned exposure_cap with remaining=0,
+        so exits never filled → n_trades=0 while open MTM invented MaxDD.
+        """
+        profile = _profile(max_symbol_exposure=1.0, max_portfolio_exposure=1.0)
+        fsm = PropRiskFSM(profile, starting_equity=100_000.0)
+        assert fsm.state == RiskState.NORMAL
+
+        portfolio = _portfolio(100_000.0)
+        pos = portfolio.get_position("ES")
+        pos.quantity = 1.0
+        pos.avg_price = 100.0
+        pos.contract = "ESH24"
+
+        # New risk-increasing entry must still be blocked
+        buy = _order(Side.BUY, 1.0)
+        rej = fsm.evaluate_order(buy, portfolio)
+        assert rej.allowed is False
+
+        flat = _order(Side.SELL, 1.0, reduce_only=True)
+        ok = fsm.evaluate_order(flat, portfolio)
+        assert ok.allowed is True
+        assert ok.adjusted_quantity == pytest.approx(1.0)
+        assert ok.reason == "risk_reducing_exit"
+
 
 class TestHardBreachFlattenHalt:
     def test_hard_breach_flattens_then_halts(self) -> None:

@@ -19,8 +19,12 @@ from control_plane.events import (
 )
 from control_plane.models import RunRecord, RunState, RunType
 from discovery.generator import CandidateGenerator
-from discovery.search_budget import SearchBudget
-from discovery.search_controller import SearchController
+from discovery.multi_family_campaign import (
+    MultiFamilyCampaign,
+    family_campaign_from_config,
+)
+from discovery.search_budget import BudgetCounters, resolve_bucket_caps, search_budget_from_config
+from discovery.search_controller import DiscoveryRunResult, SearchController
 from registry.experiment_registry import ExperimentRegistry
 from registry.hashing import sha256_json
 
@@ -251,31 +255,35 @@ def run_alpha_miner_job(
 
     art = Path(run.artifact_dir)
     art.mkdir(parents=True, exist_ok=True)
+    from control_plane.runtime_provenance import (
+        assert_dsl_signal_source,
+        collect_runtime_provenance,
+    )
+
+    provenance = collect_runtime_provenance(
+        repo_hint=Path(__file__).resolve().parents[2]
+    )
+    (art / "runtime_provenance.json").write_text(
+        json.dumps(provenance, indent=2, default=str), encoding="utf-8"
+    )
+    _emit(
+        sink,
+        run,
+        EventType.RUN_STARTED,
+        "Alpha Miner started",
+        stage="miner",
+        progress=3,
+        payload={"runtime_provenance": provenance},
+    )
+
     registry = ExperimentRegistry(art / "registry")
     budget_cfg = dict(run.config_snapshot.get("search_budget") or {})
-    pop_size = int(budget_cfg.get("population_size", 4))
-    stag_gens = budget_cfg.get("stagnation_generations")
-    if stag_gens is None:
-        stag_gens = budget_cfg.get("stagnation_limit", 8)
-    min_before_stag = budget_cfg.get("minimum_generations_before_stagnation")
-    if min_before_stag is None:
-        min_before_stag = max(1, pop_size)
-    budget = SearchBudget(
-        max_generated_candidates=int(budget_cfg.get("max_generated_candidates", 12)),
-        max_evaluated_candidates=int(budget_cfg.get("max_evaluated_candidates", 10)),
-        max_full_wfo_evaluations=int(budget_cfg.get("max_full_wfo_evaluations", 10)),
-        max_stress_evaluations=int(budget_cfg.get("max_stress_evaluations", 4)),
-        population_size=pop_size,
-        elite_count=1,
-        stagnation_limit=int(stag_gens),
-        stagnation_generations=int(stag_gens),
-        minimum_generations_before_stagnation=int(min_before_stag),
-        max_runtime_seconds=float(budget_cfg.get("max_runtime_seconds", 60)),
-        max_candidates_per_family=20,
-        max_candidates_per_complexity_tier=20,
-        max_candidates_per_feature_family=20,
+    budget = search_budget_from_config(budget_cfg)
+    bucket_caps = resolve_bucket_caps(
+        budget_cfg, max_generated_candidates=budget.max_generated_candidates
     )
-    _emit(sink, run, EventType.RUN_STARTED, "Alpha Miner started", stage="miner", progress=5)
+    canary_cfg = dict(run.config_snapshot.get("ui_canary") or {})
+    _emit(sink, run, EventType.RUN_STARTED, "Alpha Miner budget ready", stage="miner", progress=5)
 
     if cancel_check():
         run.state = RunState.CANCELLED
@@ -376,7 +384,9 @@ def run_alpha_miner_job(
             _emit(sink, run, EventType.RUN_FAILED, msg, severity=EventSeverity.ERROR)
             return run
         try:
-            resolved = resolve_bid_ask_bars(entry, timeframe=timeframe)
+            canary_max_rows = canary_cfg.get("max_rows")
+            max_rows = int(canary_max_rows) if canary_max_rows is not None else None
+            resolved = resolve_bid_ask_bars(entry, timeframe=timeframe, max_rows=max_rows)
         except (SilverResolutionError, ValueError) as exc:
             run.state = RunState.FAILED
             run.software_success = False
@@ -408,7 +418,8 @@ def run_alpha_miner_job(
             embargo_gap_bars=int(wfo_cfg_raw.get("embargo_gap_bars", 1)),
             bars_per_day=int(wfo_cfg_raw.get("bars_per_day", bars_per_day)),
             max_folds=int(wfo_cfg_raw.get("max_folds", 4)),
-            param_grid={"lookback": [10, 15], "z_entry": [1.5, 2.0]},
+            # DSL candidates carry their own parameters; do not inject MR stub grid.
+            param_grid=dict(wfo_cfg_raw.get("param_grid") or {}),
         )
         try:
             backend = EventDrivenDiscoveryBackend(
@@ -451,89 +462,314 @@ def run_alpha_miner_job(
         backend = SyntheticOOSBackend()
         backend_name = "synthetic_oos_probe"
 
-    ctrl = SearchController(
-        registry=registry,
-        budget=budget,
-        seed=run.random_seed,
-        system_version=run.system_version,
-        discovery_run_id=run.run_id,
-        progress_hook=None,
-    )
-    ctrl.evaluator.backend = backend
+    # Fail fast unless every full WFO evaluation reports DSL signal_source.
+    if getattr(backend, "is_full_event_wfo", False) and hasattr(backend, "evaluate"):
+        _orig_backend_evaluate = backend.evaluate
+
+        def _backend_evaluate_with_signal_gate(candidate):  # type: ignore[no-untyped-def]
+            folds, train_diag = _orig_backend_evaluate(candidate)
+            arts = dict(getattr(backend, "last_run_artifacts") or {})
+            src = arts.get("signal_source") or (train_diag or {}).get("signal_source")
+            assert_dsl_signal_source(src, where=f"candidate={candidate.candidate_id}")
+            if isinstance(train_diag, dict):
+                train_diag = {
+                    **train_diag,
+                    "runtime_provenance": provenance,
+                    "signal_source": src,
+                }
+            return folds, train_diag
+
+        backend.evaluate = _backend_evaluate_with_signal_gate  # type: ignore[method-assign]
+
+    multi_cfg = family_campaign_from_config(run.config_snapshot.get("multi_family"))
+    campaign_result = None
+    aggregated_records: list[Any] = []
+
+    # Mutable holder so progress_hook can update counters from either path.
+    class _CounterProxy:
+        generated = 0
+        evaluated = 0
+
+    counter_proxy = _CounterProxy()
 
     def progress_hook(name: str, payload: dict[str, Any]) -> None:
         et = event_map.get(name)
-        if et is None:
+        # Allow multi-family progress even without a mapped EventType.
+        if et is None and name not in {
+            "MULTI_FAMILY_STARTED",
+            "FAMILY_PHASE_COMPLETED",
+        }:
             return
-        # Do not advertise FINALIST before institutional gates — remap label in payload
         msg_name = name
         if name == "FINALIST_SELECTED" and backend_name != "event_driven_wfo":
             msg_name = "SHORTLIST_UPDATED"
             payload = {**payload, "label": "TOP_RANKED_UNVALIDATED"}
         gen_cap = max(1, budget.max_generated_candidates)
-        progress = min(95.0, 10.0 + 80.0 * (ctrl.counters.generated / gen_cap))
-        run.generated_count = ctrl.counters.generated
-        run.evaluated_count = ctrl.counters.evaluated
+        if multi_cfg is not None:
+            gen_cap = max(1, multi_cfg.total_candidate_budget)
+        progress = min(95.0, 10.0 + 80.0 * (counter_proxy.generated / gen_cap))
+        run.generated_count = counter_proxy.generated
+        run.evaluated_count = counter_proxy.evaluated
         run.rejected_count = len(registry.rejected_trials())
         run.qualified_count = len(
             [t for t in registry.accepted_trials() if t.ranking_score is not None]
         )
         run.progress_pct = progress
         run.current_stage = msg_name.lower()
-        run.current_message = f"{msg_name}: {payload.get('candidate_id', payload.get('generation', ''))}"
+        run.current_message = (
+            f"{msg_name}: {payload.get('candidate_id', payload.get('family_id', payload.get('generation', '')))}"
+        )
         elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
         run.elapsed_seconds = elapsed
-        _emit(
-            sink,
-            run,
-            et,
-            run.current_message,
-            stage=run.current_stage,
-            progress=progress,
-            payload={
-                **payload,
-                "generated": run.generated_count,
-                "evaluated": run.evaluated_count,
-                "evaluation_backend": backend_name,
-            },
-        )
+        if et is not None:
+            _emit(
+                sink,
+                run,
+                et,
+                run.current_message,
+                stage=run.current_stage,
+                progress=progress,
+                payload={
+                    **payload,
+                    "generated": run.generated_count,
+                    "evaluated": run.evaluated_count,
+                    "evaluation_backend": backend_name,
+                },
+            )
         if on_update is not None:
             on_update(run)
 
-    ctrl.progress_hook = progress_hook
-    ctrl.evaluator.progress_hook = progress_hook
-    result = ctrl.run()
+    try:
+        if multi_cfg is not None:
+            # Align search_budget caps with campaign totals for reporting.
+            budget = budget.with_overrides(
+                max_generated_candidates=multi_cfg.total_candidate_budget,
+                max_evaluated_candidates=int(
+                    multi_cfg.max_evaluated_candidates or multi_cfg.total_candidate_budget
+                ),
+                max_full_wfo_evaluations=multi_cfg.max_full_wfo,
+                min_oos_trades=multi_cfg.min_oos_trades,
+                min_oos_trades_per_fold=multi_cfg.min_oos_trades_per_fold,
+                max_oos_drawdown=multi_cfg.max_oos_drawdown,
+                max_runtime_seconds=multi_cfg.max_runtime_seconds,
+                stagnation_generations=multi_cfg.stagnation_generations,
+                stagnation_limit=multi_cfg.stagnation_generations,
+                population_size=multi_cfg.population_size,
+            )
+            campaign = MultiFamilyCampaign(
+                config=multi_cfg,
+                registry=registry,
+                backend=backend,
+                system_version=run.system_version,
+                discovery_run_id=run.run_id,
+                progress_hook=progress_hook,
+            )
+
+            def _campaign_progress(name: str, payload: dict[str, Any]) -> None:
+                # Refresh proxy counters from registry growth.
+                counter_proxy.generated = len(registry.all_trials())
+                counter_proxy.evaluated = len(
+                    [t for t in registry.all_trials() if t.ranking_score is not None or t.rejection_reason]
+                )
+                progress_hook(name, payload)
+
+            campaign.progress_hook = _campaign_progress
+            campaign_result = campaign.run()
+            # Aggregate counters / discovery result for the existing report builder.
+            ctrl_counters = BudgetCounters()
+            all_records: list[Any] = []
+            rankings: list[dict[str, Any]] = []
+            finalists: list[str] = []
+            clusters: list[dict[str, Any]] = []
+            for dr in campaign_result.discovery_results:
+                rankings.extend(dr.rankings)
+                finalists.extend(dr.finalists)
+                clusters.extend(dr.clusters)
+            for st in campaign_result.family_stats:
+                ctrl_counters.generated += int(st.generated)
+                ctrl_counters.unique_generated += int(st.generated)
+                ctrl_counters.evaluated += int(st.evaluated)
+                ctrl_counters.full_wfo += int(st.full_wfo)
+            ctrl_counters.runtime_seconds = 0.0
+            counter_proxy.generated = ctrl_counters.generated
+            counter_proxy.evaluated = ctrl_counters.evaluated
+            result = DiscoveryRunResult(
+                discovery_run_id=run.run_id,
+                budget_id=budget.budget_id,
+                stop_reason=campaign_result.aggregated_stop_reason,
+                generations=len(campaign_result.discovery_results),
+                evaluated=ctrl_counters.evaluated,
+                registered_trials=len(registry.all_trials()),
+                rankings=sorted(
+                    rankings,
+                    key=lambda r: float(r.get("fitness") or float("-inf")),
+                    reverse=True,
+                ),
+                finalists=list(dict.fromkeys(finalists)),
+                promoted=[],
+                portfolio_pool={"members": [], "size": 0},
+                clusters=clusters,
+                reproducible_fingerprint=campaign_result.reproducible_fingerprint,
+            )
+            # Reconstruct evaluation records from registry enrichment path — empty ok.
+            aggregated_records = all_records
+            ctrl = None  # type: ignore[assignment]
+            report_counters = ctrl_counters
+        else:
+            ctrl = SearchController(
+                registry=registry,
+                budget=budget,
+                seed=run.random_seed,
+                system_version=run.system_version,
+                discovery_run_id=run.run_id,
+                progress_hook=None,
+                canary_generate_seed=(
+                    int(canary_cfg["generate_seed"])
+                    if canary_cfg.get("generate_seed") is not None
+                    else None
+                ),
+                skip_seed_template=bool(
+                    canary_cfg.get("skip_seed_template") or canary_cfg.get("enabled")
+                ),
+            )
+            ctrl.evaluator.backend = backend
+
+            def _single_progress(name: str, payload: dict[str, Any]) -> None:
+                counter_proxy.generated = ctrl.counters.generated
+                counter_proxy.evaluated = ctrl.counters.evaluated
+                progress_hook(name, payload)
+
+            ctrl.progress_hook = _single_progress
+            ctrl.evaluator.progress_hook = _single_progress
+            result = ctrl.run()
+            report_counters = ctrl.counters
+            aggregated_records = ctrl.evaluator.records()
+    except RuntimeError as exc:
+        fail_reasons = (
+            "SIGNAL_SOURCE_MISMATCH",
+            "FAMILY_GRAMMAR_COLLAPSE",
+            "FAMILY_LABEL_COLLAPSE",
+            "duplicate FamilySpec",
+        )
+        if not any(r in str(exc) for r in fail_reasons):
+            raise
+        run.state = RunState.FAILED
+        run.software_success = False
+        terminal = (
+            "SIGNAL_SOURCE_MISMATCH"
+            if "SIGNAL_SOURCE_MISMATCH" in str(exc)
+            else "MULTI_FAMILY_FAILURE"
+        )
+        run.terminal_reason = terminal
+        fail_summary = {
+            "terminal_reason": terminal,
+            "error": str(exc),
+            "runtime_provenance": provenance,
+            "software_execution_status": "FAILED",
+            "discovery_result": "SOFTWARE_FAILURE",
+        }
+        (art / "run_summary.json").write_text(
+            json.dumps(fail_summary, indent=2, default=str), encoding="utf-8"
+        )
+        _emit(sink, run, EventType.RUN_FAILED, str(exc), severity=EventSeverity.ERROR, payload=fail_summary)
+        return run
     elapsed = (datetime.now(tz=timezone.utc) - t0).total_seconds()
-    ctrl.counters.runtime_seconds = max(ctrl.counters.runtime_seconds, elapsed)
+    report_counters.runtime_seconds = max(report_counters.runtime_seconds, elapsed)
 
     report = build_alpha_miner_report(
         registry=registry,
-        counters=ctrl.counters,
+        counters=report_counters,
         budget=budget,
         result=result,
         elapsed_seconds=elapsed,
         cancelled=False,
-        evaluation_records=ctrl.evaluator.records(),
+        evaluation_records=aggregated_records,
         evaluation_backend=backend_name,
     )
+    if campaign_result is not None:
+        report["multi_family"] = campaign_result.as_dict()
+        report["family_funnel"] = [s.as_dict() for s in campaign_result.family_stats]
+        report["budget_allocation"] = campaign_result.budget_allocation
+        report["best_candidates_per_family"] = campaign_result.as_dict()[
+            "best_candidates_per_family"
+        ]
+        (art / "multi_family_campaign.json").write_text(
+            json.dumps(campaign_result.as_dict(), indent=2, default=str), encoding="utf-8"
+        )
     report["silver_resolution"] = silver_meta
     report["execution_banners"] = list(resolution.banners)
     report["is_full_event_wfo"] = bool(resolution.is_full_event_wfo)
     report["evaluation_path"] = backend_name
-    report["invalid_candidates"] = int(ctrl.counters.invalid)
+    report["runtime_provenance"] = provenance
+    report["signal_source"] = (
+        (getattr(backend, "last_run_artifacts", {}) or {}).get("signal_source")
+        if backend_name == "event_driven_wfo"
+        else "n/a"
+    )
+    if backend_name == "event_driven_wfo":
+        try:
+            assert_dsl_signal_source(report["signal_source"], where="run_summary")
+        except RuntimeError as exc:
+            run.state = RunState.FAILED
+            run.software_success = False
+            run.terminal_reason = "SIGNAL_SOURCE_MISMATCH"
+            fail_summary = {
+                "terminal_reason": "SIGNAL_SOURCE_MISMATCH",
+                "error": str(exc),
+                "runtime_provenance": provenance,
+                "signal_source": report.get("signal_source"),
+                "software_execution_status": "FAILED",
+                "discovery_result": "SOFTWARE_FAILURE",
+            }
+            (art / "run_summary.json").write_text(
+                json.dumps(fail_summary, indent=2, default=str), encoding="utf-8"
+            )
+            _emit(sink, run, EventType.RUN_FAILED, str(exc), severity=EventSeverity.ERROR, payload=fail_summary)
+            return run
+    report["invalid_candidates"] = int(report_counters.invalid)
     report["search_budget_consumed"] = {
         **report.get("search_budget_consumed", {}),
-        "generated_attempts": ctrl.counters.generated_attempts,
-        "unique_generated_candidates": ctrl.counters.unique_generated,
-        "evaluated_candidates": ctrl.counters.evaluated,
-        "full_wfo_evaluations": ctrl.counters.full_wfo,
-        "invalid_candidates": ctrl.counters.invalid,
+        "generated_attempts": report_counters.generated_attempts,
+        "unique_generated_candidates": report_counters.unique_generated,
+        "duplicate_attempts": report_counters.duplicate_attempts,
+        "evaluated_candidates": report_counters.evaluated,
+        "full_wfo_evaluations": report_counters.full_wfo,
+        "invalid_candidates": report_counters.invalid,
         "stagnation_generations_config": budget.effective_stagnation_generations(),
         "minimum_generations_before_stagnation": (
             budget.effective_minimum_generations_before_stagnation()
         ),
-        "generations_completed": ctrl.counters.generations_completed,
-        "stagnant_generations": ctrl.counters.stagnant_generations,
+        "generations_completed": report_counters.generations_completed,
+        "stagnant_generations": report_counters.stagnant_generations,
+        "max_candidates_per_family_requested": bucket_caps["requested"][
+            "max_candidates_per_family"
+        ],
+        "max_candidates_per_family_effective": budget.max_candidates_per_family,
+        "max_candidates_per_complexity_tier_requested": bucket_caps["requested"][
+            "max_candidates_per_complexity_tier"
+        ],
+        "max_candidates_per_complexity_tier_effective": (
+            budget.max_candidates_per_complexity_tier
+        ),
+        "max_candidates_per_feature_family_requested": bucket_caps["requested"][
+            "max_candidates_per_feature_family"
+        ],
+        "max_candidates_per_feature_family_effective": (
+            budget.max_candidates_per_feature_family
+        ),
+        "min_oos_trades": budget.min_oos_trades,
+        "min_oos_trades_per_fold": budget.min_oos_trades_per_fold,
+        "max_oos_drawdown": budget.max_oos_drawdown,
+        "bucket_caps_requested": bucket_caps["requested"],
+        "bucket_caps_effective": bucket_caps["effective"],
+    }
+    report["frozen_search_budget"] = {
+        "requested": dict(budget_cfg),
+        "effective": {
+            **budget.as_dict(),
+            "bucket_caps_requested": bucket_caps["requested"],
+            "bucket_caps_effective": bucket_caps["effective"],
+        },
     }
     run.generated_count = int(report["generated_candidates"])
     run.evaluated_count = int(report["evaluated_candidates"])
@@ -579,16 +815,25 @@ def run_alpha_miner_job(
         "silver_resolution": silver_meta,
         "evaluation_path": backend_name,
         "is_full_event_wfo": bool(resolution.is_full_event_wfo),
+        "runtime_provenance": provenance,
+        "signal_source": report.get("signal_source"),
+        "ui_canary": canary_cfg or None,
+        "multi_family": (campaign_result.as_dict() if campaign_result is not None else None),
+        "family_funnel": report.get("family_funnel"),
+        "budget_allocation": report.get("budget_allocation"),
     }
     (art / "run_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     manifest_files = [
         "run_summary.json",
         "alpha_miner_report.json",
         "candidates.json",
+        "runtime_provenance.json",
         "artifact_manifest.json",
     ]
     if silver_meta:
         manifest_files.append("silver_resolution.json")
+    if campaign_result is not None:
+        manifest_files.append("multi_family_campaign.json")
     _write_manifest(run, manifest_files)
     if cancel_check():
         run.state = RunState.CANCELLED

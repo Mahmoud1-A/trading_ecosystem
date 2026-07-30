@@ -91,6 +91,7 @@ class WindowRun:
     rollover_decisions: list[dict[str, Any]] = field(default_factory=list)
     equity_curve: list[tuple[str, float]] = field(default_factory=list)
     failure_reason: str | None = None
+    trade_funnel: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -113,6 +114,7 @@ class WindowRun:
             "rollover_decisions": list(self.rollover_decisions),
             "equity_curve": list(self.equity_curve),
             "failure_reason": self.failure_reason,
+            "trade_funnel": dict(self.trade_funnel),
         }
 
 
@@ -357,11 +359,26 @@ def run_event_window(
         if context.prop_profile is not None
         else None
     )
+    base_exec = context.exec_config or ExecutionConfig()
+    # WFO windows are finite: always flatten residual open lots so OOS does not
+    # strand positions via no_next_bar_for_execution (n_trades=0 + MTM MaxDD).
+    exec_config = ExecutionConfig(
+        latency=base_exec.latency,
+        intrabar_policy=base_exec.intrabar_policy,
+        stale_rejects_fills=base_exec.stale_rejects_fills,
+        expire_day_orders_at_session_close=base_exec.expire_day_orders_at_session_close,
+        allow_partial_fills=base_exec.allow_partial_fills,
+        random_seed=base_exec.random_seed,
+        max_bar_staleness=base_exec.max_bar_staleness,
+        accrue_cfd_financing=base_exec.accrue_cfd_financing,
+        auto_roll_futures=base_exec.auto_roll_futures,
+        flatten_at_window_end=True,
+    )
     engine = EventExecutionEngine(
         context.asset,
         context.cost_model,
         starting_equity=context.starting_equity,
-        exec_config=context.exec_config or ExecutionConfig(),
+        exec_config=exec_config,
         risk_manager=risk,
         id_factory=DeterministicIdFactory(
             run_id=context.run_id, candidate_id=f"{candidate_id}:{phase}", fold_id=fold_id
@@ -372,7 +389,19 @@ def run_event_window(
         frame, symbol=context.symbol, contract=context.contract, freq=context.freq
     )
     signal_fn = signal_fn_factory(params, window)
-    result = engine.run(bars, signal_fn)
+    signal_stats = {"entry_true_count": 0, "exit_true_count": 0}
+
+    def _counting_signal_fn(bar, portfolio, i):
+        sig = signal_fn(bar, portfolio, i)
+        if sig is not None:
+            side = str(sig.side).upper()
+            if side == "FLAT":
+                signal_stats["exit_true_count"] += 1
+            elif side in {"BUY", "SELL"}:
+                signal_stats["entry_true_count"] += 1
+        return sig
+
+    result = engine.run(bars, _counting_signal_fn)
 
     net_equity = _equity_series(result.portfolio)
     gross_equity = _gross_equity_series(result.portfolio, result)
@@ -396,6 +425,53 @@ def run_event_window(
         e.as_dict() for e in (risk.events if risk is not None else [])
     ]
     failure = None if result.portfolio.trades else "no_closed_trades"
+    order_snaps = [o.snapshot() for o in result.orders]
+    fill_dicts = [f.as_dict() for f in result.fills]
+    trade_dicts = [t.as_dict() for t in result.portfolio.trades]
+    rejected_orders = [
+        o
+        for o in order_snaps
+        if o.get("reject_reason") or str(o.get("status", "")).upper() == "REJECTED"
+    ]
+    forced_window_closes = sum(
+        1
+        for o in order_snaps
+        if (o.get("meta") or {}).get("window_end_flatten")
+        or str(o.get("meta", {}).get("reason", "")).endswith("window_end_residual_flatten")
+    )
+    # Also count fills linked to window-end flatten orders
+    if forced_window_closes == 0:
+        forced_window_closes = sum(
+            1
+            for o in order_snaps
+            if o.get("reduce_only")
+            and any(
+                str(r.get("reason")) == "forced_window_closes"
+                for r in (result.rejected_signals or [])
+            )
+        )
+    # Prefer explicit marker on orders from _force_flat_open_positions
+    forced_window_closes = sum(
+        1 for o in order_snaps if (o.get("meta") or {}).get("window_end_flatten")
+    )
+    reject_reason_counts: dict[str, int] = {}
+    for o in rejected_orders:
+        reason = str(o.get("reject_reason") or "REJECTED")
+        reject_reason_counts[reason] = reject_reason_counts.get(reason, 0) + 1
+    trade_funnel = {
+        "entry_true_count": int(signal_stats["entry_true_count"]),
+        "exit_true_count": int(signal_stats["exit_true_count"]),
+        "orders_submitted": sum(1 for o in order_snaps if not o.get("reject_reason")),
+        "fills": len(fill_dicts),
+        "positions_opened": sum(
+            1 for o in order_snaps if not o.get("reduce_only") and not o.get("reject_reason")
+        ),
+        "positions_closed": len(trade_dicts),
+        "forced_window_closes": int(forced_window_closes),
+        "rejected_orders": len(rejected_orders),
+        "reject_reasons": sorted(reject_reason_counts.keys()),
+        "reject_reason_counts": reject_reason_counts,
+    }
 
     return WindowRun(
         fold_id=fold_id,
@@ -408,15 +484,16 @@ def run_event_window(
         gross_metrics=gross.to_dict(),
         net_metrics=net_dict,
         cost_attribution=_cost_attribution(result),
-        orders=[o.snapshot() for o in result.orders],
-        fills=[f.as_dict() for f in result.fills],
-        trades=[t.as_dict() for t in result.portfolio.trades],
+        orders=order_snaps,
+        fills=fill_dicts,
+        trades=trade_dicts,
         risk_transitions=risk_transitions,
         rejected_signals=list(result.rejected_signals),
         financing_events=[e.as_dict() for e in result.financing_events],
         rollover_decisions=[d.as_dict() for d in result.rollover_decisions],
         equity_curve=[(str(t), float(e)) for t, e in result.portfolio.equity_curve],
         failure_reason=failure,
+        trade_funnel=trade_funnel,
     )
 
 

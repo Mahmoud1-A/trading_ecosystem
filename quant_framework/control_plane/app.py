@@ -51,6 +51,10 @@ def create_app(manager: RunManager | None = None, *, root: Path | None = None) -
         response = await call_next(request)
         response.headers["X-Research-Only"] = "true"
         response.headers["X-Live-Trading-Enabled"] = "false"
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
         return response
 
     def _mgr() -> RunManager:
@@ -581,6 +585,37 @@ def create_app(manager: RunManager | None = None, *, root: Path | None = None) -
             "backend_preview": backend_preview,
             "execution_banners": backend_preview.get("banners") or [],
         }
+
+    @app.get("/api/strategy_families/blueprints")
+    def strategy_family_blueprints(seed: int = Query(42, ge=0, le=1_000_000)) -> dict[str, Any]:
+        from control_plane.multi_family_ui import MULTI_FAMILY_STRATEGY_FAMILY, list_family_blueprints
+
+        rows = list_family_blueprints(seed=seed)
+        return {
+            "blueprints": rows,
+            "count": len(rows),
+            "multi_family_strategy_family": MULTI_FAMILY_STRATEGY_FAMILY,
+            "seed": seed,
+        }
+
+    @app.post("/api/strategy_families/preview")
+    async def strategy_family_preview(request: Request) -> dict[str, Any]:
+        from control_plane.multi_family_ui import preview_multi_family_specs
+
+        try:
+            payload = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="invalid JSON") from exc
+        try:
+            return preview_multi_family_specs(
+                seed=int(payload.get("seed", 42)),
+                family_count=int(
+                    payload.get("requested_family_count", payload.get("family_count", 0))
+                ),
+                family_ids=list(payload["family_ids"]) if payload.get("family_ids") else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/import/files")
     def list_import_files() -> dict[str, Any]:

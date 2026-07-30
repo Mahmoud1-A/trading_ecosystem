@@ -69,6 +69,23 @@ class FitnessResult:
 RANKING_SOURCE_OOS = "validation_oos"
 RANKING_SOURCE_IS = "training_is"
 
+NO_OOS_TRADES = "NO_OOS_TRADES"
+INSUFFICIENT_OOS_TRADES = "INSUFFICIENT_OOS_TRADES"
+NEGATIVE_EXPECTANCY = "NEGATIVE_EXPECTANCY"
+PF_BELOW_ONE = "PF_BELOW_ONE"
+MAX_DRAWDOWN_EXCEEDED = "MAX_DRAWDOWN_EXCEEDED"
+
+# Exact SCORE_QUALIFIED hard rejects (fitness gate — never advance to Stress).
+SCORE_QUALIFIED_REJECT_REASONS = frozenset(
+    {
+        NO_OOS_TRADES,
+        INSUFFICIENT_OOS_TRADES,
+        NEGATIVE_EXPECTANCY,
+        PF_BELOW_ONE,
+        MAX_DRAWDOWN_EXCEEDED,
+    }
+)
+
 
 def _median(xs: Sequence[float]) -> float:
     if not xs:
@@ -108,6 +125,12 @@ class RobustFitness:
 
     One exceptional fold cannot dominate: medians, trimmed means, and lower
     confidence bounds are preferred over raw means.
+
+    SCORE_QUALIFIED hard gates (all required):
+    - median OOS expectancy > 0
+    - median profit factor > 1
+    - total OOS trades >= ``min_total_oos_trades`` (and per-fold floors)
+    - worst |MaxDD| <= ``max_oos_drawdown``
     """
 
     complexity_penalty: float = 0.05
@@ -116,6 +139,11 @@ class RobustFitness:
     similarity_penalty: float = 0.5
     multiple_testing_penalty: float = 0.0
     min_folds: int = 1
+    # Closed OOS trade floors (synced from SearchBudget in the controller).
+    min_total_oos_trades: int = 8
+    min_oos_trades_per_fold: int = 1
+    # Absolute drawdown ceiling as a positive fraction (0.20 == 20%).
+    max_oos_drawdown: float = 0.20
 
     def score(
         self,
@@ -146,11 +174,80 @@ class RobustFitness:
                 rejection_reason="insufficient_oos_folds",
             )
 
-        expectancies = [f.expectancy for f in folds]
+        # Trade counts are mandatory evidence. Expectancy/PF are trade-based and
+        # become 0.0 with empty trade lists, while MaxDD/Calmar come from the
+        # equity curve and can still be non-zero without closed trades — never
+        # score-qualify on equity-only movement.
+        fold_trade_counts = tuple(max(0, int(f.n_trades)) for f in folds)
+        total_oos_trades = int(sum(fold_trade_counts))
+        expectancies = [float(f.expectancy) for f in folds]
+        pfs = [float(f.profit_factor) for f in folds]
+        dds = [float(f.max_drawdown) for f in folds]
+        median_expectancy = _median(expectancies)
+        median_pf = _median(pfs)
+        # Worst drawdown magnitude (fold max_drawdown is typically <= 0).
+        worst_dd = float(min(dds)) if dds else 0.0
+        abs_worst_dd = abs(worst_dd)
+        trade_components = {
+            "total_oos_trades": float(total_oos_trades),
+            "minimum_required_oos_trades": float(self.min_total_oos_trades),
+            "minimum_required_oos_trades_per_fold": float(self.min_oos_trades_per_fold),
+            "median_oos_expectancy": float(median_expectancy),
+            "median_profit_factor": float(median_pf),
+            "worst_oos_max_drawdown": float(worst_dd),
+            "max_oos_drawdown_limit": float(self.max_oos_drawdown),
+            **{f"fold_{i}_oos_trades": float(n) for i, n in enumerate(fold_trade_counts)},
+        }
+        if total_oos_trades == 0:
+            return FitnessResult(
+                fitness=float("-inf"),
+                ranking_source=ranking_source,
+                components=trade_components,
+                fold_scores=(),
+                rejected=True,
+                rejection_reason=NO_OOS_TRADES,
+            )
+        if total_oos_trades < self.min_total_oos_trades or any(
+            n < self.min_oos_trades_per_fold for n in fold_trade_counts
+        ):
+            return FitnessResult(
+                fitness=float("-inf"),
+                ranking_source=ranking_source,
+                components=trade_components,
+                fold_scores=(),
+                rejected=True,
+                rejection_reason=INSUFFICIENT_OOS_TRADES,
+            )
+        if not (median_expectancy > 0.0):
+            return FitnessResult(
+                fitness=float("-inf"),
+                ranking_source=ranking_source,
+                components=trade_components,
+                fold_scores=(),
+                rejected=True,
+                rejection_reason=NEGATIVE_EXPECTANCY,
+            )
+        if not (median_pf > 1.0):
+            return FitnessResult(
+                fitness=float("-inf"),
+                ranking_source=ranking_source,
+                components=trade_components,
+                fold_scores=(),
+                rejected=True,
+                rejection_reason=PF_BELOW_ONE,
+            )
+        if abs_worst_dd > float(self.max_oos_drawdown) + 1e-15:
+            return FitnessResult(
+                fitness=float("-inf"),
+                ranking_source=ranking_source,
+                components=trade_components,
+                fold_scores=(),
+                rejected=True,
+                rejection_reason=MAX_DRAWDOWN_EXCEEDED,
+            )
+
         sharpes = [f.sharpe for f in folds]
-        pfs = [f.profit_factor for f in folds]
         calmars = [f.calmar for f in folds]
-        dds = [f.max_drawdown for f in folds]
         turnovers = [f.turnover for f in folds]
         breaches = [f.prop_breach_prob for f in folds]
         regimes = [f.regime_entropy for f in folds]
@@ -166,9 +263,9 @@ class RobustFitness:
         )
 
         positive = {
-            "median_oos_expectancy": _median(expectancies),
+            "median_oos_expectancy": median_expectancy,
             "oos_dsr_proxy": _lower_confidence_bound(sharpes),
-            "oos_profit_factor": _median(pfs),
+            "oos_profit_factor": median_pf,
             "oos_calmar": _median(calmars),
             "fold_stability": 1.0 / (1.0 + float(np.std(fold_scores)) if fold_scores else 1.0),
             "regime_breadth": _median(regimes),
@@ -202,7 +299,11 @@ class RobustFitness:
             - negative["multiple_testing_penalty"]
         )
 
-        components = {**{f"pos_{k}": v for k, v in positive.items()}, **{f"neg_{k}": v for k, v in negative.items()}}
+        components = {
+            **trade_components,
+            **{f"pos_{k}": v for k, v in positive.items()},
+            **{f"neg_{k}": v for k, v in negative.items()},
+        }
         return FitnessResult(
             fitness=float(fitness),
             ranking_source=ranking_source,

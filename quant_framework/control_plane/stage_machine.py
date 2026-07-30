@@ -56,6 +56,8 @@ TERMINAL_STOP_REASONS = {
     "max_cpu_seconds": "RUNTIME_EXHAUSTED",
     "stagnation_limit": "STAGNATION_LIMIT",
     "empty_population": "STAGNATION_LIMIT",
+    "budget_buckets_exhausted": "BUDGET_BUCKETS_EXHAUSTED",
+    "generation_diversity_exhausted": "GENERATION_DIVERSITY_EXHAUSTED",
     "completed": "CONVERGENCE",
     "cancelled": "CANCELLED",
 }
@@ -120,6 +122,7 @@ def classify_candidate(
     is_cluster_representative: bool,
     controller_shortlist: bool,
     allow_research_shortlist: bool = True,
+    total_oos_trades: int | None = None,
 ) -> dict[str, Any]:
     """
     Derive institutional stage labels.
@@ -144,6 +147,21 @@ def classify_candidate(
     if reason.startswith("eval_failed") or "invalid" in reason.lower():
         stage = CandidateStage.INVALID if "invalid" in reason.lower() else CandidateStage.EVALUATION_ERROR
         return _pack(stage, promotion="NONE", vault=False, paper=False)
+
+    if reason in {
+        "NO_OOS_TRADES",
+        "INSUFFICIENT_OOS_TRADES",
+        "NEGATIVE_EXPECTANCY",
+        "PF_BELOW_ONE",
+        "MAX_DRAWDOWN_EXCEEDED",
+    }:
+        return _pack(
+            CandidateStage.SCORE_REJECTED,
+            promotion="NONE",
+            vault=False,
+            paper=False,
+            note=reason.lower(),
+        )
 
     if "wfo" in reason.lower() and reason:
         stage = CandidateStage.WFO_FAILED
@@ -208,6 +226,16 @@ def classify_candidate(
             vault=False,
             paper=False,
             note="no_full_wfo",
+        )
+
+    # Defense in depth: zero closed OOS trades can never be SCORE_QUALIFIED.
+    if total_oos_trades is not None and int(total_oos_trades) <= 0:
+        return _pack(
+            CandidateStage.SCORE_REJECTED,
+            promotion="NONE",
+            vault=False,
+            paper=False,
+            note="no_oos_trades",
         )
 
     # Full WFO completed

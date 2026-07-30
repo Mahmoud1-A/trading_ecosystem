@@ -272,6 +272,7 @@ class CandidateEvaluator:
             "evaluation_path": (
                 "event_driven_wfo" if is_full_event_wfo else str(backend_kind)
             ),
+            "family_provenance": dict(candidate.family_provenance or {}),
             **(extra_snapshot or {}),
         }
         trial = self.registry.create_trial(
@@ -435,6 +436,18 @@ class CandidateEvaluator:
             complexity=candidate.complexity_score,
             train_metrics=train_metrics,
         )
+        fold_trade_counts = [max(0, int(f.n_trades)) for f in oos_folds]
+        total_oos_trades = int(sum(fold_trade_counts))
+        trade_meta = {
+            "total_oos_trades": total_oos_trades,
+            "fold_trade_counts": fold_trade_counts,
+            "min_oos_trades": int(self.budget.min_oos_trades),
+            "min_oos_trades_per_fold": int(self.budget.min_oos_trades_per_fold),
+            "metrics_basis_note": (
+                "expectancy_and_profit_factor_are_trade_based; "
+                "max_drawdown_and_calmar_are_equity_curve_based"
+            ),
+        }
 
         # Prop-risk soft reject
         if any(f.prop_breach_prob > 0.5 for f in oos_folds):
@@ -442,7 +455,7 @@ class CandidateEvaluator:
                 candidate,
                 rejection_reason="risk_failed:prop_breach",
                 ranking_score=fit.fitness,
-                net_metrics={"fitness": fit.fitness, **fit.components},
+                net_metrics={"fitness": fit.fitness, **fit.components, **trade_meta},
                 fold_records=[f.as_dict() for f in oos_folds],
                 trial_status=TrialStatus.FAILED,
                 failure_reason="prop_breach",
@@ -470,7 +483,11 @@ class CandidateEvaluator:
                 candidate,
                 rejection_reason=fit.rejection_reason,
                 ranking_score=None,
-                net_metrics={"train_diagnostic": train_metrics},
+                net_metrics={
+                    "train_diagnostic": train_metrics,
+                    **fit.components,
+                    **trade_meta,
+                },
                 fold_records=[f.as_dict() for f in oos_folds],
             )
             rec = EvaluationRecord(
@@ -511,10 +528,10 @@ class CandidateEvaluator:
             candidate,
             rejection_reason=None,
             ranking_score=fit.fitness,
-            net_metrics={"fitness": fit.fitness, **fit.components},
+            net_metrics={"fitness": fit.fitness, **fit.components, **trade_meta},
             gross_metrics={"train_diagnostic": train_metrics},
             fold_records=[f.as_dict() for f in oos_folds],
-            extra_snapshot={"ranking_source": RANKING_SOURCE_OOS, **wfo_meta},
+            extra_snapshot={"ranking_source": RANKING_SOURCE_OOS, **wfo_meta, **trade_meta},
         )
         rec = EvaluationRecord(
             outcome=EvalOutcome.REGISTERED,

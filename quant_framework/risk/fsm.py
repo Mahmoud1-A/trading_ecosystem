@@ -350,13 +350,24 @@ class PropRiskFSM:
             return RiskDecision(True, order.quantity, reason="reduce_allowed", state=state)
 
         exp = snapshot_exposure(portfolio, order.symbol)
-        if not order.reduce_only:
-            if exp.open_positions >= int(self.profile.max_positions) and exp.symbol_exposure <= 0:
-                return RiskDecision(False, reason="max_positions", state=state)
-            if exp.symbol_exposure + order.quantity > float(self.profile.max_symbol_exposure) + 1e-12:
-                return RiskDecision(False, reason="max_symbol_exposure", state=state)
-            if exp.portfolio_exposure + order.quantity > float(self.profile.max_portfolio_exposure) + 1e-12:
-                return RiskDecision(False, reason="max_portfolio_exposure", state=state)
+        # Risk-reducing / reduce-only exits must never be blocked by remaining
+        # exposure headroom. size_by_risk_budget treats remaining capacity as
+        # (max - open); once max_symbol_exposure is full that remaining is 0 and
+        # incorrectly rejects FLAT/close with exposure_cap → open lots never close
+        # → n_trades stays 0 while mark-to-market invents MaxDD/Calmar.
+        if order.reduce_only or is_risk_reducing(order, portfolio):
+            open_qty = abs(float(exp.symbol_exposure))
+            qty = min(float(order.quantity), open_qty)
+            if qty <= 1e-12:
+                return RiskDecision(False, reason="no_open_exposure_to_reduce", state=state)
+            return RiskDecision(True, qty, reason="risk_reducing_exit", state=state)
+
+        if exp.open_positions >= int(self.profile.max_positions) and exp.symbol_exposure <= 0:
+            return RiskDecision(False, reason="max_positions", state=state)
+        if exp.symbol_exposure + order.quantity > float(self.profile.max_symbol_exposure) + 1e-12:
+            return RiskDecision(False, reason="max_symbol_exposure", state=state)
+        if exp.portfolio_exposure + order.quantity > float(self.profile.max_portfolio_exposure) + 1e-12:
+            return RiskDecision(False, reason="max_portfolio_exposure", state=state)
 
         sizing = size_by_risk_budget(
             requested_qty=order.quantity,
