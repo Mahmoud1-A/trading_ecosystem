@@ -1,0 +1,48 @@
+# Liquid ETF universe for ingest / paper (daily bars)
+timeframe: 1d
+symbols:
+  # US broad equity
+  - SPY
+  - QQQ
+  - IWM
+  - DIA
+  - VTI
+  # US sectors
+  - XLF
+  - XLK
+  - XLE
+  - XLV
+  - XLI
+  - XLY
+  - XLP
+  - XLU
+  - XLB
+  - XLRE
+  - XLC
+  # International / factors
+  - EFA
+  - EEM
+  - VWO
+  - IEV
+  - EWJ
+  - FXI
+  - EWG
+  - INDA
+  - MTUM
+  - VLUE
+  # Rates / credit
+  - TLT
+  - IEF
+  - SHY
+  - LQD
+  - HYG
+  - TIP
+  # Commodities / alternatives
+  - GLD
+  - SLV
+  - USO
+  - UNG
+  - DBA
+  - CPER
+  - PDBC
+  - VNQ

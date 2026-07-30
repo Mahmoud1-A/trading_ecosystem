@@ -1,0 +1,47 @@
+# Portfolio stability gate + readiness levels (paper / live).
+# Applied after each aggregate_book update for the active universe.
+
+# Benchmark used to label calendar years as bull / bear / sideways
+benchmarks:
+  etf: SPY
+  etf_momentum: SPY
+  etf_satellite: SPY
+  crypto: BTC-USD
+
+# Year label thresholds on benchmark buy-hold return
+bull_year_return: 0.10      # >= +10% => bull
+bear_year_return: -0.10     # <= -10% => bear
+# otherwise sideways
+
+# Combined-book gates
+min_members: 5
+min_book_trades: 40
+min_book_cagr: 0.0          # must be non-negative for paper readiness
+max_book_dd: 0.10           # align with Prop total DD (fraction)
+min_profit_factor: 1.05
+min_win_rate: 0.20
+min_book_score: 0.0
+min_robust_score: -5.0
+
+# Regime robustness of the combined book equity path
+require_bull_and_bear_years: true
+min_bull_years: 1
+min_bear_years: 1
+# Book calendar-year return floors
+min_book_return_in_bull_year: 0.0
+min_book_return_in_bear_year: -0.15   # allow limited loss in bear years
+
+# Member quality
+min_passed_member_ratio: 0.60
+min_member_oos_cagr: -0.05
+
+# Readiness levels
+# candidate: book exists + members/trades ok, but regimes/score incomplete
+# ready_for_paper: all hard gates pass
+# ready_for_live: paper gates + stricter floors
+live:
+  min_book_cagr: 0.08
+  min_profit_factor: 1.20
+  min_book_trades: 80
+  min_members: 8
+  min_book_return_in_bear_year: -0.10

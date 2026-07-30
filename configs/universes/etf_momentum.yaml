@@ -1,0 +1,33 @@
+# Satellite sleeve: concentrated growth / momentum ETFs (Prop-compatible).
+# Sparse heroes: scan the 14-symbol pool, keep only top 3 by OOS strength.
+id: etf_momentum
+label: زخم ونمو (ETF)
+label_en: Momentum / Growth ETFs
+timeframe: 1d
+trade_default: false
+portfolio_mode: sparse_heroes
+max_heroes: 3
+# Start permissive; raise again once heroes clear ~5%+ OOS.
+min_hero_oos_cagr: 0.0
+min_bars_for_champion: 500
+cost_profile: etf
+symbols:
+  # Broad growth / tech
+  - QQQ
+  - XLK
+  - VGT
+  - IYW
+  # Semiconductors
+  - SMH
+  - SOXX
+  # Momentum / discretionary / communication
+  - MTUM
+  - XLY
+  - XLC
+  # Small-cap growth tilt
+  - IWM
+  - IWO
+  # Software / innovation (liquid)
+  - IGV
+  - SKYY
+  - BOTZ

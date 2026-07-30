@@ -1,0 +1,475 @@
+strategies:
+- id: mut_g117_0006
+  class: GapFade
+  enabled: true
+  symbols:
+  - UNG
+  params:
+    gap_pct: 0.00168103125
+    hold_bars: 6
+    risk_fraction: 0.006938968475341797
+    atr_period: 28
+    atr_stop_mult: 0.011694
+    lookback: 18
+- id: mut_g80_0001
+  class: GapFade
+  enabled: true
+  symbols:
+  - SLV
+  params:
+    gap_pct: 0.00185075
+    hold_bars: 5
+    risk_fraction: 0.00986
+    atr_period: 17
+    atr_stop_mult: 0.030393
+    lookback: 17
+- id: xover_g81_0005
+  class: GapFade
+  enabled: true
+  symbols:
+  - FXI
+  params:
+    gap_pct: 0.0019648125
+    hold_bars: 5
+    risk_fraction: 0.009237328125000001
+    atr_period: 18
+    atr_stop_mult: 0.035189
+    lookback: 16
+- id: mut_g3_0000
+  class: GapFade
+  enabled: true
+  symbols:
+  - CPER
+  params:
+    gap_pct: 0.002018
+    hold_bars: 7
+    risk_fraction: 0.006654
+    atr_period: 28
+    atr_stop_mult: 0.012241
+    lookback: 21
+- id: mut_g135_0001
+  class: GapFade
+  enabled: true
+  symbols:
+  - EWJ
+  params:
+    gap_pct: 0.001633
+    hold_bars: 6
+    risk_fraction: 0.00638
+    atr_period: 29
+    atr_stop_mult: 0.014206
+    lookback: 21
+- id: mut_g85_0000
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLK
+  params:
+    gap_pct: 0.002066
+    hold_bars: 6
+    risk_fraction: 0.00879
+    atr_period: 20
+    atr_stop_mult: 0.031872
+    lookback: 17
+- id: xover_g11_0009
+  class: GapFade
+  enabled: true
+  symbols:
+  - INDA
+  params:
+    gap_pct: 0.001626
+    hold_bars: 5
+    risk_fraction: 0.0065769999999999995
+    atr_period: 25
+    atr_stop_mult: 0.0128060625
+    lookback: 22
+- id: xover_g7_0006
+  class: GapFade
+  enabled: true
+  symbols:
+  - EEM
+  params:
+    gap_pct: 0.0018635000000000001
+    hold_bars: 6
+    risk_fraction: 0.006731
+    atr_period: 38
+    atr_stop_mult: 0.012922
+    lookback: 24
+- id: mut_g85_0001
+  class: GapFade
+  enabled: true
+  symbols:
+  - EWG
+  params:
+    gap_pct: 0.001624
+    hold_bars: 7
+    risk_fraction: 0.008961
+    atr_period: 20
+    atr_stop_mult: 0.035608
+    lookback: 14
+- id: mut_g117_0003
+  class: GapFade
+  enabled: true
+  symbols:
+  - QQQ
+  params:
+    gap_pct: 0.001585
+    hold_bars: 8
+    risk_fraction: 0.006731
+    atr_period: 22
+    atr_stop_mult: 0.0215375
+    lookback: 17
+- id: mut_g7_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - PDBC
+  params:
+    gap_pct: 0.001374
+    hold_bars: 4
+    risk_fraction: 0.0065769999999999995
+    atr_period: 29
+    atr_stop_mult: 0.013685
+    lookback: 22
+- id: mut_g88_0000
+  class: GapFade
+  enabled: true
+  symbols:
+  - VWO
+  params:
+    gap_pct: 0.001649
+    hold_bars: 6
+    risk_fraction: 0.010054
+    atr_period: 20
+    atr_stop_mult: 0.034068
+    lookback: 19
+- id: mut_g129_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLB
+  params:
+    gap_pct: 0.001813
+    hold_bars: 6
+    risk_fraction: 0.007599
+    atr_period: 29
+    atr_stop_mult: 0.017257
+    lookback: 21
+- id: mut_g12_0003
+  class: GapFade
+  enabled: true
+  symbols:
+  - MTUM
+  params:
+    gap_pct: 0.001571
+    hold_bars: 6
+    risk_fraction: 0.0065769999999999995
+    atr_period: 25
+    atr_stop_mult: 0.01239
+    lookback: 19
+- id: xover_g126_0008
+  class: GapFade
+  enabled: true
+  symbols:
+  - GLD
+  params:
+    gap_pct: 0.00212557080078125
+    hold_bars: 6
+    risk_fraction: 0.006731
+    atr_period: 22
+    atr_stop_mult: 0.020656
+    lookback: 22
+- id: mut_g8_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - VLUE
+  params:
+    gap_pct: 0.00169
+    hold_bars: 4
+    risk_fraction: 0.006676
+    atr_period: 26
+    atr_stop_mult: 0.013479
+    lookback: 19
+- id: xover_g76_0009
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLI
+  params:
+    gap_pct: 0.001472
+    hold_bars: 5
+    risk_fraction: 0.008829
+    atr_period: 20
+    atr_stop_mult: 0.049693
+    lookback: 18
+- id: mut_g131_0001
+  class: GapFade
+  enabled: true
+  symbols:
+  - IEV
+  params:
+    gap_pct: 0.001926
+    hold_bars: 6
+    risk_fraction: 0.007953
+    atr_period: 22
+    atr_stop_mult: 0.014206
+    lookback: 21
+- id: mut_g5_0000
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLY
+  params:
+    gap_pct: 0.00169
+    hold_bars: 5
+    risk_fraction: 0.003186
+    atr_period: 18
+    atr_stop_mult: 0.013447
+    lookback: 25
+- id: xover_g6_0006
+  class: GapFade
+  enabled: true
+  symbols:
+  - IWM
+  params:
+    gap_pct: 0.00169
+    hold_bars: 5
+    risk_fraction: 0.0065769999999999995
+    atr_period: 32
+    atr_stop_mult: 0.0133505625
+    lookback: 22
+- id: xover_g10_0009
+  class: GapFade
+  enabled: true
+  symbols:
+  - EFA
+  params:
+    gap_pct: 0.00169
+    hold_bars: 5
+    risk_fraction: 0.005279
+    atr_period: 22
+    atr_stop_mult: 0.013479
+    lookback: 20
+- id: mut_g134_0000
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLF
+  params:
+    gap_pct: 0.00169
+    hold_bars: 6
+    risk_fraction: 0.0066155
+    atr_period: 23
+    atr_stop_mult: 0.014206
+    lookback: 24
+- id: mut_g5_0003
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLC
+  params:
+    gap_pct: 0.0017767500000000001
+    hold_bars: 5
+    risk_fraction: 0.004682
+    atr_period: 14
+    atr_stop_mult: 0.013510999999999999
+    lookback: 23
+- id: xover_g5_0009
+  class: GapFade
+  enabled: true
+  symbols:
+  - SPY
+  params:
+    gap_pct: 0.0019068750000000001
+    hold_bars: 6
+    risk_fraction: 0.00497275
+    atr_period: 18
+    atr_stop_mult: 0.013510999999999999
+    lookback: 21
+- id: mut_g133_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - VTI
+  params:
+    gap_pct: 0.00169
+    hold_bars: 8
+    risk_fraction: 0.007667
+    atr_period: 29
+    atr_stop_mult: 0.014206
+    lookback: 21
+- id: mut_g129_0001
+  class: GapFade
+  enabled: true
+  symbols:
+  - VNQ
+  params:
+    gap_pct: 0.00169
+    hold_bars: 4
+    risk_fraction: 0.006175
+    atr_period: 29
+    atr_stop_mult: 0.014206
+    lookback: 23
+- id: mut_g4_0004
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLRE
+  params:
+    gap_pct: 0.00169
+    hold_bars: 5
+    risk_fraction: 0.0065769999999999995
+    atr_period: 24
+    atr_stop_mult: 0.014062
+    lookback: 21
+- id: mut_g135_0004
+  class: GapFade
+  enabled: true
+  symbols:
+  - TLT
+  params:
+    gap_pct: 0.001835
+    hold_bars: 6
+    risk_fraction: 0.007621
+    atr_period: 25
+    atr_stop_mult: 0.014206
+    lookback: 26
+- id: mut_g72_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - DBA
+  params:
+    gap_pct: 0.001963
+    hold_bars: 4
+    risk_fraction: 0.008745
+    atr_period: 24
+    atr_stop_mult: 0.036872
+    lookback: 17
+- id: mut_g98_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - DIA
+  params:
+    gap_pct: 0.001743
+    hold_bars: 6
+    risk_fraction: 0.008955
+    atr_period: 20
+    atr_stop_mult: 0.026991
+    lookback: 20
+- id: xover_g4_0006
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLV
+  params:
+    gap_pct: 0.0017767500000000001
+    hold_bars: 6
+    risk_fraction: 0.0046665000000000005
+    atr_period: 20
+    atr_stop_mult: 0.013510999999999999
+    lookback: 20
+- id: mut_g72_0004
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLU
+  params:
+    gap_pct: 0.00148
+    hold_bars: 4
+    risk_fraction: 0.008745
+    atr_period: 18
+    atr_stop_mult: 0.04851
+    lookback: 17
+- id: xover_g5_0007
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLP
+  params:
+    gap_pct: 0.00169
+    hold_bars: 6
+    risk_fraction: 0.0065769999999999995
+    atr_period: 32
+    atr_stop_mult: 0.01407925
+    lookback: 22
+- id: anom_g7_0000
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - USO
+  params:
+    lookback: 11
+    atr_period: 14
+    atr_stop_mult: 2.5
+    risk_fraction: 0.0075
+- id: mut_g3_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - LQD
+  params:
+    gap_pct: 0.002037
+    hold_bars: 6
+    risk_fraction: 0.007132
+    atr_period: 28
+    atr_stop_mult: 0.014667
+    lookback: 24
+- id: mut_g133_0001
+  class: GapFade
+  enabled: true
+  symbols:
+  - IEF
+  params:
+    gap_pct: 0.00169
+    hold_bars: 7
+    risk_fraction: 0.0066155
+    atr_period: 26
+    atr_stop_mult: 0.014454
+    lookback: 22
+- id: invent_g97_0002
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - XLE
+  params:
+    lookback: 10
+    atr_period: 20
+    atr_stop_mult: 2.0
+    risk_fraction: 0.0075
+- id: mut_g87_0004
+  class: GapFade
+  enabled: true
+  symbols:
+  - HYG
+  params:
+    gap_pct: 0.001898
+    hold_bars: 6
+    risk_fraction: 0.010054
+    atr_period: 20
+    atr_stop_mult: 0.026688
+    lookback: 19
+- id: mut_g105_0004
+  class: GapFade
+  enabled: true
+  symbols:
+  - TIP
+  params:
+    gap_pct: 0.001797
+    hold_bars: 6
+    risk_fraction: 0.00667
+    atr_period: 18
+    atr_stop_mult: 0.024812124999999997
+    lookback: 15
+- id: invent_g8_0000
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - SHY
+  params:
+    lookback: 20
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075

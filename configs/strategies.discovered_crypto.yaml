@@ -1,0 +1,464 @@
+strategies:
+- id: mut_g451_0008
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - AAVE-USD
+  params:
+    lookback: 10
+    atr_period: 39
+    atr_stop_mult: 1.625011
+    risk_fraction: 0.00815
+- id: invent_g189_0001
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - ADA-USD
+  params:
+    lookback: 10
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: invent_g368_0003
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - ALGO-USD
+  params:
+    lookback: 20
+    atr_period: 20
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: mut_g36_0000
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - APT-USD
+  params:
+    lookback: 13
+    atr_period: 31
+    atr_stop_mult: 1.256964
+    risk_fraction: 0.009527
+- id: xover_g3_0015
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - ARB-USD
+  params:
+    lookback: 10
+    atr_period: 18
+    atr_stop_mult: 3.0
+    risk_fraction: 0.005625
+- id: invent_g409_0003
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - ATOM-USD
+  params:
+    channel_period: 55
+    atr_period: 20
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: invent_g37_0005
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - AVAX-USD
+  params:
+    lookback: 40
+    atr_period: 20
+    atr_stop_mult: 2.0
+    risk_fraction: 0.0075
+- id: invent_g27_0000
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - AXS-USD
+  params:
+    lookback: 20
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: mut_g117_0001
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - BCH-USD
+  params:
+    lookback: 18
+    atr_period: 39
+    atr_stop_mult: 1.625011
+    risk_fraction: 0.006395
+- id: invent_g80_0003
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - BNB-USD
+  params:
+    lookback: 20
+    atr_period: 14
+    atr_stop_mult: 2.0
+    risk_fraction: 0.0075
+- id: mut_g29_0001
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - BTC-USD
+  params:
+    lookback: 16
+    atr_period: 24
+    atr_stop_mult: 1.828046
+    risk_fraction: 0.009656
+- id: mut_g10_0006
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - CRV-USD
+  params:
+    lookback: 22
+    atr_period: 22
+    atr_stop_mult: 2.267491
+    risk_fraction: 0.007559
+- id: mut_g80_0000
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - DOGE-USD
+  params:
+    lookback: 12
+    atr_period: 49
+    atr_stop_mult: 1.62547
+    risk_fraction: 0.007541394926919854
+- id: invent_g188_0001
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - DOT-USD
+  params:
+    lookback: 20
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: mut_g327_0003
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - EGLD-USD
+  params:
+    lookback: 16
+    atr_period: 34
+    atr_stop_mult: 1.625011
+    risk_fraction: 0.007502024150515825
+- id: invent_g50_0000
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - ETC-USD
+  params:
+    channel_period: 40
+    atr_period: 20
+    atr_stop_mult: 2.0
+    risk_fraction: 0.0075
+- id: invent_g365_0000
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - ETH-USD
+  params:
+    lookback: 10
+    atr_period: 14
+    atr_stop_mult: 2.0
+    risk_fraction: 0.0075
+- id: invent_g54_0002
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - FET-USD
+  params:
+    channel_period: 40
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: invent_g77_0005
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - FIL-USD
+  params:
+    channel_period: 40
+    atr_period: 20
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: invent_g37_0003
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - FTM-USD
+  params:
+    channel_period: 20
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: invent_g61_0005
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - GRT-USD
+  params:
+    lookback: 10
+    atr_period: 14
+    atr_stop_mult: 2.5
+    risk_fraction: 0.0075
+- id: invent_g1_0002
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - HBAR-USD
+  params:
+    lookback: 20
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: invent_g45_0003
+  class: SeasonalityWindow
+  enabled: true
+  symbols:
+  - ICP-USD
+  params:
+    window_code: 104
+    atr_period: 14
+    atr_stop_mult: 2.5
+    risk_fraction: 0.0075
+- id: invent_g183_0001
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - INJ-USD
+  params:
+    channel_period: 20
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: xover_g19_0018
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - LDO-USD
+  params:
+    lookback: 22
+    atr_period: 24
+    atr_stop_mult: 1.475624
+    risk_fraction: 0.00963674394750595
+- id: mut_g143_0008
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - LINK-USD
+  params:
+    lookback: 11
+    atr_period: 39
+    atr_stop_mult: 1.896601
+    risk_fraction: 0.007590066467593243
+- id: mut_g157_0010
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - LTC-USD
+  params:
+    lookback: 11
+    atr_period: 39
+    atr_stop_mult: 1.625011
+    risk_fraction: 0.00885
+- id: mut_g50_0004
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - MANA-USD
+  params:
+    lookback: 16
+    atr_period: 43
+    atr_stop_mult: 1.975927
+    risk_fraction: 0.009446
+- id: invent_g98_0003
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - MATIC-USD
+  params:
+    channel_period: 20
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: invent_g28_0001
+  class: SeasonalityWindow
+  enabled: true
+  symbols:
+  - MKR-USD
+  params:
+    window_code: 101
+    atr_period: 14
+    atr_stop_mult: 2.5
+    risk_fraction: 0.0075
+- id: invent_g31_0000
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - NEAR-USD
+  params:
+    lookback: 10
+    atr_period: 14
+    atr_stop_mult: 2.5
+    risk_fraction: 0.0075
+- id: mut_g1_0006
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - OP-USD
+  params:
+    lookback: 16
+    atr_period: 39
+    atr_stop_mult: 1.625557076171875
+    risk_fraction: 0.008298
+- id: mut_g9_0008
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - RENDER-USD
+  params:
+    lookback: 17
+    atr_period: 24
+    atr_stop_mult: 1.186441
+    risk_fraction: 0.011443
+- id: invent_g1_0003
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - SAND-USD
+  params:
+    lookback: 20
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: mut_g5_0006
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - SEI-USD
+  params:
+    lookback: 22
+    atr_period: 22
+    atr_stop_mult: 1.310831
+    risk_fraction: 0.009709403072357178
+- id: invent_g35_0005
+  class: ZScoreRevert
+  enabled: true
+  symbols:
+  - SHIB-USD
+  params:
+    lookback: 20
+    entry_z: 2.5
+    exit_z: 0.25
+    risk_fraction: 0.0075
+- id: invent_g186_0006
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - SOL-USD
+  params:
+    lookback: 10
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: invent_g17_0003
+  class: GapFade
+  enabled: true
+  symbols:
+  - STX-USD
+  params:
+    gap_pct: 0.02
+    hold_bars: 2
+    risk_fraction: 0.0075
+    atr_period: 14
+    atr_stop_mult: 2.0
+- id: anom_g21_0002
+  class: ZScoreRevert
+  enabled: true
+  symbols:
+  - SUI-USD
+  params:
+    lookback: 10
+    entry_z: 2.0
+    exit_z: 0.5
+    risk_fraction: 0.0075
+    atr_period: 14
+    atr_stop_mult: 2.129218
+- id: mut_g186_0011
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - TIA-USD
+  params:
+    lookback: 13
+    atr_period: 39
+    atr_stop_mult: 1.625011
+    risk_fraction: 0.007502
+- id: mut_g194_0004
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - TON-USD
+  params:
+    lookback: 10
+    atr_period: 44
+    atr_stop_mult: 1.625011
+    risk_fraction: 0.007507352175897673
+- id: invent_g46_0002
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - TRX-USD
+  params:
+    channel_period: 20
+    atr_period: 14
+    atr_stop_mult: 3.0
+    risk_fraction: 0.0075
+- id: invent_g38_0005
+  class: SeasonalityWindow
+  enabled: true
+  symbols:
+  - UNI-USD
+  params:
+    window_code: 10
+    atr_period: 14
+    atr_stop_mult: 2.5
+    risk_fraction: 0.0075
+- id: mut_g18_0010
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - XLM-USD
+  params:
+    lookback: 18
+    atr_period: 39
+    atr_stop_mult: 1.250594
+    risk_fraction: 0.007821803731863286
+- id: xover_g7_0018
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - XMR-USD
+  params:
+    lookback: 18
+    atr_period: 22
+    atr_stop_mult: 2.04186834375
+    risk_fraction: 0.008486
+- id: invent_g226_0005
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - XRP-USD
+  params:
+    channel_period: 55
+    atr_period: 14
+    atr_stop_mult: 2.0
+    risk_fraction: 0.0075

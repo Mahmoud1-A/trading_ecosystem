@@ -1,0 +1,1317 @@
+/* Research Control Plane SPA — Phase 12.2 (CFD Data Acquisition) */
+const PAGES = [
+  ["overview", "Overview"],
+  ["new-run", "New Run"],
+  ["data-acquisition", "Data Acquisition"],
+  ["source-target", "Source vs Target"],
+  ["data-import", "Data Import"],
+  ["datasets", "Datasets"],
+  ["dataset-detail", "Dataset Detail"],
+  ["runs", "Runs"],
+  ["run-detail", "Run Detail"],
+  ["alpha-miner", "Alpha Miner"],
+  ["wfo", "WFO"],
+  ["registry", "Candidate Registry"],
+  ["portfolio", "Portfolio"],
+  ["vault", "Vault"],
+  ["runtime", "Shadow / Paper"],
+  ["data-quality", "Data Quality"],
+  ["health", "System Health"],
+  ["artifacts", "Artifacts"],
+  ["logs", "Logs"],
+];
+
+const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"]);
+const ACTIVE = new Set(["CREATED", "QUEUED", "STARTING", "RUNNING", "CANCEL_REQUESTED"]);
+
+const state = {
+  page: location.hash.replace(/^#\/?/, "").split("?")[0] || "overview",
+  selectedRunId: localStorage.getItem("cp_run_id") || "",
+  selectedDatasetId: localStorage.getItem("cp_dataset_id") || "",
+  runFilter: localStorage.getItem("cp_run_filter") || "DEFAULT",
+  sortKey: "candidate_id",
+  sortDir: 1,
+  filter: "",
+  sse: null,
+  catalog: [],
+  constraints: null,
+};
+
+function $(sel, el = document) { return el.querySelector(sel); }
+function statusText(v, fallback = "NOT_EVALUATED") {
+  if (v == null || v === "" || v === "-") return fallback;
+  return String(v);
+}
+function fmtPct(v) {
+  if (v == null || Number.isNaN(Number(v))) return statusText(null, "NOT_AVAILABLE");
+  const n = Number(v);
+  const s = `${n.toFixed(2)}%`;
+  return n < 0 ? `<span class="neg">${s}</span>` : `<span class="pos">${s}</span>`;
+}
+function fmtVal(v) {
+  if (v == null || v === "" || v === "-") return "NOT_EVALUATED";
+  if (typeof v === "number") return Number.isFinite(v) ? v.toFixed(4) : "NOT_EVALUATED";
+  return String(v);
+}
+async function api(path, opts) {
+  const r = await fetch(path, {
+    headers: { "Content-Type": "application/json", ...(opts && opts.headers) },
+    ...opts,
+  });
+  const text = await r.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { detail: text }; }
+  if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || r.statusText));
+  return data;
+}
+function setRun(id) {
+  state.selectedRunId = id || "";
+  localStorage.setItem("cp_run_id", state.selectedRunId);
+}
+function setDataset(id) {
+  state.selectedDatasetId = id || "";
+  localStorage.setItem("cp_dataset_id", state.selectedDatasetId);
+}
+function setFilter(f) {
+  state.runFilter = f;
+  localStorage.setItem("cp_run_filter", f);
+}
+function datasetLabel(d) {
+  const range = (d.start_timestamp && d.end_timestamp)
+    ? `${String(d.start_timestamp).slice(0, 10)} → ${String(d.end_timestamp).slice(0, 10)}`
+    : "n/a";
+  const sym = (d.tradable_contracts && d.tradable_contracts[0]) || (d.symbols && d.symbols[0]) || "";
+  const smoke = d.smoke_test_only ? " · SMOKE TEST ONLY" : "";
+  return `${d.display_name} | ${d.provider_id} | ${d.asset_class} | ${sym} | ${d.timeframe} | ${range} | rows=${d.row_count} | ${d.quality_status} | v=${d.dataset_version}${smoke}`;
+}
+function nav() {
+  const el = $("#nav");
+  el.innerHTML = `<div class="brand">Quant Research</div>` + PAGES.map(([id, label]) =>
+    `<a href="#/${id}" class="${state.page === id ? "active" : ""}">${label}</a>`
+  ).join("");
+}
+function stopSSE() {
+  if (state.sse) { state.sse.close(); state.sse = null; }
+}
+
+async function renderOverview() {
+  const o = await api("/api/overview");
+  return `
+    <h1>Overview</h1>
+    <p class="sub">System ${o.system_version} · research control plane</p>
+    <div class="warn-box">${o.banner}</div>
+    <div class="grid">
+      <div class="stat"><div class="label">Active</div><div class="value">${o.active}</div></div>
+      <div class="stat"><div class="label">Queued</div><div class="value">${o.queued}</div></div>
+      <div class="stat"><div class="label">Completed</div><div class="value">${o.completed}</div></div>
+      <div class="stat"><div class="label">Failed</div><div class="value">${o.failed}</div></div>
+      <div class="stat"><div class="label">Datasets</div><div class="value">${o.dataset_count ?? 0}</div></div>
+      <div class="stat"><div class="label">Latest discovery</div><div class="value mono" style="font-size:0.85rem">${o.latest_discovery_run || "NONE"}</div></div>
+      <div class="stat"><div class="label">Latest portfolio</div><div class="value mono" style="font-size:0.85rem">${o.latest_portfolio || "NONE"}</div></div>
+      <div class="stat"><div class="label">Latest Vault</div><div class="value mono" style="font-size:0.85rem">${o.latest_vault || "NONE"}</div></div>
+      <div class="stat"><div class="label">Latest Paper</div><div class="value mono" style="font-size:0.85rem">${o.latest_paper || "NONE"}</div></div>
+      <div class="stat"><div class="label">Workers</div><div class="value">${o.health.max_workers}</div></div>
+      <div class="stat"><div class="label">Live trading</div><div class="value neg">OFF</div></div>
+    </div>`;
+}
+
+function newRunForm(datasets) {
+  const opts = (datasets || []).map(d =>
+    `<option value="${d.dataset_id}">${datasetLabel(d)}</option>`
+  ).join("") || `<option value="synthetic_demo">synthetic_demo — SMOKE TEST ONLY</option>`;
+  return `
+    <h1>New Run</h1>
+    <p class="sub">Dataset Catalog drives symbols, timeframe, and compatible models. synthetic_demo is SMOKE TEST ONLY.</p>
+    <div class="panel">
+      <div class="row">
+        <div>
+          <label>Run type</label>
+          <select id="run_type">
+            <option>RESEARCH_DEMO</option>
+            <option>ALPHA_MINER</option>
+            <option>WFO_ONLY</option>
+            <option>PORTFOLIO_BUILD</option>
+            <option>VAULT_EVALUATION</option>
+            <option>SHADOW_RUNTIME</option>
+            <option>PAPER_RUNTIME</option>
+          </select>
+        </div>
+        <div>
+          <label>Dataset (from Catalog)</label>
+          <select id="dataset">${opts}</select>
+        </div>
+      </div>
+      <div id="dataset_hint" class="warn-box" style="margin-top:0.5rem"></div>
+      <div class="row">
+        <div><label>Symbol / contract</label><select id="symbols"></select></div>
+        <div><label>Timeframe</label><select id="timeframe"></select></div>
+      </div>
+      <div class="row">
+        <div><label>Strategy family</label><select id="family"></select></div>
+        <div><label>Random seed</label><input id="seed" type="number" value="42" /></div>
+      </div>
+      <div class="row">
+        <div><label>Cost model</label><select id="cost"></select></div>
+        <div><label>Risk profile</label><select id="risk"></select></div>
+      </div>
+      <div class="row">
+        <div><label>Feature set</label><select id="features"></select></div>
+        <div><label>Asset class (locked)</label><input id="asset_class" readonly /></div>
+      </div>
+      <label>Search budget JSON</label>
+      <textarea id="budget" rows="4">{"max_generated_candidates":12,"max_evaluated_candidates":10,"max_full_wfo_evaluations":10,"population_size":4,"max_runtime_seconds":45,"stagnation_generations":8,"minimum_generations_before_stagnation":4}</textarea>
+      <label>WFO JSON</label>
+      <textarea id="wfo" rows="2">{"train_window_days":5,"validation_window_days":2,"step_forward_days":5,"max_folds":4}</textarea>
+      <div class="confirm"><input type="checkbox" id="c_miner" /><span>Confirm Alpha Miner</span></div>
+      <div class="confirm"><input type="checkbox" id="c_smoke" /><span>Smoke test only (required for synthetic_demo with Alpha Miner)</span></div>
+      <div class="confirm"><input type="checkbox" id="c_vault" /><span>Confirm Vault evaluation</span></div>
+      <div class="confirm"><input type="checkbox" id="c_paper" /><span>Confirm Paper runtime</span></div>
+      <div id="backend_box" class="panel" style="margin-top:0.75rem"></div>
+      <div class="panel" id="preview" style="margin-top:0.75rem"></div>
+      <button id="start_btn">Start run</button>
+      <pre class="logs" id="create_msg"></pre>
+    </div>`;
+}
+
+function fillSelect(el, values, selected) {
+  const vals = values && values.length ? values : [selected || ""];
+  el.innerHTML = vals.map(v => `<option value="${v}" ${v === selected ? "selected" : ""}>${v}</option>`).join("");
+}
+
+function resolveBackendPreview(c) {
+  const smoke = $("#c_smoke")?.checked === true;
+  const family = $("#family")?.value || (c.compatible_strategy_families || [])[0];
+  const tf = $("#timeframe")?.value || c.default_timeframe || c.timeframe;
+  if (c.smoke_test_only || smoke) {
+    return {
+      evaluation_backend: "synthetic_oos_probe",
+      ok: true,
+      banners: ["SYNTHETIC OOS PROBE", "SMOKE TEST ONLY", "VAULT / PAPER / LIVE DISABLED"],
+      block_reason: null,
+    };
+  }
+  if (c.research_eligible) {
+    if (tf === "tick" && family === "mean_reversion_vwap_bb") {
+      return {
+        evaluation_backend: null,
+        ok: false,
+        banners: [],
+        block_reason: "REAL_DATA_BACKEND_UNAVAILABLE: mean_reversion_vwap_bb rejects raw tick — select 1m or 5m",
+      };
+    }
+    return {
+      evaluation_backend: "event_driven_wfo",
+      ok: true,
+      banners: c.execution_banners && c.execution_banners.length ? c.execution_banners : [
+        "REAL EVENT-DRIVEN WFO",
+        "GENUINE DUKASCOPY DATA",
+        "OBSERVED BID/ASK SPREAD",
+        "INTRADAY ONLY",
+        "VAULT / PAPER / LIVE DISABLED",
+      ],
+      block_reason: null,
+    };
+  }
+  return {
+    evaluation_backend: null,
+    ok: false,
+    banners: [],
+    block_reason: "Dataset is not RESEARCH_ELIGIBLE and smoke_test is false",
+  };
+}
+
+function renderBackendBox(c) {
+  const box = $("#backend_box");
+  if (!box) return;
+  const prev = resolveBackendPreview(c);
+  const banners = (prev.banners || []).map(b => `<span class="pill" style="margin-right:0.35rem;display:inline-block;padding:0.15rem 0.45rem;border:1px solid var(--accent);font-size:0.75rem">${b}</span>`).join("");
+  if (!prev.ok) {
+    box.innerHTML = `<strong style="color:#c0392b">BLOCKED — genuine dataset would not use a real backend</strong>
+      <p class="sub">${prev.block_reason || "REAL_DATA_BACKEND_UNAVAILABLE"}</p>
+      <p class="sub">Resolved backend: ${prev.evaluation_backend || "NONE"}</p>`;
+    const btn = $("#start_btn");
+    if (btn && $("#run_type")?.value === "ALPHA_MINER") btn.disabled = true;
+    return;
+  }
+  const real = prev.evaluation_backend === "event_driven_wfo";
+  box.innerHTML = `<strong>Resolved execution backend before launch:</strong>
+    <div class="mono" style="margin:0.35rem 0">${prev.evaluation_backend}</div>
+    <div>${banners}</div>
+    ${real ? "" : `<p class="sub">Smoke / synthetic path — FINALIST promotion disabled.</p>`}`;
+  const btn = $("#start_btn");
+  if (btn) btn.disabled = false;
+}
+
+async function applyDatasetConstraints() {
+  const id = $("#dataset").value;
+  const c = await api(`/api/datasets/${encodeURIComponent(id)}/constraints`);
+  state.constraints = c;
+  const hint = $("#dataset_hint");
+  if (c.smoke_test_only) {
+    hint.innerHTML = `<strong>synthetic_demo — SMOKE TEST ONLY</strong>. Institutional Alpha Miner requires research_eligible data, or check Smoke test only.`;
+  } else if (!c.research_eligible) {
+    hint.innerHTML = `<strong>NOT RESEARCH ELIGIBLE</strong> — Alpha Miner will reject this dataset.`;
+  } else {
+    hint.innerHTML = `Research eligible · ${c.asset_class} · constraints locked to catalog membership.`;
+  }
+  const symOpts = [...new Set([...(c.tradable_contracts || []), ...(c.symbols || [])])];
+  fillSelect($("#symbols"), symOpts, symOpts[0]);
+  const tfs = (c.compatible_timeframes && c.compatible_timeframes.length)
+    ? c.compatible_timeframes
+    : [c.timeframe];
+  const defaultTf = c.default_timeframe || (tfs.includes("1m") ? "1m" : tfs[0]);
+  fillSelect($("#timeframe"), tfs, defaultTf);
+  fillSelect($("#family"), c.compatible_strategy_families, c.compatible_strategy_families[0]);
+  fillSelect($("#cost"), c.compatible_cost_models, c.compatible_cost_models[0]);
+  fillSelect($("#risk"), c.compatible_risk_profiles, c.compatible_risk_profiles[0]);
+  fillSelect($("#features"), c.compatible_feature_sets, c.compatible_feature_sets[0]);
+  $("#asset_class").value = c.asset_class || "";
+  if (c.smoke_test_only) $("#c_smoke").checked = true;
+  else if (c.research_eligible) $("#c_smoke").checked = false;
+  renderBackendBox(c);
+}
+
+async function wireNewRun() {
+  await applyDatasetConstraints();
+  const preview = () => {
+    const body = collectRunBody();
+    if (state.constraints) renderBackendBox(state.constraints);
+    const prev = state.constraints ? resolveBackendPreview(state.constraints) : {};
+    const block = prev && prev.ok === false
+      ? `<div class="warn-box" style="border-color:#c0392b;color:#c0392b"><strong>Cannot launch:</strong> ${prev.block_reason}</div>`
+      : "";
+    $("#preview").innerHTML = `${block}<strong>Frozen config preview</strong><pre class="mono">${JSON.stringify(body, null, 2)}</pre>
+      <p class="sub">Resolved backend: ${prev.evaluation_backend || "?"} · research-only · no live orders</p>`;
+  };
+  ["run_type","dataset","symbols","timeframe","family","seed","cost","risk","features","budget","wfo","c_miner","c_smoke","c_vault","c_paper"]
+    .forEach(id => {
+      const el = $(`#${id}`);
+      if (!el) return;
+      el.addEventListener("input", preview);
+      el.addEventListener("change", preview);
+    });
+  $("#dataset").addEventListener("change", async () => {
+    await applyDatasetConstraints();
+    preview();
+  });
+  preview();
+  $("#start_btn").onclick = async () => {
+    try {
+      if (state.constraints) {
+        const prev = resolveBackendPreview(state.constraints);
+        if ($("#run_type").value === "ALPHA_MINER" && prev.ok === false) {
+          $("#create_msg").textContent = prev.block_reason || "REAL_DATA_BACKEND_UNAVAILABLE";
+          return;
+        }
+      }
+      const run = await api("/api/runs", { method: "POST", body: JSON.stringify(collectRunBody()) });
+      setRun(run.run_id);
+      $("#create_msg").textContent = `Started ${run.run_id} · state=${run.state}`;
+      location.hash = run.run_type === "ALPHA_MINER" ? "#/alpha-miner" : "#/run-detail";
+    } catch (e) {
+      $("#create_msg").textContent = String(e.message || e);
+    }
+  };
+}
+function collectRunBody() {
+  let budget = {}, wfo = {};
+  try { budget = JSON.parse($("#budget").value || "{}"); } catch {}
+  try { wfo = JSON.parse($("#wfo").value || "{}"); } catch {}
+  return {
+    run_type: $("#run_type").value,
+    dataset: $("#dataset").value,
+    symbols: [$("#symbols").value].filter(Boolean),
+    timeframe: $("#timeframe").value,
+    strategy_family: $("#family").value,
+    random_seed: Number($("#seed").value),
+    cost_model_version: $("#cost").value,
+    risk_profile: $("#risk").value,
+    feature_set_version: $("#features").value,
+    search_budget: budget,
+    wfo,
+    smoke_test: $("#c_smoke").checked,
+    confirm_alpha_miner: $("#c_miner").checked,
+    confirm_vault: $("#c_vault").checked,
+    confirm_paper: $("#c_paper").checked,
+  };
+}
+
+const RUN_TABS = ["DEFAULT", "ALL", "ACTIVE", "QUEUED", "COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"];
+
+async function renderRunsPage(mode) {
+  const filter = mode === "active-only" ? "ACTIVE" : state.runFilter;
+  const data = await api(`/api/runs?filter=${encodeURIComponent(filter)}`);
+  const runs = data.runs || [];
+  const tabs = RUN_TABS.map(t =>
+    `<button class="secondary ${filter === t ? "active-tab" : ""}" data-filter="${t}" style="margin-right:0.35rem;${filter===t?"outline:1px solid var(--accent)":""}">${t}</button>`
+  ).join("");
+  const rows = runs.map(r => `
+    <tr data-id="${r.run_id}">
+      <td class="mono">${r.run_id}</td>
+      <td>${r.run_type}</td>
+      <td>${r.state}</td>
+      <td>${r.run_type === "ALPHA_MINER" ? statusText(r.summary?.discovery_result || r.profitability_result, "SEE_SUMMARY") : fmtPct(r.total_return_pct)}</td>
+      <td>${(r.progress_pct||0).toFixed(0)}%</td>
+      <td>${r.current_stage || statusText(null, "IDLE")}</td>
+      <td>${r.finalist_count ?? 0}</td>
+    </tr>`).join("") || `<tr><td colspan="7">No runs in this filter</td></tr>`;
+  return `
+    <h1>Runs</h1>
+    <p class="sub">Default view: active runs first, then recent terminal history. History persists across restarts.</p>
+    <div class="panel" id="run_tabs">${tabs}</div>
+    <div class="panel"><table>
+      <thead><tr><th>Run ID</th><th>Type</th><th>State</th><th>Result</th><th>Progress</th><th>Stage</th><th>Finalists</th></tr></thead>
+      <tbody id="run_rows">${rows}</tbody>
+    </table></div>
+    <div class="panel" id="detail"></div>`;
+}
+
+async function wireRuns() {
+  document.querySelectorAll("#run_tabs [data-filter]").forEach(btn => {
+    btn.onclick = () => { setFilter(btn.dataset.filter); route(); };
+  });
+  $("#run_rows").onclick = async (ev) => {
+    const tr = ev.target.closest("tr[data-id]");
+    if (!tr) return;
+    setRun(tr.dataset.id);
+    await showDetail(tr.dataset.id);
+  };
+  if (state.selectedRunId) await showDetail(state.selectedRunId);
+}
+
+async function showDetail(id) {
+  const run = await api(`/api/runs/${id}`);
+  const summary = await api(`/api/runs/${id}/summary`);
+  const el = $("#detail");
+  if (!el) return;
+  const cancellable = !!run.cancellable && ACTIVE.has(run.state);
+  el.innerHTML = `
+    <h2 class="mono">${run.run_id}</h2>
+    <div class="grid">
+      <div class="stat"><div class="label">State</div><div class="value" style="font-size:1rem">${run.state}</div></div>
+      <div class="stat"><div class="label">Software</div><div class="value" style="font-size:0.95rem">${statusText(summary.software_execution_status)}</div></div>
+      <div class="stat"><div class="label">Discovery</div><div class="value" style="font-size:0.85rem">${statusText(summary.discovery_result, "NOT_APPLICABLE")}</div></div>
+      <div class="stat"><div class="label">Profitability</div><div class="value" style="font-size:0.85rem">${statusText(summary.profitability_result, "NOT_AVAILABLE")}</div></div>
+      <div class="stat"><div class="label">Total return</div><div class="value">${run.total_return_pct == null ? statusText(summary.total_return_status, "NOT_AVAILABLE") : fmtPct(summary.total_return_pct)}</div></div>
+      <div class="stat"><div class="label">Statistical</div><div class="value" style="font-size:0.85rem">${statusText(summary.statistical_result)}</div></div>
+      <div class="stat"><div class="label">Vault</div><div class="value" style="font-size:0.85rem">${statusText(summary.vault_result, "NOT_SUBMITTED")}</div></div>
+      <div class="stat"><div class="label">Terminal reason</div><div class="value" style="font-size:0.8rem">${statusText(run.terminal_reason, "NONE")}</div></div>
+    </div>
+    ${cancellable ? `<button class="danger" id="cancel_btn">Cancel</button>` : `<button class="secondary" id="cancel_btn" disabled title="Terminal runs cannot be cancelled">Cancel unavailable</button>`}
+    <button class="secondary" id="refresh_btn">Refresh</button>
+    ${run.run_type === "ALPHA_MINER" ? `<button class="secondary" id="goto_miner">Open Alpha Miner</button>` : ""}
+    <pre class="logs">${JSON.stringify({run, summary}, null, 2)}</pre>`;
+  const cancelBtn = $("#cancel_btn");
+  if (cancellable) {
+    cancelBtn.onclick = async () => {
+      try {
+        await api(`/api/runs/${id}/cancel`, { method: "POST" });
+      } catch (e) {
+        alert(String(e.message || e));
+      }
+      await showDetail(id);
+    };
+  }
+  $("#refresh_btn").onclick = () => showDetail(id);
+  const gm = $("#goto_miner");
+  if (gm) gm.onclick = () => { location.hash = "#/alpha-miner"; };
+}
+
+async function renderAlpha() {
+  const all = await api("/api/runs?filter=ALL");
+  const miners = (all.runs || []).filter(r => r.run_type === "ALPHA_MINER");
+  const id = state.selectedRunId && miners.some(m => m.run_id === state.selectedRunId)
+    ? state.selectedRunId
+    : (miners[0] && miners[0].run_id) || "";
+  if (id && id !== state.selectedRunId) setRun(id);
+
+  const picker = `<label>Alpha Miner run</label>
+    <select id="miner_run">${miners.map(m =>
+      `<option value="${m.run_id}" ${m.run_id===id?"selected":""}>${m.run_id} · ${m.state} · finalists=${m.finalist_count||0}</option>`
+    ).join("") || `<option value="">No ALPHA_MINER runs</option>`}</select>`;
+
+  if (!id) {
+    return `<h1>Alpha Miner</h1><div class="panel">${picker}</div>
+      <div class="warn-box">No Alpha Miner runs yet. Start one from New Run.</div>`;
+  }
+
+  const run = await api(`/api/runs/${id}`);
+  let report = {};
+  try { report = await api(`/api/runs/${id}/alpha_miner`); } catch { report = {}; }
+  const cands = await api(`/api/runs/${id}/candidates`);
+  let rows = cands.candidates || [];
+  if (state.filter) {
+    const f = state.filter.toLowerCase();
+    rows = rows.filter(c => JSON.stringify(c).toLowerCase().includes(f));
+  }
+  rows = rows.slice().sort((a,b) => {
+    const av = a[state.sortKey], bv = b[state.sortKey];
+    if (av == bv) return 0;
+    return (av > bv ? 1 : -1) * state.sortDir;
+  });
+  const tables = report.tables || cands.tables || {};
+  const finalists = tables.finalists || rows.filter(c => c.promotion_label === "FINALIST");
+  const shortlist = tables.unvalidated_shortlist || rows.filter(c => ["SHORTLISTED","TOP_RANKED_UNVALIDATED","RESEARCH_SHORTLISTED"].includes(c.promotion_label));
+  const rejected = tables.rejected || rows.filter(c => c.rejected && c.evaluation_stage !== "DUPLICATE");
+  const duplicates = tables.duplicates || rows.filter(c => c.evaluation_stage === "DUPLICATE");
+  const failures = tables.evaluation_failures || rows.filter(c => ["EVALUATION_ERROR","WFO_FAILED","INVALID"].includes(c.evaluation_stage));
+  const noFinalists = Number(report.finalist_count ?? (typeof report.finalists === "number" ? report.finalists : 0)) === 0;
+  const isFailed = run.state === "FAILED" || report.software_execution_status === "SOFTWARE_FAILURE" || report.discovery_result === "SOFTWARE_FAILURE" || report.software_failure_banner === true;
+  const softwareErr = statusText(report.terminal_reason || run.terminal_reason || report.error, "SOFTWARE_FAILURE");
+  const budget = report.search_budget_consumed || {};
+  const dist = report.rejection_reason_distribution || {};
+
+  return `
+    <h1>Alpha Miner</h1>
+    <p class="sub">Live funnel + terminal summary. Software success ≠ discovery success.</p>
+    <div class="panel">${picker}
+      <p class="sub" id="live_status">State: ${run.state} · progress ${(run.progress_pct||0).toFixed(0)}% · stage ${run.current_stage || "IDLE"}</p>
+    </div>
+    ${isFailed ? `<div class="warn-box" style="border-color:#c0392b;background:rgba(192,57,43,0.12)"><strong style="color:#c0392b">SOFTWARE FAILURE</strong><br/>${softwareErr}<br/><span class="sub">Backend: ${statusText(report.evaluation_backend || run.summary?.evaluation_backend, "unknown")} · path: ${statusText(report.evaluation_path, report.evaluation_backend)}</span></div>` : (noFinalists && run.state === "COMPLETED" ? `<div class="warn-box"><strong>No candidate passed all mandatory Alpha Miner gates.</strong> Status: ${statusText(report.qualified_candidate_status, report.discovery_result || "NO_QUALIFIED_CANDIDATE")}<br/><span class="sub">${statusText(report.generation_cap_explanation, "")}</span></div>` : "")}
+    <p class="sub">Backend: ${statusText(report.evaluation_backend, "unknown")} · path: ${statusText(report.evaluation_path, report.evaluation_backend)} · is_full_event_wfo=${report.is_full_event_wfo === true} · terminal: ${statusText(report.terminal_reason)} · proxy_metric_used=${report.proxy_metric_used === true}</p>
+    ${(report.evaluation_backend === "synthetic_oos_probe") ? `<div class="warn-box">Synthetic OOS probe — not a real-data institutional evaluation.</div>` : ""}
+    ${report.silver_resolution ? `<div class="panel"><h3>Silver artifacts</h3><pre class="mono">${JSON.stringify(report.silver_resolution, null, 2)}</pre></div>` : ""}
+    ${report.wfo_summary ? `<div class="panel"><h3>WFO</h3><pre class="mono">${JSON.stringify(report.wfo_summary, null, 2)}</pre></div>` : ""}
+    <div class="grid">
+      <div class="stat"><div class="label">Generated</div><div class="value">${report.generated_candidates ?? run.generated_count ?? 0}</div></div>
+      <div class="stat"><div class="label">Invalid</div><div class="value">${report.invalid_candidates ?? report.invalid ?? 0}</div></div>
+      <div class="stat"><div class="label">Duplicates</div><div class="value">${report.duplicate_candidates ?? 0}</div></div>
+      <div class="stat"><div class="label">Precheck rejected</div><div class="value">${report.precheck_rejected ?? 0}</div></div>
+      <div class="stat"><div class="label">Evaluated</div><div class="value">${report.evaluated_candidates ?? run.evaluated_count ?? 0}</div></div>
+      <div class="stat"><div class="label">Full WFO</div><div class="value">${Number(report.full_wfo_evaluations ?? report.full_wfo_evaluated ?? 0)}</div></div>
+      <div class="stat"><div class="label">Score qualified</div><div class="value">${Number(report.score_qualified ?? 0)}</div></div>
+      <div class="stat"><div class="label">Stress passed</div><div class="value">${Number(report.stress_passed ?? 0)}</div></div>
+      <div class="stat"><div class="label">Clusters</div><div class="value">${Number(report.behavioral_clusters ?? 0)}</div></div>
+      <div class="stat"><div class="label">Shortlisted</div><div class="value">${Number(report.shortlisted ?? 0)}</div></div>
+      <div class="stat"><div class="label">Finalists</div><div class="value">${Number(report.finalist_count ?? (typeof report.finalists === "number" ? report.finalists : 0) ?? run.finalist_count ?? 0)}</div></div>
+      <div class="stat"><div class="label">Duplicates</div><div class="value">${Number(report.duplicate_candidates ?? report.duplicates ?? 0)}</div></div>
+      <div class="stat"><div class="label">Elapsed s</div><div class="value">${Number(report.elapsed_time ?? run.elapsed_seconds ?? 0).toFixed(2)}</div></div>
+      <div class="stat"><div class="label">Throughput /s</div><div class="value">${Number(report.throughput_per_second ?? 0).toFixed(2)}</div></div>
+      <div class="stat"><div class="label">Budget gen</div><div class="value" style="font-size:0.9rem">${budget.generated ?? 0}/${budget.generated_cap ?? "?"}</div></div>
+      <div class="stat"><div class="label">Terminal reason</div><div class="value" style="font-size:0.75rem">${statusText(report.terminal_reason || run.terminal_reason, "NONE")}</div></div>
+      <div class="stat"><div class="label">Discovery</div><div class="value" style="font-size:0.8rem">${statusText(report.discovery_result, "NOT_APPLICABLE")}</div></div>
+      <div class="stat"><div class="label">Statistical</div><div class="value" style="font-size:0.8rem">${statusText(report.statistical_result)}</div></div>
+    </div>
+    <div class="panel">
+      <h3>Qualified finalists (count=${finalists.length})</h3>
+      <table><thead><tr><th>ID</th><th>Family</th><th>Fitness</th><th>OOS Exp</th><th>PF</th><th>MaxDD</th><th>Stress</th><th>DSR</th><th>PBO</th><th>Cluster</th><th>Next gate</th></tr></thead>
+      <tbody>${finalists.map(c => `<tr>
+        <td class="mono">${c.candidate_id}</td><td>${c.family||c.strategy_family}</td>
+        <td>${fmtVal(c.fitness)}</td><td>${fmtVal(c.median_oos_expectancy)}</td>
+        <td>${fmtVal(c.profit_factor)}</td><td>${fmtVal(c.max_drawdown)}</td>
+        <td>${fmtVal(c.stress_status)}</td><td>${fmtVal(c.dsr)}</td><td>${fmtVal(c.pbo)}</td>
+        <td>${fmtVal(c.behavioral_cluster)}</td><td>${fmtVal(c.next_missing_gate)}</td>
+      </tr>`).join("") || `<tr><td colspan="11">NO_QUALIFIED_CANDIDATE</td></tr>`}</tbody></table>
+    </div>
+    <div class="panel">
+      <h3>Unvalidated shortlist (count=${shortlist.length})</h3>
+      <table><thead><tr><th>ID</th><th>Label</th><th>Stage</th><th>Backend</th><th>Missing gate</th><th>Fitness</th></tr></thead>
+      <tbody>${shortlist.map(c => `<tr>
+        <td class="mono">${c.candidate_id}</td><td>${fmtVal(c.promotion_label)}</td>
+        <td>${fmtVal(c.evaluation_stage)}</td><td>${fmtVal(c.backend_kind)}</td>
+        <td>${fmtVal(c.next_missing_gate)}</td><td>${fmtVal(c.fitness)}</td>
+      </tr>`).join("") || `<tr><td colspan="6">None</td></tr>`}</tbody></table>
+    </div>
+    <div class="panel">
+      <h3>Duplicate candidates (count=${duplicates.length})</h3>
+      <table><thead><tr><th>ID</th><th>Reason</th><th>Stage</th></tr></thead>
+      <tbody>${duplicates.map(c => `<tr><td class="mono">${c.candidate_id}</td><td>${fmtVal(c.rejection_reason)}</td><td>${fmtVal(c.evaluation_stage)}</td></tr>`).join("") || `<tr><td colspan="3">None</td></tr>`}</tbody></table>
+    </div>
+    <div class="panel">
+      <h3>Evaluation failures (count=${failures.length})</h3>
+      <table><thead><tr><th>ID</th><th>Stage</th><th>Reason</th></tr></thead>
+      <tbody>${failures.map(c => `<tr><td class="mono">${c.candidate_id}</td><td>${fmtVal(c.evaluation_stage)}</td><td>${fmtVal(c.rejection_reason)}</td></tr>`).join("") || `<tr><td colspan="3">None</td></tr>`}</tbody></table>
+    </div>
+    <div class="panel">
+      <h3>Rejected candidates</h3>
+      <input id="cand_filter" placeholder="Filter…" value="${state.filter}" />
+      <table>
+        <thead><tr>
+          <th data-k="candidate_id">Candidate</th>
+          <th data-k="family">Family</th>
+          <th data-k="generation">Gen</th>
+          <th data-k="fitness">Fitness</th>
+          <th data-k="dsr">DSR</th>
+          <th data-k="pbo">PBO</th>
+          <th data-k="stress_status">Stress</th>
+          <th data-k="rejection_reason">Rejection</th>
+          <th data-k="evaluation_stage">Stage</th>
+        </tr></thead>
+        <tbody>${(state.filter ? rows : rejected).filter(c => c.rejected).map(c => `<tr>
+          <td class="mono">${c.candidate_id}</td>
+          <td>${c.family||c.strategy_family||""}</td>
+          <td>${fmtVal(c.generation)}</td>
+          <td>${fmtVal(c.fitness)}</td>
+          <td>${fmtVal(c.dsr)}</td>
+          <td>${fmtVal(c.pbo)}</td>
+          <td>${fmtVal(c.stress_status)}</td>
+          <td>${fmtVal(c.rejection_reason)}</td>
+          <td>${fmtVal(c.evaluation_stage)}</td>
+        </tr>`).join("") || `<tr><td colspan="9">No rejected candidates</td></tr>`}</tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>All candidates</h3>
+      <table>
+        <thead><tr>
+          <th>ID</th><th>Family</th><th>Parents</th><th>Complexity</th><th>Fitness</th>
+          <th>OOS Exp</th><th>PF</th><th>MaxDD</th><th>Calmar</th>
+          <th>DSR</th><th>PBO</th><th>Cluster</th><th>Stage</th>
+        </tr></thead>
+        <tbody>${rows.map(c => `<tr>
+          <td class="mono">${c.candidate_id}</td>
+          <td>${c.family||c.strategy_family||""}</td>
+          <td class="mono">${(c.parent_ids||[]).join(",") || "NONE"}</td>
+          <td>${fmtVal(c.complexity)}</td>
+          <td>${fmtVal(c.fitness)}</td>
+          <td>${fmtVal(c.median_oos_expectancy)}</td>
+          <td>${fmtVal(c.profit_factor)}</td>
+          <td>${fmtVal(c.max_drawdown)}</td>
+          <td>${fmtVal(c.calmar_mar)}</td>
+          <td>${fmtVal(c.dsr)}</td>
+          <td>${fmtVal(c.pbo)}</td>
+          <td>${fmtVal(c.behavioral_cluster)}</td>
+          <td>${fmtVal(c.evaluation_stage)}</td>
+        </tr>`).join("") || `<tr><td colspan="13">No candidates</td></tr>`}</tbody>
+      </table>
+      <p class="sub">Registry total ${cands.registry_total} · rejected visible=${cands.rejected_visible}</p>
+    </div>
+    <div class="row">
+      <div class="panel"><h3>Rejection distribution</h3><pre class="logs">${JSON.stringify(dist, null, 2)}</pre></div>
+      <div class="panel"><h3>WFO / Stress / Clusters</h3><pre class="logs">${JSON.stringify({
+        wfo: report.wfo_summary, stress: report.stress_summary, clusters: report.behavioral_cluster_summary
+      }, null, 2)}</pre></div>
+    </div>
+    <div class="panel"><h3>Event stream</h3><div class="logs" id="miner_events">Connecting…</div></div>`;
+}
+
+function wireAlpha() {
+  const sel = $("#miner_run");
+  if (sel) sel.onchange = () => { setRun(sel.value); route(); };
+  const f = $("#cand_filter");
+  if (f) f.oninput = () => { state.filter = f.value; route(); };
+  document.querySelectorAll("th[data-k]").forEach(th => {
+    th.onclick = () => {
+      const k = th.dataset.k;
+      if (state.sortKey === k) state.sortDir *= -1;
+      else { state.sortKey = k; state.sortDir = 1; }
+      route();
+    };
+  });
+  // SSE live updates + reconnect with after_seq
+  const id = state.selectedRunId;
+  const box = $("#miner_events");
+  if (!id || !box) return;
+  stopSSE();
+  let after = 0;
+  const connect = () => {
+    const es = new EventSource(`/api/runs/${id}/events/stream?after_seq=${after}`);
+    state.sse = es;
+    es.onmessage = (ev) => {
+      try {
+        const e = JSON.parse(ev.data);
+        after = Math.max(after, e.seq || 0);
+        box.textContent = `${e.seq} [${e.event_type}] ${e.message}\n` + box.textContent;
+        const live = $("#live_status");
+        if (live && e.progress != null) {
+          live.textContent = `State: live update · progress ${Number(e.progress).toFixed(0)}% · ${e.event_type}`;
+        }
+      } catch {}
+    };
+    es.addEventListener("end", () => { es.close(); });
+    es.onerror = () => {
+      es.close();
+      // Reconnect pull missed events then resume
+      api(`/api/runs/${id}/events?after_seq=${after}`).then(data => {
+        for (const e of (data.events || [])) {
+          after = Math.max(after, e.seq || 0);
+          box.textContent = `${e.seq} [${e.event_type}] ${e.message}\n` + box.textContent;
+        }
+      }).catch(() => {});
+    };
+  };
+  // Seed from persistence first
+  api(`/api/runs/${id}/events`).then(data => {
+    const events = data.events || [];
+    box.textContent = events.map(e => `${e.seq} [${e.event_type}] ${e.message}`).join("\n") || "No events";
+    after = events.reduce((m, e) => Math.max(m, e.seq || 0), 0);
+    connect();
+  }).catch(() => { box.textContent = "Failed to load events"; });
+}
+
+async function renderWfo() {
+  const id = state.selectedRunId;
+  if (!id) return `<h1>WFO</h1><p class="sub">Select a run first.</p>`;
+  const w = await api(`/api/runs/${id}/wfo`);
+  const folds = w.fold_oos || [];
+  return `
+    <h1>WFO</h1>
+    <p class="sub">Training metrics are never labeled as OOS. Ranking source: ${w.ranking_source}</p>
+    <div class="warn-box">training_metrics_labeled_as_oos = ${w.training_metrics_labeled_as_oos}</div>
+    <div class="grid">
+      <div class="stat"><div class="label">Folds</div><div class="value">${w.folds ?? folds.length}</div></div>
+      <div class="stat"><div class="label">Agg OOS metric</div><div class="value">${w.aggregated_validation_metric != null ? Number(w.aggregated_validation_metric).toFixed(4) : "NOT_AVAILABLE"}</div></div>
+    </div>
+    <div class="panel"><table>
+      <thead><tr><th>Fold</th><th>Phase</th><th>OOS metric</th><th>Params</th><th>Is training?</th></tr></thead>
+      <tbody>${folds.map(f => `<tr>
+        <td>${f.fold}</td><td>${f.phase}</td><td>${f.metric}</td>
+        <td class="mono">${JSON.stringify(f.params)}</td><td>${f.is_training}</td>
+      </tr>`).join("") || `<tr><td colspan="5">No fold rows</td></tr>`}</tbody>
+    </table></div>`;
+}
+
+async function renderRegistry() { return renderAlpha(); }
+
+async function renderPortfolio() {
+  const id = state.selectedRunId;
+  if (!id) return `<h1>Portfolio</h1><p class="sub">Select a run first.</p>`;
+  const p = await api(`/api/runs/${id}/portfolio`);
+  return `<h1>Portfolio</h1><div class="panel"><pre class="logs">${JSON.stringify(p, null, 2)}</pre></div>`;
+}
+
+async function renderVault() {
+  const id = state.selectedRunId;
+  if (!id) return `<h1>Vault</h1><p class="sub">Select a run first.</p>`;
+  const v = await api(`/api/runs/${id}/vault`);
+  return `
+    <h1>Vault</h1>
+    <div class="warn-box">Raw Vault bars, features, timestamps, and returns are never exposed.</div>
+    <div class="panel"><pre class="logs">${JSON.stringify(v, null, 2)}</pre></div>`;
+}
+
+async function renderRuntime() {
+  const runs = await api("/api/runs?filter=ALL");
+  const rt = (runs.runs || []).filter(r => r.run_type === "SHADOW_RUNTIME" || r.run_type === "PAPER_RUNTIME");
+  let detail = "";
+  if (state.selectedRunId) {
+    const s = await api(`/api/runs/${state.selectedRunId}/summary`);
+    detail = `<div class="panel"><pre class="logs">${JSON.stringify(s, null, 2)}</pre></div>`;
+  }
+  return `
+    <h1>Shadow / Paper</h1>
+    <div class="warn-box">No live-trading activation button. PAPER remains paper-only.</div>
+    <div class="panel"><table>
+      <thead><tr><th>Run</th><th>Type</th><th>State</th><th>Paper eligible</th></tr></thead>
+      <tbody>${rt.map(r => `<tr data-id="${r.run_id}"><td class="mono">${r.run_id}</td><td>${r.run_type}</td><td>${r.state}</td><td>${r.paper_eligible}</td></tr>`).join("") || `<tr><td colspan="4">None</td></tr>`}</tbody>
+    </table></div>${detail}`;
+}
+
+async function renderDataQuality() {
+  const data = await api("/api/datasets");
+  const rows = (data.datasets || []).map(d =>
+    `<tr><td class="mono">${d.dataset_id}</td><td>${d.quality_status}</td>
+     <td>${d.missing_bar_count}</td><td>${d.duplicate_count}</td>
+     <td>${d.research_eligible ? "YES" : "NO"}</td>
+     <td>${(d.rejection_reasons||[]).join("; ")}</td></tr>`
+  ).join("");
+  return `<h1>Data Quality</h1>
+    <p class="sub">Catalog quality status for registered datasets.</p>
+    <div class="panel"><table>
+      <thead><tr><th>Dataset</th><th>Status</th><th>Missing</th><th>Dupes</th><th>Eligible</th><th>Reasons</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6">No datasets</td></tr>`}</tbody>
+    </table></div>`;
+}
+
+async function renderDatasets() {
+  const data = await api("/api/datasets");
+  const rows = (data.datasets || []).map(d => `
+    <tr data-id="${d.dataset_id}">
+      <td class="mono">${d.dataset_id}</td>
+      <td>${d.display_name}</td>
+      <td>${d.provider_id}</td>
+      <td>${d.asset_class}</td>
+      <td>${(d.tradable_contracts||[]).join(",") || (d.symbols||[]).join(",")}</td>
+      <td>${d.timeframe}</td>
+      <td>${d.row_count}</td>
+      <td>${d.quality_status}</td>
+      <td>${d.research_eligible ? "YES" : "NO"}</td>
+      <td>${d.smoke_test_only ? "SMOKE" : ""}</td>
+    </tr>`).join("") || `<tr><td colspan="10">No datasets</td></tr>`;
+  return `
+    <h1>Dataset Catalog</h1>
+    <p class="sub">Import root: <span class="mono">${data.import_root || ""}</span></p>
+    <div class="panel"><table>
+      <thead><tr>
+        <th>ID</th><th>Name</th><th>Provider</th><th>Class</th><th>Contract</th>
+        <th>TF</th><th>Rows</th><th>Quality</th><th>Eligible</th><th>Smoke</th>
+      </tr></thead>
+      <tbody id="ds_rows">${rows}</tbody>
+    </table></div>`;
+}
+
+async function wireDatasets() {
+  const tb = $("#ds_rows");
+  if (!tb) return;
+  tb.onclick = (ev) => {
+    const tr = ev.target.closest("tr[data-id]");
+    if (!tr) return;
+    setDataset(tr.dataset.id);
+    location.hash = "#/dataset-detail";
+  };
+}
+
+async function renderDatasetDetail() {
+  const id = state.selectedDatasetId;
+  if (!id) return `<h1>Dataset Detail</h1><p class="sub">Select a dataset from Datasets.</p>`;
+  const d = await api(`/api/datasets/${encodeURIComponent(id)}`);
+  return `
+    <h1>Dataset Detail</h1>
+    <p class="sub">${d.display_name} · ${d.research_eligible ? "RESEARCH ELIGIBLE" : "NOT RESEARCH ELIGIBLE"}
+      ${d.smoke_test_only ? " · SMOKE TEST ONLY" : ""}</p>
+    <div class="grid">
+      <div class="stat"><div class="label">Quality</div><div class="value" style="font-size:1rem">${d.quality_status}</div></div>
+      <div class="stat"><div class="label">Rows</div><div class="value">${d.row_count}</div></div>
+      <div class="stat"><div class="label">Missing bars</div><div class="value">${d.missing_bar_count}</div></div>
+      <div class="stat"><div class="label">Duplicates</div><div class="value">${d.duplicate_count}</div></div>
+    </div>
+    <div class="panel">
+      <h3>Manifest / provenance / hashes / schema / coverage</h3>
+      <pre class="logs">${JSON.stringify({
+        dataset_id: d.dataset_id,
+        dataset_version: d.dataset_version,
+        provider_id: d.provider_id,
+        provider_version: d.provider_version,
+        asset_class: d.asset_class,
+        symbols: d.symbols,
+        tradable_contracts: d.tradable_contracts,
+        timeframe: d.timeframe,
+        start_timestamp: d.start_timestamp,
+        end_timestamp: d.end_timestamp,
+        source_timezone: d.source_timezone,
+        exchange_or_broker: d.exchange_or_broker,
+        volume_type: d.volume_type,
+        raw_hash: d.raw_hash,
+        normalized_hash: d.normalized_hash,
+        correction_version: d.correction_version,
+        immutable: d.immutable,
+        rejection_reasons: d.rejection_reasons,
+        schema: d.schema,
+        provenance: d.provenance,
+        futures_meta: d.futures_meta,
+        cfd_meta: d.cfd_meta,
+        continuous_series: d.continuous_series,
+        rollover_metadata: d.rollover_metadata,
+        quality_report: d.quality_report,
+        dependent_run_ids: d.dependent_run_ids,
+      }, null, 2)}</pre>
+    </div>`;
+}
+
+async function renderDataImport() {
+  const files = await api("/api/import/files");
+  const opts = (files.files || []).map(f =>
+    `<option value="${f.relative_path}">${f.relative_path} (${f.size_bytes} B)</option>`
+  ).join("") || `<option value="">(no CSV/Parquet under import root)</option>`;
+  return `
+    <h1>Data Import</h1>
+    <p class="sub">Safe root: <span class="mono">${files.import_root}</span> — place files here, then select. No absolute paths, URLs, or pickles.</p>
+    <div class="panel">
+      <div class="row">
+        <div><label>File</label><select id="imp_file">${opts}</select></div>
+        <div><label>Asset class</label>
+          <select id="imp_ac"><option>FUTURES</option><option>CFD</option><option>EQUITY</option><option>FX</option></select>
+        </div>
+      </div>
+      <h3>Column mapping (explicit)</h3>
+      <div class="row">
+        <div><label>timestamp</label><input id="m_ts" value="timestamp" /></div>
+        <div><label>open</label><input id="m_o" value="open" /></div>
+        <div><label>high</label><input id="m_h" value="high" /></div>
+        <div><label>low</label><input id="m_l" value="low" /></div>
+      </div>
+      <div class="row">
+        <div><label>close</label><input id="m_c" value="close" /></div>
+        <div><label>volume</label><input id="m_v" value="volume" /></div>
+        <div><label>symbol col (opt)</label><input id="m_sym" value="" /></div>
+        <div><label>contract col (opt)</label><input id="m_ctr" value="" /></div>
+      </div>
+      <h3>Identity (never guessed)</h3>
+      <div class="row">
+        <div><label>provider_id</label><input id="imp_prov" value="" placeholder="e.g. local_csv" /></div>
+        <div><label>provider_version</label><input id="imp_prov_v" value="1.0.0" /></div>
+        <div><label>source_timezone</label><input id="imp_tz" value="America/Chicago" /></div>
+        <div><label>exchange_or_broker</label><input id="imp_xch" value="CME" /></div>
+      </div>
+      <div class="row">
+        <div><label>timeframe</label><input id="imp_tf" value="5min" /></div>
+        <div><label>volume_type</label>
+          <select id="imp_vol">
+            <option>EXCHANGE_EXECUTED_VOLUME</option>
+            <option>BROKER_REPORTED_VOLUME</option>
+            <option>TICK_ACTIVITY_PROXY</option>
+            <option>UNKNOWN</option>
+          </select>
+        </div>
+        <div><label>root_symbol</label><input id="imp_root" value="ES" /></div>
+        <div><label>tradable_contract</label><input id="imp_contract" value="ESH24" /></div>
+      </div>
+      <div class="row" id="fut_extra">
+        <div><label>multiplier</label><input id="imp_mult" type="number" value="50" /></div>
+        <div><label>tick_size</label><input id="imp_tick" type="number" step="0.01" value="0.25" /></div>
+        <div><label>tick_value</label><input id="imp_tickv" type="number" step="0.01" value="12.5" /></div>
+        <div><label>expiration (opt)</label><input id="imp_exp" value="" /></div>
+      </div>
+      <div class="row" id="cfd_extra" style="display:none">
+        <div><label>broker_symbol</label><input id="imp_bsym" value="" /></div>
+        <div><label>spread_available</label><select id="imp_spread"><option value="">(required)</option><option>true</option><option>false</option></select></div>
+        <div><label>financing_rate_available</label><select id="imp_fin"><option value="">(required)</option><option>true</option><option>false</option></select></div>
+      </div>
+      <div class="confirm"><input type="checkbox" id="imp_cont" /><span>Continuous series (requires rollover_metadata JSON)</span></div>
+      <label>rollover_metadata JSON</label>
+      <textarea id="imp_roll" rows="2">{}</textarea>
+      <label>display_name</label>
+      <input id="imp_name" value="" />
+      <div style="margin-top:0.75rem">
+        <button type="button" id="btn_preview" class="secondary">Preview</button>
+        <button type="button" id="btn_validate" class="secondary">Validate</button>
+        <button type="button" id="btn_commit">Confirm &amp; commit (Bronze→Silver→Catalog)</button>
+      </div>
+      <div class="confirm"><input type="checkbox" id="imp_confirm" /><span>I confirm writing an immutable Bronze dataset</span></div>
+      <pre class="logs" id="imp_out"></pre>
+    </div>`;
+}
+
+function collectImportBody(confirm) {
+  let roll = {};
+  try { roll = JSON.parse($("#imp_roll").value || "{}"); } catch {}
+  const ac = $("#imp_ac").value;
+  const body = {
+    relative_path: $("#imp_file").value,
+    asset_class: ac,
+    column_mapping: {
+      timestamp: $("#m_ts").value,
+      open: $("#m_o").value,
+      high: $("#m_h").value,
+      low: $("#m_l").value,
+      close: $("#m_c").value,
+      volume: $("#m_v").value,
+      symbol: $("#m_sym").value || null,
+      tradable_contract: $("#m_ctr").value || null,
+    },
+    provider_id: $("#imp_prov").value,
+    provider_version: $("#imp_prov_v").value,
+    source_timezone: $("#imp_tz").value,
+    exchange_or_broker: $("#imp_xch").value,
+    timeframe: $("#imp_tf").value,
+    volume_type: $("#imp_vol").value,
+    root_symbol: $("#imp_root").value,
+    tradable_contract: $("#imp_contract").value || null,
+    continuous_series: $("#imp_cont").checked,
+    rollover_metadata: roll,
+    display_name: $("#imp_name").value || null,
+    confirm: !!confirm,
+  };
+  if (ac === "FUTURES") {
+    body.multiplier = Number($("#imp_mult").value);
+    body.tick_size = Number($("#imp_tick").value);
+    body.tick_value = Number($("#imp_tickv").value);
+    body.contract_expiration = $("#imp_exp").value || null;
+  }
+  if (ac === "CFD") {
+    body.broker_symbol = $("#imp_bsym").value || null;
+    body.spread_available = $("#imp_spread").value === "" ? null : $("#imp_spread").value === "true";
+    body.financing_rate_available = $("#imp_fin").value === "" ? null : $("#imp_fin").value === "true";
+  }
+  return body;
+}
+
+async function wireDataImport() {
+  const toggle = () => {
+    const ac = $("#imp_ac").value;
+    $("#fut_extra").style.display = ac === "FUTURES" ? "" : "none";
+    $("#cfd_extra").style.display = ac === "CFD" ? "" : "none";
+    if (ac === "CFD") $("#imp_vol").value = "BROKER_REPORTED_VOLUME";
+  };
+  $("#imp_ac").onchange = toggle;
+  toggle();
+  $("#btn_preview").onclick = async () => {
+    try {
+      const body = collectImportBody(false);
+      const r = await api("/api/import/preview", { method: "POST", body: JSON.stringify(body) });
+      $("#imp_out").textContent = JSON.stringify(r, null, 2);
+    } catch (e) { $("#imp_out").textContent = String(e.message || e); }
+  };
+  $("#btn_validate").onclick = async () => {
+    try {
+      const r = await api("/api/import/validate", { method: "POST", body: JSON.stringify(collectImportBody(false)) });
+      $("#imp_out").textContent = JSON.stringify(r, null, 2);
+    } catch (e) { $("#imp_out").textContent = String(e.message || e); }
+  };
+  $("#btn_commit").onclick = async () => {
+    try {
+      if (!$("#imp_confirm").checked) throw new Error("Check confirmation before commit");
+      const entry = await api("/api/import/commit", { method: "POST", body: JSON.stringify(collectImportBody(true)) });
+      setDataset(entry.dataset_id);
+      $("#imp_out").textContent = JSON.stringify(entry, null, 2);
+    } catch (e) { $("#imp_out").textContent = String(e.message || e); }
+  };
+}
+
+const CFD_BANNER = "DUKASCOPY USA500 DATA IS BROKER CFD DATA. IT IS NOT CME ES FUTURES DATA.";
+
+function acqJobRow(j) {
+  return `<tr data-job="${j.download_job_id}">
+    <td class="mono">${j.download_job_id}</td>
+    <td>${j.state}</td>
+    <td>${j.stage}</td>
+    <td>${j.acquisition_mode}</td>
+    <td class="mono">${j.source_symbol}</td>
+    <td>${j.start_date} → ${j.end_date}</td>
+    <td>${j.requested_event_type} / ${j.requested_granularity}</td>
+    <td class="mono">${j.current_chunk || "-"}</td>
+    <td>${j.completed_chunks}/${j.total_chunks} (${Number(j.progress_pct).toFixed(1)}%)</td>
+    <td>${j.failed_chunks}</td>
+    <td>${j.retries}</td>
+    <td>${j.downloaded_bytes}</td>
+    <td>${j.registered_dataset_id || "-"}</td>
+  </tr>`;
+}
+
+async function renderDataAcquisition() {
+  const d = await api("/api/acquisition/source");
+  const s = d.source;
+  const auto = d.automated_download;
+  const symOpts = (d.verified_symbols || [])
+    .map(v => `<option value="${v.source_symbol}">${v.source_symbol} — ${v.display_symbol}</option>`)
+    .join("");
+  const modeOpts = (d.acquisition_modes || [])
+    .map(m => `<option value="${m}"${m === "MANUAL_EXPORT_IMPORT" ? " selected" : ""}>${m}</option>`)
+    .join("");
+  const granOpts = (d.granularities || []).map(g => `<option value="${g}">${g}</option>`).join("");
+  const jobRows = (d.jobs || []).map(acqJobRow).join("")
+    || `<tr><td colspan="13">No download jobs yet</td></tr>`;
+
+  return `
+    <h1>Data Acquisition</h1>
+    <div class="warn-box"><strong>${CFD_BANNER}</strong></div>
+    <p class="sub">Staged acquisition: probe one day, validate one month, then expand. Multi-year spans are never started implicitly.</p>
+
+    <div class="panel">
+      <h3>Historical source</h3>
+      <div class="grid">
+        <div class="stat"><div class="label">Source</div><div class="value" style="font-size:0.95rem">${s.broker_or_venue}</div></div>
+        <div class="stat"><div class="label">Instrument</div><div class="value" style="font-size:0.95rem">${s.instrument}</div></div>
+        <div class="stat"><div class="label">Exact source symbol</div><div class="value" style="font-size:0.95rem">${s.exact_source_symbol}</div></div>
+        <div class="stat"><div class="label">Display symbol</div><div class="value" style="font-size:0.95rem">${s.source_display_symbol}</div></div>
+        <div class="stat"><div class="label">Asset class</div><div class="value" style="font-size:0.95rem">${s.asset_class}</div></div>
+        <div class="stat"><div class="label">Source timezone</div><div class="value" style="font-size:0.95rem">${s.source_timezone}</div></div>
+        <div class="stat"><div class="label">Price convention</div><div class="value" style="font-size:0.95rem">${s.price_convention}</div></div>
+        <div class="stat"><div class="label">Volume type</div><div class="value" style="font-size:0.95rem">${s.volume_type}</div></div>
+        <div class="stat"><div class="label">Exchange volume</div><div class="value" style="font-size:0.95rem">${s.centralized_exchange_volume ? "YES" : "NO"}</div></div>
+        <div class="stat"><div class="label">Futures rollover</div><div class="value" style="font-size:0.95rem">${s.futures_rollover}</div></div>
+      </div>
+      <p class="sub" style="margin-top:0.75rem">Event types: <span class="mono">${(d.event_types || []).join(", ")}</span> ·
+        Availability: <span class="mono">${JSON.stringify(s.historical_availability)}</span></p>
+    </div>
+
+    <div class="panel">
+      <h3>Acquisition mode</h3>
+      <p class="sub">Automated public download enabled: <strong>${auto.enabled ? "YES" : "NO"}</strong>
+        (opt-in flag <span class="mono">${auto.network_opt_in_flag}</span>).
+        Local <span class="mono">.bi5</span> archive configured: <strong>${d.archive_root_configured ? "YES" : "NO"}</strong>
+        (<span class="mono">${d.archive_root_env}</span>).
+        Manual export/import is always available under <span class="mono">${d.import_root}</span>.</p>
+      <div class="row">
+        <div><label>Source symbol</label><select id="acq_symbol">${symOpts}</select></div>
+        <div><label>Acquisition mode</label><select id="acq_mode">${modeOpts}</select></div>
+      </div>
+      <div class="row">
+        <div><label>Start date</label><input id="acq_start" value="2024-03-04" /></div>
+        <div><label>End date</label><input id="acq_end" value="2024-03-04" /></div>
+      </div>
+      <div class="row">
+        <div><label>Granularity</label><select id="acq_gran">${granOpts}</select></div>
+        <div><label>Manual export (optional, relative to import root)</label><input id="acq_file" placeholder="usa500_ticks.csv" /></div>
+      </div>
+      <div class="row">
+        <div><button id="acq_probe">Probe One Day</button></div>
+        <div><button id="acq_create">Create Download Job</button></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Probe result — sample rows, quality, estimates</h3>
+      <pre class="logs" id="acq_probe_out">Run "Probe One Day" to parse a single trading day. Nothing is stored until you register.</pre>
+    </div>
+
+    <div class="panel">
+      <h3>Download jobs</h3>
+      <table>
+        <thead><tr>
+          <th>Job</th><th>State</th><th>Stage</th><th>Mode</th><th>Symbol</th><th>Range</th>
+          <th>Event/Gran</th><th>Chunk</th><th>Progress</th><th>Failed</th><th>Retries</th><th>Bytes</th><th>Dataset</th>
+        </tr></thead>
+        <tbody id="acq_jobs">${jobRows}</tbody>
+      </table>
+      <div class="row" style="margin-top:0.75rem">
+        <div><label>Selected job id</label><input id="acq_job_id" placeholder="click a row above" /></div>
+        <div><label>&nbsp;</label>
+          <button id="acq_run">Run / Resume Chunks</button>
+        </div>
+      </div>
+      <div class="row">
+        <div><button id="acq_pause">Pause</button></div>
+        <div><button id="acq_resume">Resume</button></div>
+      </div>
+      <div class="row">
+        <div><button id="acq_cancel">Cancel</button></div>
+        <div><button id="acq_register">Register Dataset</button></div>
+      </div>
+      <div class="confirm">
+        <input type="checkbox" id="acq_confirm" />
+        <label for="acq_confirm">I confirm writing an immutable Bronze dataset and registering it in the catalog.</label>
+      </div>
+      <pre class="logs" id="acq_out">No action yet.</pre>
+    </div>`;
+}
+
+async function wireDataAcquisition() {
+  const out = $("#acq_out");
+  const probeOut = $("#acq_probe_out");
+  const show = (el, v) => { el.textContent = typeof v === "string" ? v : JSON.stringify(v, null, 2); };
+  const jobId = () => ($("#acq_job_id").value || "").trim();
+
+  const jobs = $("#acq_jobs");
+  if (jobs) {
+    jobs.onclick = (ev) => {
+      const tr = ev.target.closest("tr[data-job]");
+      if (!tr) return;
+      $("#acq_job_id").value = tr.dataset.job;
+    };
+  }
+
+  $("#acq_probe").onclick = async () => {
+    show(probeOut, "Probing…");
+    try {
+      const body = {
+        symbol: $("#acq_symbol").value,
+        day: $("#acq_start").value,
+      };
+      const file = ($("#acq_file").value || "").trim();
+      if (file) body.relative_path = file;
+      const id = jobId();
+      if (id) body.job_id = id;
+      const r = await api("/api/acquisition/probe", { method: "POST", body: JSON.stringify(body) });
+      show(probeOut, {
+        exact_source_symbol: r.source_symbol,
+        asset_class: r.asset_class,
+        source_timezone: r.source_timezone,
+        price_convention: r.price_convention,
+        volume_type: r.volume_type,
+        centralized_exchange_volume: r.centralized_exchange_volume,
+        schema: r.schema,
+        estimated_row_count: r.estimated_rows_per_day,
+        estimated_storage_bytes: r.estimated_storage_bytes,
+        quality_status: r.quality.quality_status,
+        research_eligible: r.quality.research_eligible,
+        rejection_reasons: r.quality.rejection_reasons,
+        warnings: r.quality.warnings,
+        crossed_quotes: r.quality.crossed_quote_count,
+        spread_distribution: r.quality.spread_distribution,
+        approval_required: r.approval_required,
+        sample_rows: r.sample_rows,
+      });
+    } catch (e) { show(probeOut, `ERROR: ${e.message}`); }
+  };
+
+  $("#acq_create").onclick = async () => {
+    show(out, "Creating job…");
+    try {
+      const r = await api("/api/acquisition/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          symbol: $("#acq_symbol").value,
+          start: $("#acq_start").value,
+          end: $("#acq_end").value,
+          granularity: $("#acq_gran").value,
+          acquisition_mode: $("#acq_mode").value,
+        }),
+      });
+      $("#acq_job_id").value = r.download_job_id;
+      show(out, r);
+    } catch (e) { show(out, `ERROR: ${e.message}`); }
+  };
+
+  const jobAction = (path, label) => async () => {
+    const id = jobId();
+    if (!id) { show(out, "Select a job id first."); return; }
+    show(out, `${label}…`);
+    try {
+      show(out, await api(`/api/acquisition/jobs/${encodeURIComponent(id)}/${path}`, { method: "POST" }));
+    } catch (e) { show(out, `ERROR: ${e.message}`); }
+  };
+  $("#acq_run").onclick = jobAction("run", "Acquiring chunks");
+  $("#acq_pause").onclick = jobAction("pause", "Pausing");
+  $("#acq_resume").onclick = jobAction("resume", "Resuming");
+  $("#acq_cancel").onclick = jobAction("cancel", "Cancelling");
+
+  $("#acq_register").onclick = async () => {
+    show(out, "Registering…");
+    try {
+      const body = { confirm: $("#acq_confirm").checked };
+      const id = jobId();
+      if (id) body.job_id = id;
+      const file = ($("#acq_file").value || "").trim();
+      if (file) body.relative_path = file;
+      body.symbol = $("#acq_symbol").value;
+      const r = await api("/api/acquisition/register", { method: "POST", body: JSON.stringify(body) });
+      show(out, {
+        dataset_id: r.dataset_id,
+        research_eligible: r.research_eligible,
+        quality_status: r.quality.quality_status,
+        cost_model: r.cost_model.eligibility,
+        rejection_reasons: r.catalog_entry.rejection_reasons,
+        paper_eligible: r.catalog_entry.paper_eligible,
+        paper_eligibility_reason: r.catalog_entry.paper_eligibility_reason,
+      });
+    } catch (e) { show(out, `ERROR: ${e.message}`); }
+  };
+}
+
+async function renderSourceTarget() {
+  const d = await api("/api/acquisition/source_target");
+  const rows = (d.comparison_rows || []).map(r => `
+    <tr>
+      <td>${r.field}</td>
+      <td class="mono">${typeof r.source === "object" ? JSON.stringify(r.source) : r.source}</td>
+      <td class="mono">${typeof r.target === "object" ? JSON.stringify(r.target) : r.target}</td>
+      <td>${r.matches ? `<span class="pos">MATCH</span>` : `<span class="neg">DIFFERS</span>`}</td>
+      <td>${r.verified == null ? "-" : (r.verified ? "VERIFIED" : "UNVERIFIED")}</td>
+    </tr>`).join("");
+  const warns = (d.warnings || []).map(w => `
+    <tr>
+      <td class="mono">${w.code}</td>
+      <td>${w.severity === "CRITICAL" ? `<span class="neg">${w.severity}</span>` : w.severity}</td>
+      <td>${w.message}</td>
+    </tr>`).join("") || `<tr><td colspan="3">No warnings</td></tr>`;
+
+  return `
+    <h1>Source vs Target</h1>
+    <div class="warn-box"><strong>${CFD_BANNER}</strong></div>
+    <p class="sub">Historical source broker: <strong>${d.historical_source_broker}</strong> ·
+      Target prop broker: <strong>${d.target_prop_broker}</strong> ·
+      Target feed imported: <strong>${d.target_feed_imported ? "YES" : "NO"}</strong></p>
+
+    <div class="grid">
+      <div class="stat"><div class="label">Warnings</div><div class="value">${d.warning_count}</div></div>
+      <div class="stat"><div class="label">Critical</div><div class="value ${d.critical_count ? "neg" : "pos"}">${d.critical_count}</div></div>
+      <div class="stat"><div class="label">Research eligible possible</div><div class="value" style="font-size:1rem">YES</div></div>
+      <div class="stat"><div class="label">Paper eligible</div>
+        <div class="value ${d.paper_eligibility.paper_eligible ? "pos" : "neg"}" style="font-size:1rem">
+          ${d.paper_eligibility.paper_eligible ? "YES" : "NO"}</div></div>
+    </div>
+
+    <div class="panel">
+      <h3>Field comparison</h3>
+      <table>
+        <thead><tr><th>Field</th><th>Historical source</th><th>Execution target</th><th>Status</th><th>Verified</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h3>Unresolved warnings</h3>
+      <table>
+        <thead><tr><th>Code</th><th>Severity</th><th>Detail</th></tr></thead>
+        <tbody>${warns}</tbody>
+      </table>
+      <p class="sub" style="margin-top:0.75rem">${d.paper_eligibility.reason}</p>
+      <p class="sub">${d.note}</p>
+    </div>`;
+}
+
+async function renderHealth() {
+  const h = await api("/api/system/health");
+  const c = await api("/api/system/capabilities");
+  return `<h1>System Health</h1>
+    <div class="warn-box">${h.banner}</div>
+    <div class="panel"><pre class="logs">${JSON.stringify({health:h, capabilities:c}, null, 2)}</pre></div>`;
+}
+
+async function renderArtifacts() {
+  const id = state.selectedRunId;
+  if (!id) return `<h1>Artifacts</h1><p class="sub">Select a run first.</p>`;
+  const a = await api(`/api/runs/${id}/artifacts`);
+  return `<h1>Artifacts</h1>
+    <p class="sub">Only manifest-registered files are accessible. Path traversal is blocked.</p>
+    <div class="panel"><ul>${(a.manifest||[]).map(f => `<li><a href="/api/runs/${id}/artifacts/${encodeURIComponent(f)}" target="_blank">${f}</a></li>`).join("") || "<li>Empty</li>"}</ul></div>`;
+}
+
+async function renderLogs() {
+  const id = state.selectedRunId;
+  if (!id) return `<h1>Logs</h1><p class="sub">Select a run first.</p>`;
+  const e = await api(`/api/runs/${id}/events`);
+  return `<h1>Logs / Events</h1>
+    <p class="sub">Reconnect-safe: pass after_seq to retrieve missed events.</p>
+    <div class="logs">${(e.events||[]).map(x => `${x.seq} ${x.timestamp} [${x.event_type}] ${x.message}`).join("\n")}</div>`;
+}
+
+const RENDERERS = {
+  overview: renderOverview,
+  "new-run": async () => {
+    const catalog = await api("/api/datasets");
+    state.catalog = catalog.datasets || [];
+    return newRunForm(state.catalog);
+  },
+  "data-acquisition": renderDataAcquisition,
+  "source-target": renderSourceTarget,
+  "data-import": renderDataImport,
+  datasets: renderDatasets,
+  "dataset-detail": renderDatasetDetail,
+  runs: () => renderRunsPage("default"),
+  active: () => { setFilter("ACTIVE"); return renderRunsPage("default"); },
+  "run-detail": () => renderRunsPage("default"),
+  "alpha-miner": renderAlpha,
+  wfo: renderWfo,
+  registry: renderRegistry,
+  portfolio: renderPortfolio,
+  vault: renderVault,
+  runtime: renderRuntime,
+  "data-quality": renderDataQuality,
+  health: renderHealth,
+  artifacts: renderArtifacts,
+  logs: renderLogs,
+};
+
+const WIRES = {
+  "new-run": wireNewRun,
+  "data-acquisition": wireDataAcquisition,
+  "data-import": wireDataImport,
+  datasets: wireDatasets,
+  runs: wireRuns,
+  active: wireRuns,
+  "run-detail": wireRuns,
+  "alpha-miner": wireAlpha,
+  registry: wireAlpha,
+  runtime: async () => {
+    const tb = document.querySelector("tbody");
+    if (!tb) return;
+    tb.onclick = (ev) => {
+      const tr = ev.target.closest("tr[data-id]");
+      if (!tr) return;
+      setRun(tr.dataset.id);
+      route();
+    };
+  },
+};
+
+async function route() {
+  stopSSE();
+  const raw = location.hash.replace(/^#\/?/, "") || "overview";
+  state.page = raw.split("?")[0];
+  if (state.page === "active") state.page = "runs";
+  nav();
+  const app = $("#app");
+  app.innerHTML = `<p class="sub">Loading…</p>`;
+  try {
+    const html = await (RENDERERS[state.page] || renderOverview)();
+    app.innerHTML = html;
+    if (WIRES[state.page]) await WIRES[state.page]();
+  } catch (e) {
+    app.innerHTML = `<h1>Error</h1><pre class="logs">${String(e.message || e)}</pre>`;
+  }
+}
+
+window.addEventListener("hashchange", route);
+route();

@@ -1,0 +1,40 @@
+strategies:
+  - id: donchian_spy
+    class: DonchianATR
+    enabled: true
+    symbols: [SPY]
+    params:
+      channel_period: 20
+      atr_period: 14
+      atr_stop_mult: 2.5
+      risk_fraction: 0.0075
+
+  - id: donchian_qqq
+    class: DonchianATR
+    enabled: true
+    symbols: [QQQ]
+    params:
+      channel_period: 20
+      atr_period: 14
+      atr_stop_mult: 2.5
+      risk_fraction: 0.0075
+
+  - id: donchian_gld
+    class: DonchianATR
+    enabled: true
+    symbols: [GLD]
+    params:
+      channel_period: 55
+      atr_period: 20
+      atr_stop_mult: 3.0
+      risk_fraction: 0.005
+
+  - id: donchian_tlt
+    class: DonchianATR
+    enabled: true
+    symbols: [TLT]
+    params:
+      channel_period: 20
+      atr_period: 14
+      atr_stop_mult: 2.0
+      risk_fraction: 0.005

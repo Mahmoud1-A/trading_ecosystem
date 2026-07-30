@@ -1,0 +1,96 @@
+# Trade-only stack for DigitalOcean / VPS.
+# Discovery stays on the laptop — do NOT add te-discover here.
+#
+# Usage (from repo root):
+#   docker compose -f deploy/docker-compose.yml up -d --build
+# Optional one-shot jobs:
+#   docker compose -f deploy/docker-compose.yml --profile jobs run --rm ingest
+
+services:
+  monitor:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - ../.env
+    environment:
+      DATA_DIR: /app/data
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - te_data:/app/data
+      - ../configs:/app/configs:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Live execution sleeve under MasterRiskManager (Alpaca Paper by default).
+  paper:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      DATA_DIR: /app/data
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ALPACA_PAPER: ${ALPACA_PAPER:-true}
+    volumes:
+      - te_data:/app/data
+      - ../configs:/app/configs:ro
+    command:
+      [
+        "te-paper",
+        "--broker",
+        "alpaca",
+        "--loop",
+        "--interval-sec",
+        "60",
+        "--no-freeze-book",
+        "--replay-days",
+        "0",
+        "--strategies",
+        "/app/configs/strategies.paper.live.yaml",
+      ]
+    depends_on:
+      monitor:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+
+  ingest:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - te_data:/app/data
+      - ../configs:/app/configs:ro
+    command: ["te-ingest", "--start", "2018-01-01"]
+    profiles: ["jobs"]
+
+  backtest:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - te_data:/app/data
+      - ../configs:/app/configs:ro
+    command: ["te-backtest", "--ingest-first", "--start", "2018-01-01"]
+    profiles: ["jobs"]
+
+volumes:
+  te_data:

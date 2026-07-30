@@ -1,0 +1,48 @@
+# Satellite sleeve outside the live 40: scan 25 liquid ETFs, keep top 8 heroes.
+# Diversified across semis/tech, biotech, country, miners, energy, banks, defense, retail.
+id: etf_satellite
+label: قمر صناعي (25→8)
+label_en: Satellite heroes (25→8)
+timeframe: 1d
+trade_default: false
+portfolio_mode: sparse_heroes
+max_heroes: 8
+min_hero_oos_cagr: 0.0
+min_bars_for_champion: 500
+cost_profile: etf
+symbols:
+  # Semiconductors / tech growth (not in live 40)
+  - SMH
+  - SOXX
+  - VGT
+  - IGV
+  - HACK
+  # Biotech
+  - XBI
+  - IBB
+  # Country / regional
+  - EWY
+  - EWZ
+  - EWT
+  - KWEB
+  - EWA
+  # Miners / uranium
+  - GDX
+  - COPX
+  - URA
+  # Energy niche
+  - XOP
+  - OIH
+  # Regional banks
+  - KRE
+  # Defense / transport
+  - ITA
+  - JETS
+  # Homebuilders / retail
+  - XHB
+  - XRT
+  # Clean energy
+  - ICLN
+  # Small-cap style (IWM is in live 40)
+  - IWO
+  - IWN

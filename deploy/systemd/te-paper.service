@@ -1,0 +1,24 @@
+[Unit]
+Description=Trading Ecosystem Paper/Live Execution (MRM + broker)
+After=network.target te-monitor.service
+Wants=te-monitor.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/trading_ecosystem
+EnvironmentFile=/opt/trading_ecosystem/.env
+Environment=DATA_DIR=/opt/trading_ecosystem/data
+# Fast execution loop — discovery stays on the laptop.
+ExecStart=/opt/trading_ecosystem/.venv/bin/te-paper \
+  --broker alpaca \
+  --loop \
+  --interval-sec 60 \
+  --no-freeze-book \
+  --replay-days 0 \
+  --strategies /opt/trading_ecosystem/configs/strategies.paper.live.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

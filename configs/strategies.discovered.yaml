@@ -1,0 +1,315 @@
+strategies:
+- id: invent_g3_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - CPER
+  params:
+    gap_pct: 0.005
+    hold_bars: 10
+    risk_fraction: 0.005
+    atr_period: 28
+    atr_stop_mult: 1.5
+- id: mut_g1_0001
+  class: ZScoreRevert
+  enabled: true
+  symbols:
+  - DBA
+  params:
+    lookback: 37
+    entry_z: 1.5
+    exit_z: 0.25
+    risk_fraction: 0.004035
+- id: invent_g1_0003
+  class: GapFade
+  enabled: true
+  symbols:
+  - EEM
+  params:
+    gap_pct: 0.005
+    hold_bars: 10
+    risk_fraction: 0.0075
+    atr_period: 14
+    atr_stop_mult: 1.0
+- id: mut_g7_0006
+  class: GapFade
+  enabled: true
+  symbols:
+  - EFA
+  params:
+    gap_pct: 0.0015
+    hold_bars: 9
+    risk_fraction: 0.01
+    atr_period: 20
+    atr_stop_mult: 0.547814
+- id: invent_g1_0006
+  class: GapFade
+  enabled: true
+  symbols:
+  - EWJ
+  params:
+    gap_pct: 0.008
+    hold_bars: 3
+    risk_fraction: 0.005
+    atr_period: 14
+    atr_stop_mult: 1.5
+- id: invent_g1_0001
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - FXI
+  params:
+    lookback: 20
+    atr_period: 14
+    atr_stop_mult: 2.5
+    risk_fraction: 0.005
+- id: xover_g1_0016
+  class: GapFade
+  enabled: true
+  symbols:
+  - GLD
+  params:
+    gap_pct: 0.002
+    hold_bars: 10
+    risk_fraction: 0.01
+    atr_period: 14
+    atr_stop_mult: 2.5
+    exit_z: 0.25
+- id: mut_g3_0004
+  class: ZScoreRevert
+  enabled: true
+  symbols:
+  - IEF
+  params:
+    lookback: 48
+    entry_z: 1.5
+    exit_z: 0.189052
+    risk_fraction: 0.00625
+    hold_bars: 1
+- id: mut_g3_0006
+  class: GapFade
+  enabled: true
+  symbols:
+  - IEV
+  params:
+    gap_pct: 0.002333
+    hold_bars: 10
+    risk_fraction: 0.01
+    atr_period: 14
+    atr_stop_mult: 2.756758
+- id: anom_g1_0003
+  class: ZScoreRevert
+  enabled: true
+  symbols:
+  - INDA
+  params:
+    lookback: 12
+    entry_z: 2.0
+    exit_z: 0.5
+    risk_fraction: 0.0075
+    atr_period: 14
+    atr_stop_mult: 2.5
+- id: mut_g13_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - IWM
+  params:
+    gap_pct: 0.01548
+    hold_bars: 1
+    risk_fraction: 0.0075
+    atr_period: 14
+    atr_stop_mult: 1.812861
+- id: invent_g1_0000
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - LQD
+  params:
+    lookback: 10
+    atr_period: 20
+    atr_stop_mult: 2.0
+    risk_fraction: 0.0075
+- id: mut_g4_0008
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - QQQ
+  params:
+    lookback: 9
+    atr_period: 17
+    atr_stop_mult: 2.423494
+    risk_fraction: 0.010059
+- id: mut_g3_0007
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - SPY
+  params:
+    lookback: 10
+    atr_period: 14
+    atr_stop_mult: 2.003854
+    risk_fraction: 0.006084
+- id: xover_g2_0020
+  class: ZScoreRevert
+  enabled: true
+  symbols:
+  - TIP
+  params:
+    lookback: 40
+    entry_z: 1.5
+    exit_z: 0.235429
+    risk_fraction: 0.005498
+    atr_stop_mult: 1.812861
+- id: invent_g2_0006
+  class: ZScoreRevert
+  enabled: true
+  symbols:
+  - TLT
+  params:
+    lookback: 20
+    entry_z: 2.5
+    exit_z: 0.5
+    risk_fraction: 0.0075
+- id: mut_g48_0003
+  class: GapFade
+  enabled: true
+  symbols:
+  - UNG
+  params:
+    gap_pct: 0.0027375
+    hold_bars: 4
+    risk_fraction: 0.007891
+    atr_period: 28
+    atr_stop_mult: 0.25
+    entry_z: 1.192192
+- id: mut_g6_0005
+  class: GapFade
+  enabled: true
+  symbols:
+  - USO
+  params:
+    gap_pct: 0.001879
+    hold_bars: 10
+    risk_fraction: 0.01
+    atr_period: 15
+    atr_stop_mult: 2.4223505000000003
+- id: invent_g3_0003
+  class: SeasonalityWindow
+  enabled: true
+  symbols:
+  - VLUE
+  params:
+    window_code: 10
+    atr_period: 14
+    atr_stop_mult: 2.5
+    risk_fraction: 0.005
+- id: mut_g3_0008
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - VNQ
+  params:
+    channel_period: 16
+    atr_period: 18
+    atr_stop_mult: 2.209597
+    risk_fraction: 0.0041
+- id: invent_g2_0003
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - VTI
+  params:
+    lookback: 40
+    atr_period: 20
+    atr_stop_mult: 3.0
+    risk_fraction: 0.005
+- id: mut_g1_0009
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLC
+  params:
+    gap_pct: 0.012
+    hold_bars: 1
+    risk_fraction: 0.009245
+    atr_period: 19
+    atr_stop_mult: 1.698646
+- id: xover_g37_0016
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLE
+  params:
+    gap_pct: 0.00150275
+    hold_bars: 6
+    risk_fraction: 0.0070295
+    atr_period: 22
+    atr_stop_mult: 0.25
+    entry_z: 1.159693
+- id: invent_g5_0006
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLF
+  params:
+    gap_pct: 0.0015
+    hold_bars: 10
+    risk_fraction: 0.01
+    atr_period: 20
+    atr_stop_mult: 0.5
+- id: mut_g3_0009
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - XLI
+  params:
+    lookback: 9
+    atr_period: 14
+    atr_stop_mult: 2.0
+    risk_fraction: 0.0077
+- id: xover_g10_0021
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLK
+  params:
+    gap_pct: 0.0015
+    hold_bars: 11
+    risk_fraction: 0.009329
+    atr_period: 20
+    atr_stop_mult: 0.471651
+- id: mut_g2_0007
+  class: GapFade
+  enabled: true
+  symbols:
+  - XLU
+  params:
+    gap_pct: 0.012
+    hold_bars: 1
+    risk_fraction: 0.007195
+    atr_period: 10
+    atr_stop_mult: 3.51091
+    window_code: 3
+- id: invent_g3_0000
+  class: DonchianATR
+  enabled: true
+  symbols:
+  - XLV
+  params:
+    channel_period: 20
+    atr_period: 14
+    atr_stop_mult: 2.0
+    risk_fraction: 0.005
+- id: anom_g1_0001
+  class: ZScoreRevert
+  enabled: true
+  symbols:
+  - XLY
+  params:
+    lookback: 10
+    entry_z: 2.0
+    exit_z: 0.474946
+    risk_fraction: 0.0075
+    atr_period: 14
+    atr_stop_mult: 2.5

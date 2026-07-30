@@ -1,0 +1,37 @@
+strategies:
+- id: mut_g1461_0009
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - SOXX
+  params:
+    lookback: 20
+    atr_period: 18
+    atr_stop_mult: 4.315368
+    risk_fraction: 0.008438
+    channel_period: 25
+    exit_z: 0.446897
+- id: mut_g88_0009
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - SMH
+  params:
+    lookback: 15
+    atr_period: 15
+    atr_stop_mult: 4.343733
+    risk_fraction: 0.008530308593750001
+    channel_period: 24
+    exit_z: 0.370464484375
+- id: mut_g52_0009
+  class: BreakoutATR
+  enabled: true
+  symbols:
+  - IYW
+  params:
+    lookback: 21
+    atr_period: 23
+    atr_stop_mult: 3.851685
+    risk_fraction: 0.008482
+    channel_period: 24
+    exit_z: 0.378569

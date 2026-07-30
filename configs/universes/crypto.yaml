@@ -1,0 +1,65 @@
+# Liquid crypto majors via Yahoo Finance tickers
+# Discovery uses per-coin champions (equal weight), not aggregate_book swaps.
+id: crypto
+label: عملات رقمية
+label_en: Cryptocurrencies
+timeframe: 1d
+trade_default: false
+portfolio_mode: sector_champions
+# Ignore coins with too-short history (inflates OOS CAGR)
+min_bars_for_champion: 500
+symbols:
+  # Layer-1 majors
+  - BTC-USD
+  - ETH-USD
+  - SOL-USD
+  - BNB-USD
+  - XRP-USD
+  - ADA-USD
+  - AVAX-USD
+  - DOT-USD
+  - TRX-USD
+  - TON-USD
+  - NEAR-USD
+  - APT-USD
+  - SUI-USD
+  - ATOM-USD
+  - ICP-USD
+  - HBAR-USD
+  - ALGO-USD
+  - EGLD-USD
+  - FTM-USD
+  - SEI-USD
+  - INJ-USD
+  - TIA-USD
+  - STX-USD
+  # L2 / scaling
+  - MATIC-USD
+  - ARB-USD
+  - OP-USD
+  - IMX-USD
+  # DeFi / infra
+  - LINK-USD
+  - UNI-USD
+  - AAVE-USD
+  - MKR-USD
+  - LDO-USD
+  - CRV-USD
+  - GRT-USD
+  - FIL-USD
+  - RENDER-USD
+  - FET-USD
+  # Payments / legacy alts
+  - LTC-USD
+  - BCH-USD
+  - XLM-USD
+  - ETC-USD
+  - XMR-USD
+  # High-liquidity meme / retail (noisy but liquid; need enough history)
+  - DOGE-USD
+  - SHIB-USD
+  # Gaming / meta
+  - SAND-USD
+  - MANA-USD
+  - AXS-USD
+cost_profile: crypto

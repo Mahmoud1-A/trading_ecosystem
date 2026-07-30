@@ -1,0 +1,25 @@
+# Simulated prop-firm challenge rules (HARD gates by default)
+mode: HARD
+starting_equity: 100000.0
+max_daily_drawdown_pct: 5.0
+max_total_drawdown_pct: 10.0
+trailing_total_dd: true
+# Soft limits fire before hard (fraction of max_*_drawdown_pct)
+soft_daily_dd_frac: 0.70
+soft_total_dd_frac: 0.70
+slippage_reserve_bps: 5.0
+risk_per_trade_pct: 0.75
+max_symbol_exposure_pct: 25.0
+max_gross_exposure_pct: 100.0
+max_net_exposure_pct: 100.0
+max_cluster_exposure_pct: 40.0
+max_concurrent_positions: 40
+# Per-position notional so the full 40-sleeve fits under max_gross (100/40 = 2.5).
+# "auto" = max_gross_exposure_pct / max_concurrent_positions
+max_position_exposure_pct: auto
+# Sleeves on the same broker account share one risk scope
+account_risk_scope: unified
+news_block_minutes_before: 30
+news_block_minutes_after: 30
+flatten_on_daily_breach: true
+halt_on_total_breach: true

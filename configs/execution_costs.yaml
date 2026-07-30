@@ -1,0 +1,19 @@
+# Realistic execution costs for backtest / discovery / sim paper.
+# Market orders default to taker. Limit/passive can set intent.meta.liquidity = maker.
+
+profiles:
+  etf:
+    # Commission-free stocks/ETFs; model spread via slippage.
+    slippage_bps: 5.0
+    maker_fee_bps: 0.0
+    taker_fee_bps: 0.0
+    commission_per_share: 0.0
+    default_liquidity: taker
+
+  crypto:
+    # Typical CEX-style round-trip fees + wider slippage on daily bars.
+    slippage_bps: 10.0
+    maker_fee_bps: 15.0   # 0.15%
+    taker_fee_bps: 25.0   # 0.25%
+    commission_per_share: 0.0
+    default_liquidity: taker

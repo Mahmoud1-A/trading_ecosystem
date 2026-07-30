@@ -1,0 +1,50 @@
+# Traditional liquid ETF / macro book (current production universe)
+id: etf
+label: أصول تقليدية (ETFs)
+label_en: Traditional assets (ETFs)
+timeframe: 1d
+# Keep trading sleeve on this book by default
+trade_default: true
+symbols:
+  - SPY
+  - QQQ
+  - IWM
+  - DIA
+  - VTI
+  - XLF
+  - XLK
+  - XLE
+  - XLV
+  - XLI
+  - XLY
+  - XLP
+  - XLU
+  - XLB
+  - XLRE
+  - XLC
+  - EFA
+  - EEM
+  - VWO
+  - IEV
+  - EWJ
+  - FXI
+  - EWG
+  - INDA
+  - MTUM
+  - VLUE
+  - TLT
+  - IEF
+  - SHY
+  - LQD
+  - HYG
+  - TIP
+  - GLD
+  - SLV
+  - USO
+  - UNG
+  - DBA
+  - CPER
+  - PDBC
+  - VNQ
+cost_profile: etf
+portfolio_mode: aggregate_book

@@ -1,0 +1,144 @@
+# Algorithm discovery under HARD prop_rules.yaml (single source of truth for DD).
+target_cagr: 0.30
+min_trades: 8
+min_positive_oos_folds: 1
+max_winner_correlation: 0.65
+max_portfolio_size: 6
+# Combined book optimized for aggregate P&L (swap sector member only if book improves)
+portfolio_mode: aggregate_book
+portfolio_sector_rank: 1
+portfolio_require_passed: true
+portfolio_max_swap_trials: 8
+# Live/paper execution sleeve size (match Prop concurrent cap; discovery still owns full book)
+paper_live_size: 40
+top_n_report: 20
+leaderboard_size: 50
+# Independent of Top50: best N algorithms kept per symbol/sector
+best_per_sector: 3
+max_candidates_per_family: 80
+anomaly_top_patterns: 40
+random_seed: 42
+
+# Active discovery universe (configs/universes/<id>.yaml). Override via control panel / DISCOVERY_UNIVERSE.
+active_universe: etf
+
+# 24/7 evolutionary loop (te-discover --continuous)
+continuous:
+  batch_size: 40
+  elite_size: 14
+  # Core budget (24 logical): 22 discovery eval + 2 OS/monitor. Never oversubscribe.
+  # Book-swap phase uses up to 8 (sequential after eval; memory-heavy).
+  workers: 22
+  sleep_sec_between_generations: 1
+  book_workers: 8
+  readiness_every_n_gens: 1
+  readiness_skip_unchanged: true
+  # Prior on invent draws only (not a hard lock). Bias toward families with
+  # realistic daily-ETF edges; OOS / Prop / costs still decide winners.
+  invent_family_weights:
+    GapFade: 0.40
+    ZScoreRevert: 0.20
+    BreakoutATR: 0.15
+    DonchianATR: 0.15
+    SeasonalityWindow: 0.10
+  # Adaptive budget floors (P2) — static weights are priors, then ledger tilts
+  family_min_explore_weight: 0.08
+  use_adaptive_family_budget: true
+
+# Walk-forward: research splits + sealed Validation Vault (promotion-only)
+walk_forward:
+  train_ratio: 0.55
+  validate_ratio: 0.25
+  holdout_ratio: 0.0
+  vault_ratio: 0.20
+  seal_vault: true
+  use_yearly_rolls: true
+  min_bars_per_fold: 60
+
+# 40 liquid ETFs (same universe as symbols.yaml)
+symbols:
+  - SPY
+  - QQQ
+  - IWM
+  - DIA
+  - VTI
+  - XLF
+  - XLK
+  - XLE
+  - XLV
+  - XLI
+  - XLY
+  - XLP
+  - XLU
+  - XLB
+  - XLRE
+  - XLC
+  - EFA
+  - EEM
+  - VWO
+  - IEV
+  - EWJ
+  - FXI
+  - EWG
+  - INDA
+  - MTUM
+  - VLUE
+  - TLT
+  - IEF
+  - SHY
+  - LQD
+  - HYG
+  - TIP
+  - GLD
+  - SLV
+  - USO
+  - UNG
+  - DBA
+  - CPER
+  - PDBC
+  - VNQ
+
+families:
+  DonchianATR:
+    enabled: true
+    grids:
+      channel_period: [20, 40, 55]
+      atr_period: [14, 20]
+      atr_stop_mult: [2.0, 2.5, 3.0]
+      risk_fraction: [0.005, 0.0075]
+
+  BreakoutATR:
+    enabled: true
+    grids:
+      lookback: [10, 20, 40]
+      atr_period: [14, 20]
+      atr_stop_mult: [2.0, 2.5, 3.0]
+      risk_fraction: [0.005, 0.0075]
+
+  GapFade:
+    enabled: true
+    # Daily ETF gaps are typically micro (tenths of a percent), not 1–2%.
+    # Ranges are domain priors — not copied live-40 params; OOS still gates.
+    grids:
+      gap_pct: [0.001, 0.0015, 0.002, 0.003, 0.005, 0.008]
+      hold_bars: [2, 3, 5, 7, 10]
+      risk_fraction: [0.005, 0.0075, 0.01]
+      atr_period: [14, 20, 28]
+      atr_stop_mult: [0.5, 1.0, 1.5, 2.0, 2.5]
+
+  ZScoreRevert:
+    enabled: true
+    grids:
+      lookback: [10, 20, 40]
+      entry_z: [1.5, 2.0, 2.5]
+      exit_z: [0.25, 0.5]
+      risk_fraction: [0.005, 0.0075]
+
+  SeasonalityWindow:
+    enabled: true
+    grids:
+      # month 1-12; quarter coded as 101-104 for Q1-Q4
+      window_code: [1, 4, 10, 11, 101, 104]
+      atr_period: [14]
+      atr_stop_mult: [2.5]
+      risk_fraction: [0.005, 0.0075]

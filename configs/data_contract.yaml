@@ -1,0 +1,34 @@
+# Unified market-data / execution semantics for strategies & promotion artifacts.
+timezone: America/New_York
+calendar: primary_exchange
+price_source: yfinance  # not SIP; IEX≠SIP — document before live promotion
+price_adjustment_default: split  # discovery pin; strategies cannot choose at search time
+series:
+  raw:
+    description: Unadjusted OHLC (splits/dividends not removed)
+    path_suffix: raw
+  split_adjusted:
+    description: Split-adjusted only (preferred for GapFade gap math)
+    path_suffix: split
+  total_return:
+    description: Split+dividend adjusted (Yahoo auto_adjust) — do NOT use for micro-gap signals
+    path_suffix: ""  # legacy default parquet
+strategy_series_pin:
+  GapFade: split_adjusted
+  BreakoutATR: total_return
+  DonchianATR: total_return
+  ZScoreRevert: total_return
+  SeasonalityWindow: total_return
+gapfade:
+  execution_model: post_open
+  auction_mode: unsupported
+  entry_price_definition: next_session_open_after_gap_signal
+  exit_price_definition: stop_or_hold_bars_close
+  gap_numerator: session_open
+  gap_denominator: prior_session_close
+  corporate_action_policy: use_split_adjusted_series_not_total_return
+signal_timestamp: bar_session_date_open_decision
+corporate_action_policy: store_raw_and_split_separately_forbid_search_time_choice
+warnings:
+  - "Alpaca IEX is not equivalent to SIP consolidated quotes."
+  - "Corporate actions may arrive late; freeze data hashes at promotion."

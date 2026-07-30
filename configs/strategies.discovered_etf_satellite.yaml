@@ -1,0 +1,89 @@
+strategies:
+- id: mut_g149_0005
+  class: GapFade
+  enabled: true
+  symbols:
+  - OIH
+  params:
+    gap_pct: 0.000572
+    hold_bars: 5
+    risk_fraction: 0.004652
+    atr_period: 14
+    atr_stop_mult: 0.25
+- id: xover_g81_0014
+  class: GapFade
+  enabled: true
+  symbols:
+  - COPX
+  params:
+    gap_pct: 0.00051
+    hold_bars: 8
+    risk_fraction: 0.00699125
+    atr_period: 18
+    atr_stop_mult: 0.25
+- id: mut_g231_0007
+  class: GapFade
+  enabled: true
+  symbols:
+  - XOP
+  params:
+    gap_pct: 0.000567
+    hold_bars: 5
+    risk_fraction: 0.005236
+    atr_period: 12
+    atr_stop_mult: 0.25
+- id: mut_g233_0012
+  class: GapFade
+  enabled: true
+  symbols:
+  - KWEB
+  params:
+    gap_pct: 0.000567
+    hold_bars: 4
+    risk_fraction: 0.004887
+    atr_period: 14
+    atr_stop_mult: 0.25
+- id: mut_g120_0000
+  class: GapFade
+  enabled: true
+  symbols:
+  - URA
+  params:
+    gap_pct: 0.0005
+    hold_bars: 5
+    risk_fraction: 0.005236
+    atr_period: 24
+    atr_stop_mult: 0.25
+- id: mut_g81_0002
+  class: GapFade
+  enabled: true
+  symbols:
+  - GDX
+  params:
+    gap_pct: 0.00051
+    hold_bars: 8
+    risk_fraction: 0.006742
+    atr_period: 19
+    atr_stop_mult: 0.25
+- id: xover_g107_0015
+  class: GapFade
+  enabled: true
+  symbols:
+  - SMH
+  params:
+    gap_pct: 0.0005
+    hold_bars: 7
+    risk_fraction: 0.008456
+    atr_period: 20
+    atr_stop_mult: 0.2509825
+- id: mut_g219_0009
+  class: GapFade
+  enabled: true
+  symbols:
+  - JETS
+  params:
+    gap_pct: 0.0005
+    hold_bars: 5
+    risk_fraction: 0.004652
+    atr_period: 10
+    atr_stop_mult: 0.25
