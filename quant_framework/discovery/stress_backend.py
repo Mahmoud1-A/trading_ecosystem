@@ -23,6 +23,34 @@ if TYPE_CHECKING:
 
 SYNTHETIC_STRESS_FORBIDDEN = "SYNTHETIC_STRESS_FORBIDDEN"
 STRESS_BACKEND_KIND = "real_event_driven"
+STRESS_BASELINE_TRADES_UNAVAILABLE = "STRESS_BASELINE_TRADES_UNAVAILABLE"
+UNSUPPORTED_STRESS_SCENARIO = "UNSUPPORTED_STRESS_SCENARIO"
+NOT_APPLICABLE_SINGLE_SYMBOL = "NOT_APPLICABLE_SINGLE_SYMBOL"
+# Fraction (by count) of top realized net-PnL closed trades removed for the
+# "removed_best_trades" scenario — distinct from "removed_best_day", which
+# removes only the single highest realized net-PnL calendar day.
+REMOVED_BEST_TRADES_FRACTION = 0.1
+# Scenario names the real Stress path knows how to execute or explicitly
+# mark not-applicable/unavailable. Anything else is UNSUPPORTED_STRESS_SCENARIO.
+KNOWN_STRESS_SCENARIOS = frozenset(
+    {
+        "base_costs",
+        "costs_2x",
+        "costs_4x",
+        "wider_spread",
+        "worse_slippage",
+        "delayed_execution",
+        "conservative_intrabar",
+        "reduced_participation",
+        "alt_wfo_alignment",
+        "alt_start_dates",
+        "parameter_perturbation",
+        "regime_exclusion",
+        "removed_best_day",
+        "removed_best_trades",
+        "symbol_exclusion",
+    }
+)
 
 
 def _copy_cost(cost: CostModel, **updates: Any) -> CostModel:
@@ -107,13 +135,6 @@ def _perturb_candidate(candidate: StrategyCandidate, scenario: str) -> StrategyC
     )
 
 
-def _day_key(ts: Any) -> str:
-    t = pd.Timestamp(ts)
-    if t.tzinfo is None:
-        t = t.tz_localize("UTC")
-    return str(t.floor("D"))
-
-
 def _drop_calendar_days(bars: pd.DataFrame, days: set[str]) -> pd.DataFrame:
     work = bars.copy()
     if "timestamp" in work.columns:
@@ -142,12 +163,63 @@ class StressScenarioBackend:
         return self.inner.evaluate(cand)
 
 
+@dataclass
+class StressScenarioStatus:
+    """A Stress scenario that was NOT genuinely rerun against the real backend.
+
+    Used for ``NOT_APPLICABLE_SINGLE_SYMBOL``, ``UNSUPPORTED_STRESS_SCENARIO``,
+    and ``STRESS_BASELINE_TRADES_UNAVAILABLE``. Never calls a real backend and
+    never fabricates fold metrics — :class:`StressTester` must detect
+    ``stress_status`` and record it as excluded from pass/fail/executed and
+    the pass-rate denominator, instead of silently rerunning the baseline.
+    """
+
+    scenario: str
+    stress_status: str
+    backend_kind: str = "stress_status_no_rerun"
+    is_full_event_wfo: bool = False
+
+    def evaluate(self, candidate: StrategyCandidate) -> tuple[list[FoldOOSMetrics], dict[str, float]]:
+        return [], {"signal_source": "not_executed", "stress_status": self.stress_status}
+
+
+def _day_key(ts: Any) -> str:
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    return str(t.floor("D"))
+
+
+def _extract_closed_trades(baseline_artifacts: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Real baseline closed-trade records from the last real backend run.
+
+    Returns an empty list (never a fabricated fallback) when unavailable so
+    callers can honestly report ``STRESS_BASELINE_TRADES_UNAVAILABLE``.
+    """
+    if not baseline_artifacts:
+        return []
+    trades = baseline_artifacts.get("closed_trades")
+    return list(trades) if trades else []
+
+
+def _aggregate_daily_net_pnl(trades: list[dict[str, Any]]) -> dict[str, float]:
+    """Realized net PnL aggregated by the calendar day each trade closed on."""
+    daily: dict[str, float] = {}
+    for t in trades:
+        ts = t.get("exit_time")
+        if not ts:
+            continue
+        day = _day_key(ts)
+        daily[day] = daily.get(day, 0.0) + float(t.get("net_pnl", 0.0) or 0.0)
+    return daily
+
+
 def build_stress_backend_for_scenario(
     base: Any,
     scenario: str,
     *,
     baseline_artifacts: dict[str, Any] | None = None,
-) -> StressScenarioBackend:
+) -> StressScenarioBackend | StressScenarioStatus:
     """Build a real stress backend that mutates execution context, not metrics."""
     assert base._context is not None
     cost = base._context.cost_model
@@ -231,37 +303,59 @@ def build_stress_backend_for_scenario(
     elif scenario == "parameter_perturbation":
         transform = lambda c, s=scenario: _perturb_candidate(c, s)  # noqa: E731
         exec_changes = {"parameter_perturbation": True}
-    elif scenario in {"removed_best_day", "removed_best_trades"} and bars is not None:
-        arts = baseline_artifacts or {}
-        # Prefer day keys collected from baseline fold trade timestamps.
-        day_pnls: dict[str, float] = {}
-        for fold in arts.get("folds") or []:
-            # folds from EventDrivenWFO may nest validation trade rows differently;
-            # fall back to oos_ranges midpoints if trade rows absent.
-            for key in ("validation_start_ts", "train_start_ts"):
-                if fold.get(key):
-                    day_pnls[_day_key(fold[key])] = day_pnls.get(_day_key(fold[key]), 0.0) + float(
-                        fold.get("validation_metric", 0.0) or 0.0
-                    )
-        for row in arts.get("oos_ranges") or []:
-            if row.get("start"):
-                d = _day_key(row["start"])
-                day_pnls[d] = day_pnls.get(d, 0.0) + 1.0
-        if day_pnls:
-            best_day = max(day_pnls.items(), key=lambda kv: kv[1])[0]
-            bars = _drop_calendar_days(bars, {best_day})
-            exec_changes = {"removed_days": [best_day], "mode": scenario}
-        else:
-            # Deterministic fallback: drop the middle calendar day present in the sample.
-            if "timestamp" in bars.columns:
-                ts = pd.to_datetime(bars["timestamp"], utc=True)
-            else:
-                ts = pd.to_datetime(bars.index, utc=True)
-            days = sorted({_day_key(t) for t in ts})
-            if days:
-                mid = days[len(days) // 2]
-                bars = _drop_calendar_days(bars, {mid})
-                exec_changes = {"removed_days": [mid], "mode": scenario, "fallback": True}
+    elif scenario == "removed_best_day":
+        if bars is None:
+            return StressScenarioStatus(scenario=scenario, stress_status=STRESS_BASELINE_TRADES_UNAVAILABLE)
+        trades = _extract_closed_trades(baseline_artifacts)
+        daily_pnl = _aggregate_daily_net_pnl(trades)
+        if not daily_pnl:
+            # Honest failure — never infer the "best day" from fold metrics,
+            # OOS range boundaries, or an arbitrary middle date.
+            return StressScenarioStatus(scenario=scenario, stress_status=STRESS_BASELINE_TRADES_UNAVAILABLE)
+        best_day, best_day_pnl = max(daily_pnl.items(), key=lambda kv: kv[1])
+        removed = [t for t in trades if t.get("exit_time") and _day_key(t["exit_time"]) == best_day]
+        bars = _drop_calendar_days(bars, {best_day})
+        exec_changes = {
+            "removed_day": best_day,
+            "baseline_day_net_pnl": best_day_pnl,
+            "removed_trade_ids": [t.get("trade_id") for t in removed],
+            "removed_trade_timestamps": [t.get("exit_time") for t in removed],
+            "rerun_methodology": (
+                "aggregated_realized_net_pnl_by_exit_day_from_baseline_closed_trades; "
+                "removed_calendar_day_with_highest_net_pnl; reran_real_event_driven_backend"
+            ),
+        }
+    elif scenario == "removed_best_trades":
+        if bars is None:
+            return StressScenarioStatus(scenario=scenario, stress_status=STRESS_BASELINE_TRADES_UNAVAILABLE)
+        trades = _extract_closed_trades(baseline_artifacts)
+        if not trades:
+            return StressScenarioStatus(scenario=scenario, stress_status=STRESS_BASELINE_TRADES_UNAVAILABLE)
+        ranked = sorted(trades, key=lambda t: float(t.get("net_pnl", 0.0) or 0.0), reverse=True)
+        n_remove = max(1, int(round(len(ranked) * REMOVED_BEST_TRADES_FRACTION)))
+        removed = ranked[:n_remove]
+        removed_days = {_day_key(t["exit_time"]) for t in removed if t.get("exit_time")}
+        if removed_days:
+            bars = _drop_calendar_days(bars, removed_days)
+        exec_changes = {
+            "removed_trade_ids": [t.get("trade_id") for t in removed],
+            "removed_trade_timestamps": [t.get("exit_time") for t in removed],
+            "removed_fraction": REMOVED_BEST_TRADES_FRACTION,
+            "baseline_removed_net_pnl": float(
+                sum(float(t.get("net_pnl", 0.0) or 0.0) for t in removed)
+            ),
+            "rerun_methodology": (
+                "ranked_baseline_closed_trades_by_realized_net_pnl_desc; "
+                f"removed_top_{REMOVED_BEST_TRADES_FRACTION:.0%}_by_trade_count; "
+                "dropped_calendar_days_containing_those_trade_exit_timestamps; "
+                "reran_real_event_driven_backend; NOT_an_alias_for_removed_best_day"
+            ),
+        }
+    elif scenario == "symbol_exclusion":
+        # This codebase only ever runs single-symbol campaigns (asset_universe
+        # is always a single instrument) — there is no multi-symbol universe
+        # to defensibly exclude a member from.
+        return StressScenarioStatus(scenario=scenario, stress_status=NOT_APPLICABLE_SINGLE_SYMBOL)
     elif scenario == "regime_exclusion" and bars is not None:
         # Drop bars in the strongest absolute trend tercile using causal features.
         from features.regime_features import compute_regime_features
@@ -283,12 +377,9 @@ def build_stress_backend_for_scenario(
             exec_changes = {"regime_exclusion_abs_trend_cap": thr}
         except Exception as exc:  # noqa: BLE001
             exec_changes = {"regime_exclusion_error": str(exc)}
-    elif scenario == "symbol_exclusion":
-        # Single-symbol research path: treat as no-op re-run (still real backend).
-        exec_changes = {"symbol_exclusion": "noop_single_symbol"}
-    else:
-        # Unknown scenario still uses real base backend (no synthetic haircut).
-        exec_changes = {"unmodified_passthrough": True}
+    elif scenario not in KNOWN_STRESS_SCENARIOS:
+        # Unknown scenario name — never silently rerun the unchanged baseline.
+        return StressScenarioStatus(scenario=scenario, stress_status=UNSUPPORTED_STRESS_SCENARIO)
 
     inner = _clone_event_backend(
         base,

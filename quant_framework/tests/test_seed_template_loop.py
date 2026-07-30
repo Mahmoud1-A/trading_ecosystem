@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -209,6 +210,33 @@ class TestDiversityExhaustion:
         assert counters.duplicate_attempts >= 1
 
 
+@dataclass
+class _FakeFullWfoBackend(SyntheticOOSBackend):
+    """Test double that HONESTLY proves full-WFO completion.
+
+    Merely flipping ``is_full_event_wfo`` on a synthetic backend is no longer
+    sufficient to advance the Full WFO budget (Phase 1 fix) — the evaluator now
+    requires the backend's own returned artifacts to prove completion
+    (``signal_source == candidate_dsl_trees``, ``is_full_event_wfo`` in the
+    train-metrics payload, and ``wfo_completed_folds > 0``). This double
+    supplies those artifacts so budget/plumbing tests stay fast without a real
+    event-driven backend.
+    """
+
+    is_full_event_wfo: bool = True
+    backend_kind: str = "event_driven_wfo"
+
+    def evaluate(self, candidate):
+        folds, train = super().evaluate(candidate)
+        train = {
+            **train,
+            "signal_source": "candidate_dsl_trees",
+            "is_full_event_wfo": True,
+            "wfo_completed_folds": len(folds),
+        }
+        return folds, train
+
+
 class TestFortyCandidateWfoReach:
     def test_forty_candidate_run_reaches_real_wfo(self, tmp_path: Path) -> None:
         """A 40-candidate synthetic run must evaluate via backend (WFO path active)."""
@@ -221,9 +249,9 @@ class TestFortyCandidateWfoReach:
             max_runtime_seconds=45.0,
         )
         ctrl = SearchController(registry=reg, budget=budget, seed=21)
-        # Mark synthetic backend as full WFO so full_wfo counter advances
-        backend = SyntheticOOSBackend(seed_salt=7)
-        backend.is_full_event_wfo = True  # type: ignore[attr-defined]
+        # A backend that truthfully reports full-WFO completion artifacts so
+        # the Full WFO counter advances (see _FakeFullWfoBackend docstring).
+        backend = _FakeFullWfoBackend(seed_salt=7)
         ctrl.evaluator.backend = backend
 
         eval_ids: list[str] = []

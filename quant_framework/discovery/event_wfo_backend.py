@@ -271,6 +271,14 @@ class EventDrivenDiscoveryBackend:
     last_run_artifacts: dict[str, Any] = field(default_factory=dict)
     available_feature_ids: frozenset[str] | None = None
     dataset_capabilities: tuple[str, ...] = ()
+    # Feature-capability resolution outcome — "unresolved" | "resolved" | "failed".
+    # CandidateEvaluator reads this to fail closed on research-eligible runs
+    # instead of silently treating an unresolved capability set as "no check".
+    feature_resolution_status: str = "unresolved"
+    feature_resolution_error: str | None = None
+    feature_resolution_exception: BaseException | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.bars is None:
@@ -334,7 +342,9 @@ class EventDrivenDiscoveryBackend:
                 freq=freq,
                 bars_per_year=252 * bpd,
             )
-        if self.available_feature_ids is None and self.bars is not None:
+        if self.available_feature_ids is not None:
+            self.feature_resolution_status = "resolved"
+        elif self.bars is not None:
             try:
                 from features.generator import FeatureGenerator
 
@@ -351,8 +361,15 @@ class EventDrivenDiscoveryBackend:
                 self.dataset_capabilities = tuple(
                     sorted(str(c) for c in (ff.meta or {}).get("capabilities", []))
                 )
-            except Exception:  # noqa: BLE001 — leave None; evaluator skips check
+                self.feature_resolution_status = "resolved"
+            except Exception as exc:  # noqa: BLE001 — recorded, not swallowed
+                # Leave available_feature_ids as None but preserve the original
+                # exception and a status the evaluator can fail closed on for
+                # research-eligible execution (FEATURE_CAPABILITY_RESOLUTION_FAILED).
                 self.available_feature_ids = None
+                self.feature_resolution_status = "failed"
+                self.feature_resolution_error = f"{type(exc).__name__}: {exc}"
+                self.feature_resolution_exception = exc
 
     def evaluate(self, candidate: StrategyCandidate) -> tuple[list[FoldOOSMetrics], dict[str, float]]:
         assert self.bars is not None and self.wfo_config is not None and self._context is not None
@@ -404,6 +421,7 @@ class EventDrivenDiscoveryBackend:
         training_ranges: list[dict[str, str]] = []
         oos_ranges: list[dict[str, str]] = []
         fold_funnels: list[dict[str, Any]] = []
+        closed_trades: list[dict[str, Any]] = []
         for fr in result.folds:
             val = fr.validation_run
             net = val.net_metrics if val else {}
@@ -415,6 +433,11 @@ class EventDrivenDiscoveryBackend:
                 signal_entry_count += int(funnel.get("entry_true_count", 0))
                 signal_exit_count += int(funnel.get("exit_true_count", 0))
                 fold_funnels.append({"fold_id": fr.fold_id, "phase": "validation_oos", **funnel})
+                for t in val.trades or ():
+                    trade = dict(t)
+                    trade["fold_id"] = fr.fold_id
+                    trade["phase"] = "validation_oos"
+                    closed_trades.append(trade)
             if fr.train_run:
                 order_count += len(fr.train_run.orders)
                 fill_count += len(fr.train_run.fills)
@@ -457,6 +480,11 @@ class EventDrivenDiscoveryBackend:
             "dsl_missing_features": list(dsl_stats.missing_features),
             "fold_trade_funnels": fold_funnels,
             "folds": [f.as_dict() for f in result.folds],
+            "wfo_completed_folds": len(result.folds),
+            # Real closed-trade records (validation/OOS only) — the honest basis
+            # for Stress "removed_best_day" / "removed_best_trades" scenarios;
+            # never inferred from fold-level metrics or OOS range boundaries.
+            "closed_trades": closed_trades,
         }
         self.last_run_artifacts = artifact_payload
         if self.artifact_dir is not None:

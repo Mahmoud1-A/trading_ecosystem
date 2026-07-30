@@ -121,6 +121,7 @@ class SearchController:
             discovery_run_id=self.discovery_run_id,
             grammar=self.generator.grammar,
             progress_hook=self.progress_hook,
+            research_eligible=bool(self.research_eligible),
         )
         forbid = bool(self.synthetic_stress_forbidden or self.research_eligible)
         self.stress_tester = StressTester(
@@ -142,6 +143,7 @@ class SearchController:
             self.research_eligible = bool(research_eligible)
         forbid = bool(self.synthetic_stress_forbidden or self.research_eligible)
         self.evaluator.backend = backend
+        self.evaluator.research_eligible = bool(self.research_eligible)
         avail = getattr(backend, "available_feature_ids", None)
         if avail is not None:
             self.evaluator.available_feature_ids = frozenset(avail)
@@ -618,8 +620,17 @@ class SearchController:
             rec.robustness_results = {r.parameter: r.as_dict() for r in rob}
             instability = self.robustness.instability_score(rob)
 
-            # Re-score with stress/robustness penalties for promotion threshold
-            pass_rate = sum(1 for s in stress if s.passed) / len(stress) if stress else 1.0
+            # Re-score with stress/robustness penalties for promotion threshold.
+            # Scenarios that were not genuinely executed (e.g. symbol_exclusion
+            # on a single-symbol campaign, unsupported/unknown scenarios, or a
+            # baseline-trades-unavailable status) must not count as passed,
+            # failed, or be part of the pass-rate denominator.
+            executed_stress = [s for s in stress if getattr(s, "status", "executed") == "executed"]
+            pass_rate = (
+                sum(1 for s in executed_stress if s.passed) / len(executed_stress)
+                if executed_stress
+                else 1.0
+            )
             frozen = freeze_candidate(
                 cand,
                 oos_fitness=rec.fitness.fitness,

@@ -587,16 +587,24 @@ class MultiFamilyCampaign:
                     getattr(self.backend, "dataset_capabilities", ()) or ()
                 )
             for cand in take:
+                # Authoritative counter delta: the evaluator only advances
+                # counters.full_wfo when a real WFO evaluation completed and
+                # its own returned artifacts prove it (signal_source ==
+                # candidate_dsl_trees, is_full_event_wfo == True,
+                # completed_fold_count > 0). This is the single source of
+                # truth — outcomes like PRECHECK_FAILED, INVALID_DSL_TYPE,
+                # DUPLICATE_SKIPPED, FEATURE_UNAVAILABLE, or an evaluation
+                # exception never move this counter.
+                prev_full_wfo = ev.counters.full_wfo
                 rec = ev.evaluate(cand)
                 records_by_family[fid].append(rec)
                 evaluated_ids[fid].add(cand.candidate_id)
-                # FEATURE_UNAVAILABLE must not consume Full WFO budget.
+                if ev.counters.full_wfo > prev_full_wfo:
+                    full_wfo_counts[fid] += 1
+                # FEATURE_UNAVAILABLE must not consume Full WFO budget or
+                # count toward early-phase scoring/candidate tracking.
                 if rec.outcome is EvalOutcome.FEATURE_UNAVAILABLE:
                     continue
-                if bool(getattr(self.backend, "is_full_event_wfo", False)):
-                    full_wfo_counts[fid] += 1
-                elif rec.outcome is not EvalOutcome.DUPLICATE_SKIPPED:
-                    full_wfo_counts[fid] += 1
                 early_candidate_ids[fid].append(cand.candidate_id)
                 if rec.fitness is not None and not rec.fitness.rejected:
                     early_scores[fid] = max(early_scores[fid], float(rec.fitness.fitness))

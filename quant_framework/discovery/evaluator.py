@@ -12,6 +12,10 @@ import numpy as np
 
 from discovery.candidate import StrategyCandidate
 from discovery.expression_tree import DSLValidationError
+from discovery.feature_domains import (
+    INVALID_FEATURE_THRESHOLD_DOMAIN,
+    collect_candidate_threshold_violations,
+)
 from discovery.fitness import (
     RANKING_SOURCE_OOS,
     FoldOOSMetrics,
@@ -31,6 +35,8 @@ from registry.experiment_registry import ExperimentRegistry, TrialStatus
 
 
 FEATURE_UNAVAILABLE = "FEATURE_UNAVAILABLE"
+FEATURE_CAPABILITY_RESOLUTION_FAILED = "FEATURE_CAPABILITY_RESOLUTION_FAILED"
+PERMISSIVE_NON_RESEARCH_FALLBACK = "permissive_non_research_fallback"
 
 
 class EvalOutcome(str, Enum):
@@ -39,6 +45,8 @@ class EvalOutcome(str, Enum):
     PRECHECK_FAILED = "PRECHECK_FAILED"
     INVALID_DSL_TYPE = "INVALID_DSL_TYPE"
     FEATURE_UNAVAILABLE = "FEATURE_UNAVAILABLE"
+    FEATURE_CAPABILITY_RESOLUTION_FAILED = "FEATURE_CAPABILITY_RESOLUTION_FAILED"
+    INVALID_FEATURE_THRESHOLD_DOMAIN = "INVALID_FEATURE_THRESHOLD_DOMAIN"
     EVAL_FAILED = "EVAL_FAILED"
     RISK_FAILED = "RISK_FAILED"
     WFO_FAILED = "WFO_FAILED"
@@ -164,6 +172,10 @@ class CandidateEvaluator:
     # When set, reject candidates whose feature_ids are not subset before Full WFO.
     available_feature_ids: frozenset[str] | None = None
     dataset_capabilities: tuple[str, ...] = ()
+    # Research-eligible execution must fail closed when feature-capability
+    # resolution failed; non-research smoke runs may remain permissive but
+    # the fact is always recorded on the evaluation record (never hidden).
+    research_eligible: bool = False
     _seen_candidate_ids: set[str] = field(default_factory=set)
     _records: list[EvaluationRecord] = field(default_factory=list)
 
@@ -391,6 +403,98 @@ class CandidateEvaluator:
             )
             return rec
 
+        # Semantic threshold-domain validation — runs regardless of creation
+        # path (generation, mutation, crossover, import, manual construction,
+        # or robustness perturbation) since generation-time checks alone can
+        # be bypassed by all of those. Rejects before Full WFO; zero budget
+        # consumed.
+        violations = collect_candidate_threshold_violations(candidate, self.grammar)
+        if violations:
+            artifact = {"violations": [v.as_dict() for v in violations]}
+            trial_id = self._register(
+                candidate,
+                rejection_reason=INVALID_FEATURE_THRESHOLD_DOMAIN,
+                ranking_score=None,
+                net_metrics={"invalid_feature_threshold_domain": True, **artifact},
+                trial_status=TrialStatus.FAILED,
+                failure_reason=INVALID_FEATURE_THRESHOLD_DOMAIN,
+                extra_snapshot={"threshold_domain_violations": artifact},
+            )
+            rec = EvaluationRecord(
+                outcome=EvalOutcome.INVALID_FEATURE_THRESHOLD_DOMAIN,
+                candidate_id=candidate.candidate_id,
+                lineage_id=candidate.lineage_id,
+                trial_id=trial_id,
+                fitness=None,
+                rejection_reason=INVALID_FEATURE_THRESHOLD_DOMAIN,
+                runtime_seconds=time.perf_counter() - t0,
+                meta=artifact,
+            )
+            self._records.append(rec)
+            self._emit_progress(
+                "CANDIDATE_REJECTED",
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "reason": INVALID_FEATURE_THRESHOLD_DOMAIN,
+                    **artifact,
+                },
+            )
+            return rec
+
+        # Feature-capability resolution must fail closed for research-eligible
+        # execution — an unresolved capability set is not a green light to
+        # skip validation, it is a stop condition. Non-research smoke runs may
+        # remain permissive, but the fact is always labeled on the record.
+        backend_resolution_status = getattr(self.backend, "feature_resolution_status", None)
+        feature_resolution_note: dict[str, Any] = {}
+        if backend_resolution_status == "failed":
+            resolution_error = getattr(self.backend, "feature_resolution_error", None)
+            if self.research_eligible:
+                artifact = {
+                    "research_eligible": True,
+                    "feature_resolution_status": FEATURE_CAPABILITY_RESOLUTION_FAILED,
+                    "resolution_error": resolution_error,
+                    "available_features": None,
+                    "dataset_capabilities": list(self.dataset_capabilities),
+                    "candidate_id": candidate.candidate_id,
+                    "full_wfo_consumed": False,
+                }
+                trial_id = self._register(
+                    candidate,
+                    rejection_reason=FEATURE_CAPABILITY_RESOLUTION_FAILED,
+                    ranking_score=None,
+                    net_metrics={"feature_capability_resolution_failed": True, **artifact},
+                    trial_status=TrialStatus.FAILED,
+                    failure_reason=resolution_error or FEATURE_CAPABILITY_RESOLUTION_FAILED,
+                    extra_snapshot={"feature_capability_resolution": artifact},
+                )
+                rec = EvaluationRecord(
+                    outcome=EvalOutcome.FEATURE_CAPABILITY_RESOLUTION_FAILED,
+                    candidate_id=candidate.candidate_id,
+                    lineage_id=candidate.lineage_id,
+                    trial_id=trial_id,
+                    fitness=None,
+                    rejection_reason=FEATURE_CAPABILITY_RESOLUTION_FAILED,
+                    runtime_seconds=time.perf_counter() - t0,
+                    meta=artifact,
+                )
+                self._records.append(rec)
+                self._emit_progress(
+                    "CANDIDATE_REJECTED",
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "reason": FEATURE_CAPABILITY_RESOLUTION_FAILED,
+                        **artifact,
+                    },
+                )
+                return rec
+            # Explicit non-research smoke fallback — permissive, but labeled so
+            # it can never be confused with a real research evaluation.
+            feature_resolution_note = {
+                "feature_resolution_status": PERMISSIVE_NON_RESEARCH_FALLBACK,
+                "resolution_error": resolution_error,
+            }
+
         # Fail before Full WFO when required features are unavailable.
         avail = self.available_feature_ids
         if avail is None:
@@ -478,8 +582,20 @@ class CandidateEvaluator:
             return rec
 
         self.counters.evaluated += 1
-        # Full WFO budget only advances on institutional event-driven backends.
-        if bool(getattr(self.backend, "is_full_event_wfo", False)):
+        # Full WFO budget only advances when a real WFO evaluation actually
+        # completed and the backend's own returned artifacts prove it — being
+        # "an event-driven backend" is not sufficient on its own. All prior
+        # early-exit paths (duplicate, precheck, invalid DSL, feature
+        # unavailable, eval exception) already returned before this line and
+        # therefore never consume Full WFO budget.
+        completed_fold_count = int(train_metrics.get("wfo_completed_folds", len(oos_folds)))
+        is_full_wfo_completion = (
+            bool(getattr(self.backend, "is_full_event_wfo", False))
+            and train_metrics.get("signal_source") == "candidate_dsl_trees"
+            and bool(train_metrics.get("is_full_event_wfo", False))
+            and completed_fold_count > 0
+        )
+        if is_full_wfo_completion:
             self.counters.full_wfo += 1
 
         fit = self.fitness_model.score(
@@ -522,6 +638,7 @@ class CandidateEvaluator:
                 oos_folds=oos_folds,
                 train_metrics=train_metrics,
                 runtime_seconds=time.perf_counter() - t0,
+                meta={"is_full_wfo_completion": is_full_wfo_completion, **feature_resolution_note},
             )
             self._records.append(rec)
             self._emit_progress(
@@ -552,6 +669,7 @@ class CandidateEvaluator:
                 oos_folds=oos_folds,
                 train_metrics=train_metrics,
                 runtime_seconds=time.perf_counter() - t0,
+                meta={"is_full_wfo_completion": is_full_wfo_completion, **feature_resolution_note},
             )
             self._records.append(rec)
             self._emit_progress(
@@ -576,6 +694,7 @@ class CandidateEvaluator:
             )
             if k in train_metrics
         }
+        wfo_meta["is_full_wfo_completion"] = is_full_wfo_completion
         trial_id = self._register(
             candidate,
             rejection_reason=None,
@@ -595,6 +714,7 @@ class CandidateEvaluator:
             oos_folds=oos_folds,
             train_metrics=train_metrics,
             runtime_seconds=time.perf_counter() - t0,
+            meta={"is_full_wfo_completion": is_full_wfo_completion, **feature_resolution_note},
         )
         self._records.append(rec)
         self.counters.runtime_seconds += rec.runtime_seconds

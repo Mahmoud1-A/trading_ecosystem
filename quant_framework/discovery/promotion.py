@@ -85,9 +85,11 @@ class PromotionGate:
             )
 
         stress = stress_results or []
-        pass_rate = (
-            sum(1 for s in stress if s.passed) / len(stress) if stress else 1.0
-        )
+        # Non-executed scenarios (not-applicable single-symbol exclusion,
+        # unsupported/unknown scenario names, baseline-trades-unavailable)
+        # must never inflate or deflate the promotion pass-rate denominator.
+        executed = [s for s in stress if getattr(s, "status", "executed") == "executed"]
+        pass_rate = sum(1 for s in executed if s.passed) / len(executed) if executed else 1.0
         if pass_rate < self.min_stress_pass_rate:
             return PromotionDecision(
                 status=PromotionStatus.HELD,

@@ -6,6 +6,7 @@ import numpy as np
 
 from discovery.candidate import StrategyCandidate, build_candidate
 from discovery.expression_tree import DSLValidationError, ExprNode, constant_node, feature_node, op_node
+from discovery.feature_domains import domain_for_context
 from discovery.grammar import Grammar
 from discovery.operators import OPERATOR_REGISTRY, OperatorId
 from discovery.prechecks import structural_precheck
@@ -20,6 +21,43 @@ class Mutator:
 
     def _nodes(self, tree: ExprNode) -> list[ExprNode]:
         return list(tree.walk())
+
+    def _node_contexts(
+        self, tree: ExprNode
+    ) -> list[tuple[OperatorId | None, int | None, ExprNode | None]]:
+        """Parent-operator context for each node, in the same pre-order as ``_nodes``.
+
+        For node at walk-index ``i``, returns ``(parent_op, idx_in_parent, sibling)``
+        so a CONSTANT replacement can be sampled from the domain implied by its
+        position (e.g. the feature it is compared against, or an ATR multiplier
+        slot) instead of a blind multiplicative jitter.
+        """
+        contexts: list[tuple[OperatorId | None, int | None, ExprNode | None]] = []
+
+        def _walk(
+            node: ExprNode,
+            parent_op: OperatorId | None,
+            idx_in_parent: int | None,
+            sibling: ExprNode | None,
+        ) -> None:
+            contexts.append((parent_op, idx_in_parent, sibling))
+            if node.kind is NodeKind.OPERATOR:
+                op = OperatorId(node.name)
+                kids = node.children
+                for i, child in enumerate(kids):
+                    if len(kids) == 3:
+                        sib = kids[0] if i != 0 else None
+                    elif len(kids) == 2:
+                        sib = kids[1 - i]
+                    else:
+                        sib = None
+                    _walk(child, op, i, sib)
+            else:
+                for child in node.children:
+                    _walk(child, None, None, None)
+
+        _walk(tree, None, None, None)
+        return contexts
 
     def _replace(self, root: ExprNode, target_id: int, new_node: ExprNode) -> ExprNode:
         """Replace node at walk-index; require identical value_type to preserve typing."""
@@ -51,8 +89,14 @@ class Mutator:
             return self._replace(tree, idx, feature_node(leaf.feature_id, leaf.value_type))
 
         if choice == 1 and node.kind is NodeKind.CONSTANT:
-            val = float(node.meta.get("value", 0.0)) * float(rng.uniform(0.5, 1.5))
-            val += float(rng.normal(0, 0.1))
+            contexts = self._node_contexts(tree)
+            parent_op, idx_in_parent, sibling = contexts[idx]
+            domain = domain_for_context(parent_op, idx_in_parent, sibling, self.grammar)
+            if domain is not None:
+                val = domain.sample_threshold(rng)
+            else:
+                val = float(node.meta.get("value", 0.0)) * float(rng.uniform(0.5, 1.5))
+                val += float(rng.normal(0, 0.1))
             return self._replace(tree, idx, constant_node(val, node.value_type))
 
         if choice == 2 and node.kind is NodeKind.OPERATOR:

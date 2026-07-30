@@ -11,12 +11,20 @@ from discovery.fitness import FoldOOSMetrics, RobustFitness
 from discovery.search_budget import BudgetCounters, SearchBudget
 from discovery.stable_hash import stable_int_hash
 from discovery.stress_backend import (
+    NOT_APPLICABLE_SINGLE_SYMBOL,
     STRESS_BACKEND_KIND,
     SYNTHETIC_STRESS_FORBIDDEN,
+    UNSUPPORTED_STRESS_SCENARIO,
     StressScenarioBackend,
     assert_not_synthetic_stress,
     make_stress_backend_factory,
 )
+
+# Signal-source / backend-kind values that must be true for a research-eligible
+# executed Stress scenario to be trusted (never hardcoded — always read from
+# the scenario backend's own returned artifact).
+_REQUIRED_RESEARCH_SIGNAL_SOURCE = "candidate_dsl_trees"
+STRESS_SIGNAL_INTEGRITY_FAILED = "STRESS_SIGNAL_INTEGRITY_FAILED"
 
 
 STRESS_SCENARIOS: tuple[str, ...] = (
@@ -56,6 +64,14 @@ class StressResult:
     orders_count: int = 0
     fills_count: int = 0
     details: dict[str, Any] = field(default_factory=dict)
+    # "executed" (real rerun happened, normal pass/fail semantics) |
+    # "not_applicable" (e.g. symbol_exclusion on a single-symbol campaign) |
+    # "unsupported" (unknown scenario name) |
+    # "baseline_unavailable" (real baseline closed trades could not be read).
+    # Only "executed" scenarios belong in the Stress pass-rate denominator.
+    status: str = "executed"
+    completed_fold_count: int = 0
+    integrity_ok: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +91,9 @@ class StressResult:
             "passed": self.passed,
             "failure_reason": self.failure_reason,
             "details": dict(self.details),
+            "status": self.status,
+            "completed_fold_count": self.completed_fold_count,
+            "integrity_ok": self.integrity_ok,
         }
 
 
@@ -118,13 +137,53 @@ class StressTester:
             except Exception:  # noqa: BLE001
                 baseline_arts = None
 
+        single_symbol = len(candidate.asset_universe) <= 1
+
         for scenario in chosen:
             if self.counters.stress >= self.budget.max_stress_evaluations:
                 break
+
+            # Scenarios that can never be a genuine rerun must not consume a
+            # stress-evaluation slot, must never be marked passed or failed,
+            # and must never touch the real backend.
+            if scenario == "symbol_exclusion" and single_symbol:
+                results.append(
+                    self._not_executed_result(
+                        candidate, scenario, status="not_applicable",
+                        reason=NOT_APPLICABLE_SINGLE_SYMBOL,
+                    )
+                )
+                continue
+            if scenario not in STRESS_SCENARIOS:
+                results.append(
+                    self._not_executed_result(
+                        candidate, scenario, status="unsupported",
+                        reason=UNSUPPORTED_STRESS_SCENARIO,
+                    )
+                )
+                continue
+
             backend = self.backend_factory(scenario)
             assert_not_synthetic_stress(backend, research_eligible=forbid)
             if forbid and isinstance(backend, SyntheticOOSBackend):
                 raise RuntimeError(SYNTHETIC_STRESS_FORBIDDEN)
+
+            stress_status = getattr(backend, "stress_status", None)
+            if stress_status is not None:
+                # Real factory determined this scenario cannot be a genuine
+                # rerun (e.g. baseline closed trades unavailable) — never
+                # silently fall back to rerunning the unchanged baseline.
+                status = (
+                    "not_applicable"
+                    if stress_status == NOT_APPLICABLE_SINGLE_SYMBOL
+                    else "unsupported"
+                    if stress_status == UNSUPPORTED_STRESS_SCENARIO
+                    else "baseline_unavailable"
+                )
+                results.append(
+                    self._not_executed_result(candidate, scenario, status=status, reason=stress_status)
+                )
+                continue
 
             folds, _ = backend.evaluate(candidate)
             # Research integrity: never post-process / haircut fold metrics.
@@ -144,12 +203,27 @@ class StressTester:
             trade_counts = int(arts.get("trades_count", sum(f.n_trades for f in folds)))
             orders_count = int(arts.get("orders_count", 0))
             fills_count = int(arts.get("fills_count", 0))
+            completed_fold_count = int(arts.get("wfo_completed_folds", len(folds)))
+            # Never hardcode — always read the actual signal source the
+            # scenario backend claims to have used.
+            signal_source = str(arts.get("signal_source") or "signal_source_missing")
+            integrity_ok = (
+                signal_source == _REQUIRED_RESEARCH_SIGNAL_SOURCE
+                and backend_kind == STRESS_BACKEND_KIND
+                and completed_fold_count > 0
+            )
 
             # Pass only if real rerun satisfies economic SCORE gates (not fitness ratio alone).
             passed = not fit.rejected
             failure_reason = fit.rejection_reason if fit.rejected else None
             if not passed and failure_reason is None:
                 failure_reason = "STRESS_ECONOMIC_GATE_FAILED"
+            if self.research_eligible and not integrity_ok:
+                # A research-eligible executed scenario whose own artifact does
+                # not prove a real DSL-tree event-driven rerun is an integrity
+                # failure, not a pass — regardless of the economic gate result.
+                passed = False
+                failure_reason = failure_reason or STRESS_SIGNAL_INTEGRITY_FAILED
 
             results.append(
                 StressResult(
@@ -160,7 +234,7 @@ class StressTester:
                     max_drawdown=float(min((f.max_drawdown for f in folds), default=0.0)),
                     passed=passed,
                     failure_reason=failure_reason,
-                    signal_source="candidate_dsl_trees",
+                    signal_source=signal_source,
                     backend_kind=backend_kind,
                     cost_model_changes=cost_changes,
                     execution_changes=exec_changes,
@@ -168,6 +242,9 @@ class StressTester:
                     trade_counts=trade_counts,
                     orders_count=orders_count,
                     fills_count=fills_count,
+                    status="executed",
+                    completed_fold_count=completed_fold_count,
+                    integrity_ok=integrity_ok,
                     details={
                         "base_fitness": base_fitness,
                         "fitness_ratio_vs_base": (
@@ -180,6 +257,31 @@ class StressTester:
             )
             self.counters.stress += 1
         return results
+
+    @staticmethod
+    def _not_executed_result(
+        candidate: StrategyCandidate, scenario: str, *, status: str, reason: str
+    ) -> "StressResult":
+        """Build a StressResult for a scenario that was never genuinely rerun.
+
+        Never passed, never failed, never executed, and excluded from the
+        pass-rate denominator by callers filtering on ``status == "executed"``.
+        """
+        return StressResult(
+            scenario=scenario,
+            candidate_id=candidate.candidate_id,
+            fitness=0.0,
+            median_expectancy=0.0,
+            max_drawdown=0.0,
+            passed=False,
+            failure_reason=reason,
+            signal_source="not_executed",
+            backend_kind="stress_status_no_rerun",
+            status=status,
+            completed_fold_count=0,
+            integrity_ok=False,
+            details={"executed": False, "reason": reason},
+        )
 
 
 def np_median(xs: list[float]) -> float:

@@ -127,7 +127,14 @@ FAMILY_BLUEPRINTS: dict[str, dict[str, Any]] = {
         entry_patterns=("breakout_distance", "compression_release"),
         exit_patterns=("breakout_failure", "trailing_range_exit"),
         parameter_ranges={
-            "entry_threshold": (0.0, 0.05),
+            # Matched to the realistic scale of price.breakout_distance_20 /
+            # price.return_5 (typically well under 1%) — previously (0.0,0.05)
+            # allowed magnitudes an order of magnitude above what these
+            # ratio/return features ever reach, making the entry structurally
+            # unreachable now that direction-aware generation always samples a
+            # strictly-signed magnitude (no more accidental near-zero/negative
+            # "always true" thresholds slipping through parameter jitter).
+            "entry_threshold": (0.0005, 0.01),
             "exit_threshold": (-0.02, 0.02),
             "lookback": (10.0, 40.0),
         },

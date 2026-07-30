@@ -134,6 +134,29 @@ class CandidateGenerator:
             return parameter_node(f"p{idx}", sample_threshold_for_leaf(leaf, rng))
         return parameter_node(f"p{idx}", float(rng.uniform(-2, 2)))
 
+    def _sample_magnitude(
+        self,
+        rng: np.random.Generator,
+        name: str,
+        default_lo: float,
+        default_hi: float,
+    ) -> float:
+        """Sample a strictly-positive magnitude from the (possibly signed) param range."""
+        ranges = dict(self.family_spec.parameter_ranges) if self.family_spec else {}
+        lo, hi = ranges.get(name, (default_lo, default_hi))
+        mag_lo, mag_hi = sorted((abs(float(lo)), abs(float(hi))))
+        if mag_hi <= 0.0:
+            mag_hi = max(abs(float(default_hi)), 1e-6)
+        if mag_lo <= 0.0:
+            mag_lo = min(mag_hi, 1e-6)
+        if mag_lo > mag_hi:
+            mag_lo, mag_hi = mag_hi, mag_lo
+        return float(rng.uniform(mag_lo, mag_hi))
+
+    def _signed_param(self, name: str, magnitude: float, *, negative: bool) -> ExprNode:
+        value = -abs(magnitude) if negative else abs(magnitude)
+        return parameter_node(name, value)
+
     def _allowed_ops(self, target_type: ValueType) -> list[OperatorId]:
         return list(self.grammar.operators_returning(target_type))
 
@@ -295,38 +318,60 @@ class CandidateGenerator:
                 continue
         return self._leaf(rng, target_type=target_type, param_counter=param_counter)
 
-    def _pattern_entry_cond(self, pattern: str, rng: np.random.Generator) -> ExprNode:
-        """Build a BOOLEAN condition shaped by the family entry pattern."""
-        if pattern in {"zscore_extreme", "vwap_zscore"}:
-            feat = self._pick_feature(rng, "price.rolling_z_20", "liq.dist_session_vwap")
-            thr = self._sample_param(rng, "entry_threshold", -2.5, -1.0)
-            return op_node(OperatorId.LESS_THAN, feat, thr)
+    #: Entry patterns whose condition sign must directly determine the trade
+    #: direction (no post-hoc random ENTRY_LONG/ENTRY_SHORT selection). Maps
+    #: pattern name -> True keys are handled inside ``_pattern_entry_cond``.
+    _DIRECTION_LINKED_PATTERNS = frozenset(
+        {
+            # Mean reversion
+            "zscore_extreme",
+            "dist_mean_threshold",
+            # VWAP reversion
+            "vwap_deviation",
+            "vwap_zscore",
+            # Momentum
+            "return_persistence",
+            "cross_momentum",
+            # Breakout
+            "breakout_distance",
+            "compression_release",
+            # Gap fade
+            "gap_fade_entry",
+            "vwap_gap_reversion",
+        }
+    )
+
+    def _pattern_entry_cond(
+        self, pattern: str, rng: np.random.Generator
+    ) -> tuple[ExprNode, OperatorId | None]:
+        """Build a BOOLEAN condition shaped by the family entry pattern.
+
+        For direction-linked families (mean reversion, VWAP reversion, momentum,
+        breakout, gap fade) the direction is chosen first and the condition is
+        built to match its sign — never the other way around. Returns
+        ``(condition, forced_direction)``; ``forced_direction`` is ``None`` for
+        patterns without a required condition/direction linkage.
+        """
+        if pattern in self._DIRECTION_LINKED_PATTERNS:
+            allow_short = self.grammar.allows_operator(OperatorId.ENTRY_SHORT)
+            direction = (
+                OperatorId.ENTRY_SHORT if (allow_short and rng.random() < 0.5) else OperatorId.ENTRY_LONG
+            )
+            long_side = direction is OperatorId.ENTRY_LONG
+            cond = self._direction_linked_cond(pattern, rng, long_side=long_side)
+            return cond, direction
+
         if pattern == "pullback_to_ema":
             feat = self._pick_feature(rng, "price.dist_rolling_mean_20", "liq.dist_session_vwap")
             thr = self._sample_param(rng, "entry_threshold", -0.04, -0.002)
-            return op_node(OperatorId.LESS_THAN, feat, thr)
-        if pattern in {"dist_mean_threshold", "vwap_deviation"}:
-            feat = self._pick_feature(
-                rng, "price.dist_rolling_mean_20", "liq.dist_session_vwap", "price.rolling_z_20"
-            )
-            if feat.name == "price.rolling_z_20":
-                thr = self._sample_param(rng, "entry_threshold", -2.5, -1.0)
-            else:
-                thr = self._sample_param(rng, "entry_threshold", -0.04, -0.002)
-            return op_node(OperatorId.LESS_THAN, feat, thr)
-        if pattern in {"return_persistence", "cross_momentum", "trend_resume_cross"}:
+            return op_node(OperatorId.LESS_THAN, feat, thr), None
+        if pattern == "trend_resume_cross":
             feat = self._pick_feature(rng, "price.return_5", "price.simple_return_1")
             thr = self._sample_param(rng, "entry_threshold", 0.0, 0.02)
             if self.grammar.allows_operator(OperatorId.CROSS_ABOVE) and rng.random() < 0.5:
                 base = self._pick_feature(rng, "price.simple_return_1", "price.log_return_1")
-                return op_node(OperatorId.CROSS_ABOVE, feat, base)
-            return op_node(OperatorId.GREATER_THAN, feat, thr)
-        if pattern in {"breakout_distance", "compression_release"}:
-            feat = self._pick_feature(
-                rng, "price.breakout_distance_20", "vol.range_compression_20", "liq.volume_pct_20"
-            )
-            thr = self._sample_param(rng, "entry_threshold", 0.0, 0.05)
-            return op_node(OperatorId.GREATER_THAN, feat, thr)
+                return op_node(OperatorId.CROSS_ABOVE, feat, base), None
+            return op_node(OperatorId.GREATER_THAN, feat, thr), None
         if pattern in {"vol_expansion_break", "compression_then_move"}:
             feat = self._pick_feature(
                 rng, "vol.range_compression_20", "vol.realized_20", "vol.norm_atr_14"
@@ -338,28 +383,8 @@ class CandidateGenerator:
             # Directional confirmation uses return-scale threshold (not exit_vol).
             right = op_node(OperatorId.GREATER_THAN, op_node(OperatorId.ABS, move), ret_thr)
             if self.grammar.allows_operator(OperatorId.AND) and rng.random() < 0.7:
-                return op_node(OperatorId.AND, left, right)
-            return left
-        if pattern in {"gap_fade_entry", "vwap_gap_reversion"}:
-            # Normalized overnight gap (instrument-independent), not one-bar return.
-            gap = self._pick_feature(rng, "price.close_to_open")
-            thr = self._sample_param(rng, "entry_threshold", 0.0005, 0.012)
-            core = op_node(OperatorId.GREATER_THAN, op_node(OperatorId.ABS, gap), thr)
-            if pattern == "vwap_gap_reversion" and self.grammar.allows_operator(OperatorId.OR):
-                vwap = self._pick_feature(rng, "liq.dist_session_vwap")
-                vwap_cond = op_node(
-                    OperatorId.GREATER_THAN,
-                    op_node(OperatorId.ABS, vwap),
-                    self._sample_param(rng, "exit_threshold", 0.001, 0.01),
-                )
-                # OR keeps the gate economically meaningful without always-false AND.
-                core = op_node(OperatorId.OR, core, vwap_cond)
-            elif self.grammar.allows_operator(OperatorId.AND) and rng.random() < 0.5:
-                minutes = self._pick_feature(rng, "temp.minutes_since_open")
-                tmax = self._sample_param(rng, "minutes_open_max", 90.0, 390.0)
-                window = op_node(OperatorId.LESS_THAN, minutes, tmax)
-                core = op_node(OperatorId.AND, core, window)
-            return core
+                return op_node(OperatorId.AND, left, right), None
+            return left, None
         if pattern in {"session_extreme", "open_fade"}:
             feat = self._pick_feature(
                 rng, "price.rolling_z_20", "liq.dist_session_vwap", "price.simple_return_1"
@@ -370,10 +395,91 @@ class CandidateGenerator:
                 minutes = self._pick_feature(rng, "temp.minutes_since_open")
                 tmax = self._sample_param(rng, "minutes_open_max", 60.0, 390.0)
                 window = op_node(OperatorId.LESS_THAN, minutes, tmax)
-                return op_node(OperatorId.AND, core, window)
-            return core
+                return op_node(OperatorId.AND, core, window), None
+            return core, None
         # Fallback: family-constrained boolean leaf
-        return self._boolean_leaf(rng, [0])
+        return self._boolean_leaf(rng, [0]), None
+
+    def _direction_linked_cond(
+        self, pattern: str, rng: np.random.Generator, *, long_side: bool
+    ) -> ExprNode:
+        """Build the entry condition whose sign matches ``long_side`` exactly."""
+        if pattern in {"zscore_extreme", "vwap_zscore"}:
+            # Mean reversion / VWAP reversion (extreme z-score style):
+            # feat < -mag -> ENTRY_LONG, feat > mag -> ENTRY_SHORT.
+            feat = self._pick_feature(rng, "price.rolling_z_20", "liq.dist_session_vwap")
+            mag = self._sample_magnitude(rng, "entry_threshold", 1.0, 3.0)
+            op = OperatorId.LESS_THAN if long_side else OperatorId.GREATER_THAN
+            return op_node(op, feat, self._signed_param("entry_threshold", mag, negative=long_side))
+
+        if pattern in {"dist_mean_threshold", "vwap_deviation"}:
+            # Mean reversion / VWAP reversion (distance-from-mean style):
+            # negative displacement -> ENTRY_LONG, positive displacement -> ENTRY_SHORT.
+            feat = self._pick_feature(
+                rng, "price.dist_rolling_mean_20", "liq.dist_session_vwap", "price.rolling_z_20"
+            )
+            if feat.name == "price.rolling_z_20":
+                mag = self._sample_magnitude(rng, "entry_threshold", 1.0, 3.0)
+            else:
+                mag = self._sample_magnitude(rng, "entry_threshold", 0.002, 0.04)
+            op = OperatorId.LESS_THAN if long_side else OperatorId.GREATER_THAN
+            return op_node(op, feat, self._signed_param("entry_threshold", mag, negative=long_side))
+
+        if pattern in {"return_persistence", "cross_momentum"}:
+            # Momentum: positive return threshold -> ENTRY_LONG,
+            # negative return threshold -> ENTRY_SHORT.
+            feat = self._pick_feature(rng, "price.return_5", "price.simple_return_1")
+            if (
+                pattern == "cross_momentum"
+                and self.grammar.allows_operator(OperatorId.CROSS_ABOVE)
+                and self.grammar.allows_operator(OperatorId.CROSS_BELOW)
+                and rng.random() < 0.5
+            ):
+                base = self._pick_feature(rng, "price.simple_return_1", "price.log_return_1")
+                op = OperatorId.CROSS_ABOVE if long_side else OperatorId.CROSS_BELOW
+                return op_node(op, feat, base)
+            mag = self._sample_magnitude(rng, "entry_threshold", 0.0005, 0.02)
+            op = OperatorId.GREATER_THAN if long_side else OperatorId.LESS_THAN
+            return op_node(op, feat, self._signed_param("entry_threshold", mag, negative=not long_side))
+
+        if pattern in {"breakout_distance", "compression_release"}:
+            # Breakout: upside breakout -> ENTRY_LONG, downside breakout -> ENTRY_SHORT.
+            if long_side:
+                feat = self._pick_feature(
+                    rng, "price.breakout_distance_20", "vol.range_compression_20", "liq.volume_pct_20"
+                )
+            else:
+                # No dedicated "breakdown distance" feature — use the return
+                # feature's negative-magnitude side as the downside-breakout proxy.
+                feat = self._pick_feature(rng, "price.return_5", "vol.range_compression_20")
+            mag = self._sample_magnitude(rng, "entry_threshold", 0.0, 0.05)
+            op = OperatorId.GREATER_THAN if long_side else OperatorId.LESS_THAN
+            return op_node(op, feat, self._signed_param("entry_threshold", mag, negative=not long_side))
+
+        if pattern in {"gap_fade_entry", "vwap_gap_reversion"}:
+            # Gap fade: positive opening gap -> ENTRY_SHORT (fade it down),
+            # negative opening gap -> ENTRY_LONG (fade it up). No ABS(gap).
+            gap = self._pick_feature(rng, "price.close_to_open")
+            mag = self._sample_magnitude(rng, "entry_threshold", 0.0005, 0.012)
+            op = OperatorId.LESS_THAN if long_side else OperatorId.GREATER_THAN
+            core = op_node(op, gap, self._signed_param("entry_threshold", mag, negative=long_side))
+            if pattern == "vwap_gap_reversion" and self.grammar.allows_operator(OperatorId.OR):
+                vwap = self._pick_feature(rng, "liq.dist_session_vwap")
+                vwap_mag = self._sample_magnitude(rng, "exit_threshold", 0.001, 0.01)
+                vwap_op = OperatorId.LESS_THAN if long_side else OperatorId.GREATER_THAN
+                vwap_cond = op_node(
+                    vwap_op, vwap, self._signed_param("exit_threshold", vwap_mag, negative=long_side)
+                )
+                # OR keeps the gate economically meaningful while preserving sign.
+                core = op_node(OperatorId.OR, core, vwap_cond)
+            elif self.grammar.allows_operator(OperatorId.AND) and rng.random() < 0.5:
+                minutes = self._pick_feature(rng, "temp.minutes_since_open")
+                tmax = self._sample_param(rng, "minutes_open_max", 90.0, 390.0)
+                window = op_node(OperatorId.LESS_THAN, minutes, tmax)
+                core = op_node(OperatorId.AND, core, window)
+            return core
+
+        raise DSLValidationError(f"unsupported direction-linked pattern {pattern!r}")
 
     def _pattern_exit_tree(self, pattern: str, rng: np.random.Generator) -> ExprNode:
         if pattern in {"session_flatten"} and self.grammar.allows_operator(OperatorId.SESSION_EXIT):
@@ -424,12 +530,11 @@ class CandidateGenerator:
             pattern = self.family_spec.entry_patterns[
                 int(rng.integers(0, len(self.family_spec.entry_patterns)))
             ]
-            cond = self._pattern_entry_cond(pattern, rng)
-            # Gap fade: fade direction opposite the gap sign → short after up-gap.
-            if pattern in {"gap_fade_entry", "vwap_gap_reversion"} and self.grammar.allows_operator(
-                OperatorId.ENTRY_SHORT
-            ):
-                entry_op = OperatorId.ENTRY_SHORT if rng.random() < 0.5 else OperatorId.ENTRY_LONG
+            cond, forced_direction = self._pattern_entry_cond(pattern, rng)
+            # Direction-linked patterns: the condition's sign already determined
+            # the direction inside _pattern_entry_cond — never re-randomize here.
+            if forced_direction is not None:
+                entry_op = forced_direction
             entry = op_node(entry_op, cond)
             entry = repair_entry(clamp_lookbacks(entry, self.grammar), self.grammar)
             check_ast_types(entry, path="entry", operation="generate")
