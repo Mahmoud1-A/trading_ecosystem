@@ -189,6 +189,47 @@ function newRunForm(datasets) {
           <input type="checkbox" id="mf_adaptive" checked />
           <span>Adaptive WFO allocation after early folds</span>
         </div>
+        <div class="confirm" style="margin-top:0.5rem">
+          <input type="checkbox" id="mf_family_local_evolution" checked />
+          <span>Enable family-local evolution</span>
+        </div>
+        <div class="row">
+          <div><label>Evolution generations</label><input id="mf_evolution_generations" type="number" min="1" max="50" value="2" /></div>
+          <div><label>Stagnation generations</label><input id="mf_stagnation_generations" type="number" min="1" max="99" value="1" /></div>
+          <div><label>Minimum improvement</label><input id="mf_minimum_improvement" type="number" min="0" step="0.0001" value="0.0001" /></div>
+        </div>
+        <label>Stress scenarios (multiselect — hold Ctrl/Cmd)</label>
+        <select id="mf_stress_scenarios" multiple size="6" style="width:100%;min-height:7rem">
+          <option value="base_costs" selected>base_costs</option>
+          <option value="costs_2x" selected>costs_2x</option>
+          <option value="wider_spread" selected>wider_spread</option>
+          <option value="worse_slippage" selected>worse_slippage</option>
+          <option value="delayed_execution" selected>delayed_execution</option>
+          <option value="removed_best_day" selected>removed_best_day</option>
+        </select>
+        <div class="row">
+          <div><label>Max Stress evaluations</label><input id="mf_max_stress_evaluations" type="number" min="0" max="500" value="24" /></div>
+          <div><label>Max Stress scenarios / candidate</label><input id="mf_max_stress_scenarios_per_candidate" type="number" min="1" max="50" value="6" /></div>
+          <div><label>Minimum Stress pass rate</label><input id="mf_min_stress_pass_rate" type="number" min="0" max="1" step="0.05" value="0.5" /></div>
+        </div>
+        <div class="row">
+          <div><label>Max Robustness candidates</label><input id="mf_max_robustness_candidates" type="number" min="0" max="50" value="3" /></div>
+          <div><label>Max Robustness evaluations</label><input id="mf_max_robustness_evaluations" type="number" min="0" max="500" value="18" /></div>
+        </div>
+        <div class="row">
+          <div><label>Max parameters / candidate</label><input id="mf_max_parameters_per_candidate" type="number" min="1" max="20" value="2" /></div>
+          <div><label>Max points / parameter</label><input id="mf_max_points_per_parameter" type="number" min="1" max="20" value="3" /></div>
+          <div><label>Min valid neighborhood points</label><input id="mf_min_valid_neighborhood_points" type="number" min="1" max="50" value="3" /></div>
+        </div>
+        <div class="row">
+          <div><label>Minimum DSR</label><input id="mf_min_dsr" type="number" min="0" max="5" step="0.01" value="0.95" /></div>
+          <div><label>Maximum PBO</label><input id="mf_max_pbo" type="number" min="0" max="1" step="0.01" value="0.5" /></div>
+          <div><label>PBO splits</label><input id="mf_pbo_n_splits" type="number" min="2" max="20" value="4" /></div>
+        </div>
+        <div class="row">
+          <div><label>Min DSR OOS observations</label><input id="mf_min_oos_observations_for_dsr" type="number" min="1" max="1000" value="20" /></div>
+          <div><label>Behavioral similarity threshold</label><input id="mf_behavioral_similarity_threshold" type="number" min="0" max="1" step="0.01" value="0.85" /></div>
+        </div>
         <p class="sub" id="mf_hint">Select at least 2 blueprints. Launch fails if fewer than 2 distinct grammar fingerprints.</p>
       </div>
       <div class="row">
@@ -320,6 +361,23 @@ function selectedBlueprintIds() {
   return Array.from(sel.selectedOptions || []).map(o => o.value).filter(Boolean);
 }
 
+function selectedStressScenarios() {
+  const sel = $("#mf_stress_scenarios");
+  if (!sel) {
+    return ["base_costs", "costs_2x", "wider_spread", "worse_slippage", "delayed_execution", "removed_best_day"];
+  }
+  const picked = Array.from(sel.selectedOptions || []).map(o => o.value).filter(Boolean);
+  return picked.length
+    ? picked
+    : ["base_costs", "costs_2x", "wider_spread", "worse_slippage", "delayed_execution", "removed_best_day"];
+}
+
+function mfNum(id, fallback) {
+  const el = $(`#${id}`);
+  const n = Number(el && el.value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function isMultiFamilyMode() {
   return ($("#run_mode") && $("#run_mode").value === "multi");
 }
@@ -449,7 +507,7 @@ async function wireNewRun() {
     if (previewTimer) clearTimeout(previewTimer);
     previewTimer = setTimeout(() => { preview().catch(() => {}); }, 120);
   };
-  ["run_type","dataset","symbols","timeframe","family","seed","cost","risk","features","budget","wfo","c_miner","c_smoke","c_vault","c_paper","run_mode","mf_family_count","mf_per_family","mf_blueprints","mf_adaptive"]
+  ["run_type","dataset","symbols","timeframe","family","seed","cost","risk","features","budget","wfo","c_miner","c_smoke","c_vault","c_paper","run_mode","mf_family_count","mf_per_family","mf_blueprints","mf_adaptive","mf_family_local_evolution","mf_evolution_generations","mf_stagnation_generations","mf_minimum_improvement","mf_stress_scenarios","mf_max_stress_evaluations","mf_max_stress_scenarios_per_candidate","mf_min_stress_pass_rate","mf_max_robustness_candidates","mf_max_robustness_evaluations","mf_max_parameters_per_candidate","mf_max_points_per_parameter","mf_min_valid_neighborhood_points","mf_min_dsr","mf_max_pbo","mf_pbo_n_splits","mf_min_oos_observations_for_dsr","mf_behavioral_similarity_threshold"]
     .forEach(id => {
       const el = $(`#${id}`);
       if (!el) return;
@@ -544,6 +602,27 @@ function collectRunBody() {
       family_ids: familyIds,
       seed,
       max_oos_drawdown: Number(budget.max_oos_drawdown ?? 0.2),
+      family_local_evolution: !!( $("#mf_family_local_evolution") && $("#mf_family_local_evolution").checked ),
+      evolution_generations: mfNum("mf_evolution_generations", 2),
+      stagnation_generations: mfNum("mf_stagnation_generations", 1),
+      minimum_improvement: mfNum("mf_minimum_improvement", 0.0001),
+      allow_cross_family_crossover: false,
+      stress_scenarios: selectedStressScenarios(),
+      max_stress_evaluations: mfNum("mf_max_stress_evaluations", 24),
+      max_stress_scenarios_per_candidate: mfNum("mf_max_stress_scenarios_per_candidate", 6),
+      min_stress_pass_rate: mfNum("mf_min_stress_pass_rate", 0.5),
+      fail_closed_unsupported_stress: true,
+      max_robustness_candidates: mfNum("mf_max_robustness_candidates", 3),
+      max_robustness_evaluations: mfNum("mf_max_robustness_evaluations", 18),
+      max_parameters_per_candidate: mfNum("mf_max_parameters_per_candidate", 2),
+      max_points_per_parameter: mfNum("mf_max_points_per_parameter", 3),
+      min_valid_neighborhood_points: mfNum("mf_min_valid_neighborhood_points", 3),
+      allow_one_sided_neighborhood: false,
+      min_dsr: mfNum("mf_min_dsr", 0.95),
+      max_pbo: mfNum("mf_max_pbo", 0.5),
+      pbo_n_splits: mfNum("mf_pbo_n_splits", 4),
+      min_oos_observations_for_dsr: mfNum("mf_min_oos_observations_for_dsr", 20),
+      behavioral_similarity_threshold: mfNum("mf_behavioral_similarity_threshold", 0.85),
     };
   }
   return body;

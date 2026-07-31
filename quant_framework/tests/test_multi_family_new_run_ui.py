@@ -14,6 +14,39 @@ from control_plane.multi_family_ui import (
 from control_plane.run_manager import RunManager
 from fastapi.testclient import TestClient
 
+_PIPELINE_FIELDS = (
+    "family_local_evolution",
+    "evolution_generations",
+    "stagnation_generations",
+    "minimum_improvement",
+    "allow_cross_family_crossover",
+    "stress_scenarios",
+    "max_stress_evaluations",
+    "max_stress_scenarios_per_candidate",
+    "min_stress_pass_rate",
+    "fail_closed_unsupported_stress",
+    "max_robustness_candidates",
+    "max_robustness_evaluations",
+    "max_parameters_per_candidate",
+    "max_points_per_parameter",
+    "min_valid_neighborhood_points",
+    "allow_one_sided_neighborhood",
+    "min_dsr",
+    "max_pbo",
+    "pbo_n_splits",
+    "min_oos_observations_for_dsr",
+    "behavioral_similarity_threshold",
+)
+
+_FROZEN_PREVIEW_MARKERS = (
+    '"family_local_evolution": true',
+    '"evolution_generations": 2',
+    '"max_stress_evaluations": 24',
+    '"max_robustness_candidates": 3',
+    '"min_dsr": 0.95',
+    '"max_pbo": 0.5',
+)
+
 
 @pytest.fixture()
 def client(tmp_path: Path) -> TestClient:
@@ -25,6 +58,12 @@ def _js(client: TestClient) -> str:
     return client.get("/assets/dashboard.js").text
 
 
+def _collect_run_body_fn(js: str) -> str:
+    start = js.index("function collectRunBody()")
+    end = js.index("\nconst RUN_TABS", start)
+    return js[start:end]
+
+
 class TestNewRunDashboardControls:
     def test_run_mode_and_multi_family_controls_present(self, client: TestClient) -> None:
         js = _js(client)
@@ -34,6 +73,24 @@ class TestNewRunDashboardControls:
         assert 'id="mf_per_family"' in js
         assert 'id="mf_blueprints"' in js
         assert 'id="mf_adaptive"' in js
+        assert 'id="mf_family_local_evolution"' in js
+        assert 'id="mf_evolution_generations"' in js
+        assert 'id="mf_stagnation_generations"' in js
+        assert 'id="mf_minimum_improvement"' in js
+        assert 'id="mf_stress_scenarios"' in js
+        assert 'id="mf_max_stress_evaluations"' in js
+        assert 'id="mf_max_stress_scenarios_per_candidate"' in js
+        assert 'id="mf_min_stress_pass_rate"' in js
+        assert 'id="mf_max_robustness_candidates"' in js
+        assert 'id="mf_max_robustness_evaluations"' in js
+        assert 'id="mf_max_parameters_per_candidate"' in js
+        assert 'id="mf_max_points_per_parameter"' in js
+        assert 'id="mf_min_valid_neighborhood_points"' in js
+        assert 'id="mf_min_dsr"' in js
+        assert 'id="mf_max_pbo"' in js
+        assert 'id="mf_pbo_n_splits"' in js
+        assert 'id="mf_min_oos_observations_for_dsr"' in js
+        assert 'id="mf_behavioral_similarity_threshold"' in js
         assert "multi_family_generated" in js
         assert "Generated family specs" in js
         assert "collectRunBody" in js
@@ -45,6 +102,87 @@ class TestNewRunDashboardControls:
         assert "preview_family_specs" in js
         assert "/api/strategy_families/preview" in js
         assert "/api/strategy_families/blueprints" in js
+
+    def test_frozen_preview_includes_pipeline_defaults(self, client: TestClient) -> None:
+        js = _js(client)
+        assert "Frozen config preview" in js
+        assert "JSON.stringify(body, null, 2)" in js
+        body_fn = _collect_run_body_fn(js)
+        # Defaults wired into multi_family so frozen preview shows them.
+        assert "family_local_evolution:" in body_fn
+        assert 'mfNum("mf_evolution_generations", 2)' in body_fn
+        assert 'mfNum("mf_max_stress_evaluations", 24)' in body_fn
+        assert 'mfNum("mf_max_robustness_candidates", 3)' in body_fn
+        assert 'mfNum("mf_min_dsr", 0.95)' in body_fn
+        assert 'mfNum("mf_max_pbo", 0.5)' in body_fn
+        assert 'id="mf_family_local_evolution" checked' in js
+        assert 'id="mf_evolution_generations" type="number" min="1" max="50" value="2"' in js
+        assert 'id="mf_max_stress_evaluations" type="number" min="0" max="500" value="24"' in js
+        assert 'id="mf_max_robustness_candidates" type="number" min="0" max="50" value="3"' in js
+        assert 'id="mf_min_dsr" type="number" min="0" max="5" step="0.01" value="0.95"' in js
+        assert 'id="mf_max_pbo" type="number" min="0" max="1" step="0.01" value="0.5"' in js
+        for marker in _FROZEN_PREVIEW_MARKERS:
+            # Proof markers: UI defaults + collectRunBody wiring produce these keys.
+            key = marker.split(":")[0].strip().strip('"')
+            assert key in body_fn
+
+    def test_collect_run_body_sends_complete_multifamily_pipeline(self, client: TestClient) -> None:
+        body_fn = _collect_run_body_fn(_js(client))
+        assert "body.multi_family = {" in body_fn
+        for field in _PIPELINE_FIELDS:
+            assert f"{field}:" in body_fn or f'"{field}"' in body_fn
+        assert "allow_cross_family_crossover: false" in body_fn
+        assert "fail_closed_unsupported_stress: true" in body_fn
+        assert "allow_one_sided_neighborhood: false" in body_fn
+        # Must live inside multi_family, not only search_budget.
+        mf_block = body_fn[body_fn.index("body.multi_family = {") :]
+        for field in (
+            "family_local_evolution",
+            "max_stress_evaluations",
+            "max_robustness_candidates",
+            "min_dsr",
+            "max_pbo",
+            "stress_scenarios",
+        ):
+            assert field in mf_block
+        budget_assign = body_fn[
+            body_fn.index("body.search_budget = {") : body_fn.index("body.multi_family = {")
+        ]
+        assert "family_local_evolution" not in budget_assign
+        assert "min_dsr" not in budget_assign
+        assert "max_stress_evaluations" not in budget_assign
+
+    def test_single_family_requests_omit_multi_family(self, client: TestClient) -> None:
+        body_fn = _collect_run_body_fn(_js(client))
+        assert "const multi = isMultiFamilyMode();" in body_fn
+        assert "if (multi) {" in body_fn
+        # multi_family is only assigned inside the multi branch.
+        before_multi = body_fn[: body_fn.index("if (multi) {")]
+        assert "body.multi_family" not in before_multi
+        assert 'strategy_family: multi ? "multi_family_generated" : $("#family").value' in body_fn
+
+    def test_cross_family_crossover_forced_false(self, client: TestClient) -> None:
+        body_fn = _collect_run_body_fn(_js(client))
+        assert "allow_cross_family_crossover: false" in body_fn
+        assert "allow_cross_family_crossover: true" not in body_fn
+        assert 'id="mf_allow_cross_family_crossover"' not in _js(client)
+
+    def test_vault_paper_live_confirmations_default_false(self, client: TestClient) -> None:
+        js = _js(client)
+        assert 'id="c_vault"' in js
+        assert 'id="c_paper"' in js
+        assert 'id="c_vault" checked' not in js
+        assert 'id="c_paper" checked' not in js
+        assert "confirm_vault: $("#c_vault").checked" in js
+        assert "confirm_paper: $("#c_paper").checked" in js
+        assert "confirm_live" not in js
+        assert "Live trading" in js and "OFF" in js
+        from control_plane.security import CreateRunRequest
+
+        req = CreateRunRequest(run_type="ALPHA_MINER", confirm_alpha_miner=True, smoke_test=True)
+        assert req.confirm_vault is False
+        assert req.confirm_paper is False
+        assert getattr(req, "confirm_live", False) is False
 
 
 class TestBlueprintsAndPreviewApi:
@@ -132,6 +270,34 @@ class TestCreateRunMultiFamilyContract:
                     "volatility_expansion",
                 ],
                 "seed": 11,
+                "family_local_evolution": True,
+                "evolution_generations": 2,
+                "stagnation_generations": 1,
+                "minimum_improvement": 0.0001,
+                "allow_cross_family_crossover": False,
+                "stress_scenarios": [
+                    "base_costs",
+                    "costs_2x",
+                    "wider_spread",
+                    "worse_slippage",
+                    "delayed_execution",
+                    "removed_best_day",
+                ],
+                "max_stress_evaluations": 24,
+                "max_stress_scenarios_per_candidate": 6,
+                "min_stress_pass_rate": 0.5,
+                "fail_closed_unsupported_stress": True,
+                "max_robustness_candidates": 3,
+                "max_robustness_evaluations": 18,
+                "max_parameters_per_candidate": 2,
+                "max_points_per_parameter": 3,
+                "min_valid_neighborhood_points": 3,
+                "allow_one_sided_neighborhood": False,
+                "min_dsr": 0.95,
+                "max_pbo": 0.5,
+                "pbo_n_splits": 4,
+                "min_oos_observations_for_dsr": 20,
+                "behavioral_similarity_threshold": 0.85,
             },
             **extra,
         }
@@ -163,6 +329,61 @@ class TestCreateRunMultiFamilyContract:
         assert mf.get("enabled") is True
         assert int(mf.get("distinct_grammar_fingerprints") or 0) >= 2
         assert len(mf.get("preview_family_specs") or []) >= 2
+        assert mf.get("family_local_evolution") is True
+        assert mf.get("evolution_generations") == 2
+        assert mf.get("max_stress_evaluations") == 24
+        assert mf.get("max_robustness_candidates") == 3
+        assert mf.get("min_dsr") == 0.95
+        assert mf.get("max_pbo") == 0.5
+        assert mf.get("allow_cross_family_crossover") is False
+        assert snap.get("live_trading_enabled") is False
+        client.post(f"/api/runs/{run_id}/cancel")
+
+    def test_launch_stores_complete_pipeline_in_multi_family(self, client: TestClient) -> None:
+        resp = client.post("/api/runs", json=self._mf_payload())
+        assert resp.status_code == 200, resp.text
+        run_id = resp.json()["run_id"]
+        snap = client.get(f"/api/runs/{run_id}").json().get("config_snapshot") or {}
+        mf = snap.get("multi_family") or {}
+        budget = snap.get("search_budget") or {}
+        for field in _PIPELINE_FIELDS:
+            assert field in mf, field
+        assert mf["stress_scenarios"] == [
+            "base_costs",
+            "costs_2x",
+            "wider_spread",
+            "worse_slippage",
+            "delayed_execution",
+            "removed_best_day",
+        ]
+        assert "family_local_evolution" not in budget
+        assert "min_dsr" not in budget
+        client.post(f"/api/runs/{run_id}/cancel")
+
+    def test_single_family_launch_unchanged(self, client: TestClient) -> None:
+        payload = {
+            "run_type": "ALPHA_MINER",
+            "confirm_alpha_miner": True,
+            "smoke_test": True,
+            "dataset": "synthetic_demo",
+            "random_seed": 11,
+            "strategy_family": "mean_reversion_vwap_bb",
+            "search_budget": {
+                "max_generated_candidates": 12,
+                "max_evaluated_candidates": 12,
+                "max_full_wfo_evaluations": 4,
+                "population_size": 4,
+                "max_runtime_seconds": 20,
+            },
+        }
+        resp = client.post("/api/runs", json=payload)
+        assert resp.status_code == 200, resp.text
+        run_id = resp.json()["run_id"]
+        snap = client.get(f"/api/runs/{run_id}").json().get("config_snapshot") or {}
+        assert snap.get("strategy_family") == "mean_reversion_vwap_bb"
+        mf = snap.get("multi_family") or {}
+        assert not mf.get("enabled")
+        assert snap.get("live_trading_enabled") is False
         client.post(f"/api/runs/{run_id}/cancel")
 
 
