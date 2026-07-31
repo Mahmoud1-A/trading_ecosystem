@@ -481,3 +481,256 @@ class TestBehavioralSignatureArtifacts:
         assert sig is not None
         assert len(sig.signal_vector) >= 8
         assert len(sig.daily_pnl) >= 8
+
+
+class TestAdversarialIntegrity:
+    """Adversarial proofs required by the Phase 3C final audit."""
+
+    def test_single_candidate_cannot_produce_valid_pbo(self) -> None:
+        from discovery.evaluator import EvaluationRecord, EvalOutcome
+        from discovery.fitness import FitnessResult
+        from metrics.pbo import PBOStatus
+
+        folds = _folds_for_candidate("solo_cand", n=24)
+        closed = _closed_trades("solo_cand", folds)
+        rec = EvaluationRecord(
+            outcome=EvalOutcome.REGISTERED,
+            candidate_id="solo_cand",
+            lineage_id="l_solo",
+            trial_id="t_solo",
+            fitness=FitnessResult(
+                fitness=1.0,
+                ranking_source="validation_oos",
+                components={},
+                fold_scores=(1.0,),
+            ),
+            rejection_reason=None,
+            oos_folds=folds,
+            train_metrics={
+                "signal_source": "candidate_dsl_trees",
+                "is_full_event_wfo": True,
+                "wfo_completed_folds": len(folds),
+            },
+            meta={
+                "is_full_wfo_completion": True,
+                "baseline_wfo_artifacts": {
+                    "signal_source": "candidate_dsl_trees",
+                    "is_full_event_wfo": True,
+                    "wfo_completed_folds": len(folds),
+                    "closed_trades": closed,
+                },
+            },
+        )
+        pop, _ids, series = build_full_wfo_trial_population([rec])
+        assert len(series) == 1
+        matrix = align_performance_matrix(series)
+        assert matrix is None
+        dsr, pbo, _meta = evaluate_candidate_dsr_pbo(
+            rec=rec,
+            population=pop,
+            performance_matrix=matrix,
+            trial_column_index=0,
+            config=ResearchShortlistConfig(min_oos_observations_for_dsr=20),
+        )
+        assert pbo is not None
+        assert pbo.status == PBOStatus.INSUFFICIENT_DATA
+        assert pbo.pbo is None
+        # Even if DSR were somehow passed, PBO insufficiency must still block shortlist.
+        ok, _, reason = hard_gate_check(
+            score_qualified=True,
+            stress_passed=True,
+            robustness_passed=True,
+            dsr_decision=DSR_PASSED,
+            pbo_decision="PBO_INSUFFICIENT_DATA",
+        )
+        assert ok is False
+        assert reason == "PBO_INSUFFICIENT_DATA"
+
+    def test_aggregate_only_pf_cannot_fabricate_statistics(self) -> None:
+        from discovery.evaluator import EvaluationRecord, EvalOutcome
+        from discovery.fitness import FitnessResult
+
+        # No OOS folds, no closed trades — only a train-side PF aggregate claim.
+        rec = EvaluationRecord(
+            outcome=EvalOutcome.REGISTERED,
+            candidate_id="agg_only",
+            lineage_id="l_agg",
+            trial_id="t_agg",
+            fitness=FitnessResult(
+                fitness=9.9,
+                ranking_source="validation_oos",
+                components={"profit_factor": 5.0, "expectancy": 1.0},
+                fold_scores=(9.9,),
+            ),
+            rejection_reason=None,
+            oos_folds=[],
+            train_metrics={
+                "signal_source": "candidate_dsl_trees",
+                "is_full_event_wfo": True,
+                "wfo_completed_folds": 3,
+                "profit_factor": 5.0,
+            },
+            meta={
+                "is_full_wfo_completion": True,
+                "baseline_wfo_artifacts": {
+                    "signal_source": "candidate_dsl_trees",
+                    "is_full_event_wfo": True,
+                    "wfo_completed_folds": 3,
+                    "closed_trades": [],
+                },
+            },
+        )
+        pop, ids, series = build_full_wfo_trial_population([rec])
+        assert ids == []
+        assert series == []
+        matrix = align_performance_matrix(series)
+        assert matrix is None
+        # Population with no scored trials still must not fabricate OK DSR/PBO.
+        from metrics.trial_population import TrialSelection, build_trial_population
+
+        empty_pop = build_trial_population(
+            [],
+            total_trials=1,
+            rejected_trials=0,
+            failed_trials=1,
+            selection=TrialSelection.ALL_TRIALS,
+        )
+        dsr, pbo, _meta = evaluate_candidate_dsr_pbo(
+            rec=rec,
+            population=empty_pop,
+            performance_matrix=None,
+            trial_column_index=None,
+            config=ResearchShortlistConfig(min_oos_observations_for_dsr=20),
+        )
+        assert dsr.status.value == "INSUFFICIENT_DATA"
+        assert dsr.deflated_sharpe is None
+        assert pbo is None or pbo.status.value == "INSUFFICIENT_DATA"
+
+    def test_clustering_uses_behavior_not_candidate_or_family_hash(self) -> None:
+        from discovery.behavioral_dedup import behavioral_similarity
+        from discovery.evaluator import EvaluationRecord, EvalOutcome
+        from discovery.fitness import FitnessResult
+
+        def _cand(cid: str, family: str, seed: int):
+            return build_candidate(
+                entry_tree=op_node(
+                    OperatorId.GREATER_THAN,
+                    feature_node("price.return_5", ValueType.RETURN),
+                    parameter_node("thr", 0.0, ValueType.SCALAR),
+                ),
+                exit_tree=feature_node("price.simple_return_1", ValueType.BOOLEAN),
+                stop=None,
+                target=None,
+                sizing=None,
+                regime_gates=(),
+                strategy_family=family,
+                creation_method=CreationMethod.RANDOM,
+                generation=0,
+                parent_ids=(),
+                grammar_version="g1",
+                feature_set_version="f1",
+                cost_model_version="c1",
+                asset_universe=("ES",),
+                random_seed=seed,
+            )
+
+        def _rec(cid: str, folds, closed):
+            return EvaluationRecord(
+                outcome=EvalOutcome.REGISTERED,
+                candidate_id=cid,
+                lineage_id=f"l_{cid}",
+                trial_id=f"t_{cid}",
+                fitness=FitnessResult(
+                    fitness=1.0,
+                    ranking_source="validation_oos",
+                    components={},
+                    fold_scores=(1.0,),
+                ),
+                rejection_reason=None,
+                oos_folds=folds,
+                train_metrics={
+                    "signal_source": "candidate_dsl_trees",
+                    "is_full_event_wfo": True,
+                    "wfo_completed_folds": len(folds),
+                },
+                meta={
+                    "is_full_wfo_completion": True,
+                    "baseline_wfo_artifacts": {
+                        "signal_source": "candidate_dsl_trees",
+                        "is_full_event_wfo": True,
+                        "wfo_completed_folds": len(folds),
+                        "closed_trades": closed,
+                    },
+                },
+            )
+
+        # Identical OOS behavior artifacts, different IDs / families.
+        folds = _folds_for_candidate("behavior_twin_a", n=24)
+        closed = _closed_trades("behavior_twin_a", folds)
+        a = _cand("id_aaaa_family_x", "momentum", 1)
+        b = _cand("id_bbbb_family_y", "mean_reversion", 2)
+        # Force shared candidate_id on records for artifact extraction, then rename on signature via cand.
+        rec_a = _rec(a.candidate_id, folds, closed)
+        rec_b = _rec(b.candidate_id, folds, closed)
+        # Overwrite baseline trades to the *same* behavioral series (not ID-derived).
+        same_trades = list(closed)
+        rec_a.meta["baseline_wfo_artifacts"]["closed_trades"] = same_trades
+        rec_b.meta["baseline_wfo_artifacts"]["closed_trades"] = same_trades
+        rec_a.oos_folds = folds
+        rec_b.oos_folds = folds
+        sig_a = build_behavioral_signature(a, rec_a)
+        sig_b = build_behavioral_signature(b, rec_b)
+        assert sig_a is not None and sig_b is not None
+        assert sig_a.candidate_id != sig_b.candidate_id
+        # Primary weights are OOS signal/PnL (0.8); feature Jaccard is only 0.2.
+        assert np.allclose(sig_a.signal_vector, sig_b.signal_vector)
+        assert np.allclose(sig_a.daily_pnl, sig_b.daily_pnl)
+        twin_sim = behavioral_similarity(sig_a, sig_b)
+        assert twin_sim >= 0.80
+
+        # Different OOS behavior, similar ID prefixes / same family → must not force-cluster.
+        folds_c = _folds_for_candidate("behavior_opposite", n=24)
+        closed_c = _closed_trades("behavior_opposite", folds_c)
+        c = _cand("id_aaaa_family_z", "momentum", 3)
+        rec_c = _rec(c.candidate_id, folds_c, closed_c)
+        sig_c = build_behavioral_signature(c, rec_c)
+        assert sig_c is not None
+        # Opposite path should be materially less similar than identical twins.
+        assert behavioral_similarity(sig_a, sig_c) < behavioral_similarity(sig_a, sig_b)
+
+    def test_cannot_skip_upstream_status_into_shortlist(self) -> None:
+        for missing in (
+            {"score_qualified": False, "stress_passed": True, "robustness_passed": True},
+            {"score_qualified": True, "stress_passed": False, "robustness_passed": True},
+            {"score_qualified": True, "stress_passed": True, "robustness_passed": False},
+        ):
+            ok, gates, reason = hard_gate_check(
+                dsr_decision=DSR_PASSED,
+                pbo_decision=PBO_PASSED,
+                **missing,
+            )
+            assert ok is False
+            assert reason is not None
+            assert "PBO_PASSED" not in gates
+
+    def test_dashboard_renders_report_fields_not_hardcoded_success(self) -> None:
+        from pathlib import Path
+
+        dash = (
+            Path(__file__).resolve().parents[1]
+            / "control_plane"
+            / "static"
+            / "assets"
+            / "dashboard.js"
+        )
+        text = dash.read_text(encoding="utf-8")
+        assert "report.research_shortlist" in text
+        assert "report.clusters" in text
+        assert "report.candidate_statistics_summaries" in text
+        assert "report.candidate_status_history" in text
+        assert "Vault / Paper / Live remain blocked" in text
+        assert "vault_pipeline_complete" in text or "report.vault_pipeline_complete" in text or "VAULT" in text
+        # Must not hardcode research shortlist / vault approval as always true.
+        assert "vault_eligible: true" not in text.lower()
+        assert 'vault_eligible: true' not in text
+        assert "live_pipeline_complete = true" not in text
