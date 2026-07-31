@@ -7,7 +7,10 @@ Vault / Paper / Live remain blocked after this stage.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Sequence
 
 import numpy as np
@@ -64,6 +67,28 @@ GATE_DSR_FAILED = "GATE_DSR_FAILED"
 GATE_PBO_FAILED = "GATE_PBO_FAILED"
 NO_ROBUSTNESS_PASSED_FOR_STATISTICS = "NO_ROBUSTNESS_PASSED_FOR_STATISTICS"
 NO_BEHAVIORAL_SIGNATURE = "NO_BEHAVIORAL_SIGNATURE"
+STATISTICS_INSUFFICIENT_DATA = "STATISTICS_INSUFFICIENT_DATA"
+PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY = "PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY"
+PBO_ALIGNMENT_INSUFFICIENT_PERIODS = "PBO_ALIGNMENT_INSUFFICIENT_PERIODS"
+PBO_ALIGNMENT_TOO_MANY_MISSING = "PBO_ALIGNMENT_TOO_MANY_MISSING"
+TIMING_DATA_UNAVAILABLE = "timing_data_unavailable"
+EXPOSURE_DATA_UNAVAILABLE = "exposure_data_unavailable"
+
+# Explicit observation types for DSR (never mixed silently).
+OBS_NORMALIZED_EQUITY_BAR_RETURN = "normalized_equity_bar_return"
+OBS_NORMALIZED_TRADE_RETURN = "normalized_trade_return"
+OBS_INSUFFICIENT = "insufficient"
+
+# Documented normalization methods.
+NORM_EQUITY_BAR = "equity_or_bar_return_field"
+NORM_TRADE_RETURN_FIELD = "explicit_normalized_trade_return_field"
+NORM_PNL_OVER_NOTIONAL = "net_pnl_divided_by_notional_or_qty_exposure"
+NORM_NONE = "none"
+
+# PBO partition / fill policy labels.
+PARTITION_WFO_VALIDATION_PERIOD = "wfo_validation_period"
+PARTITION_TRADING_DAY = "trading_day"
+FILL_ZERO_WHEN_NO_TRADE = "zero_return_when_no_trade_in_common_period"
 
 PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST = (
     "MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST"
@@ -259,16 +284,22 @@ def _baseline_artifacts(rec: EvaluationRecord) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
+def _stable_fingerprint(payload: dict[str, Any]) -> str:
+    blob = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def _full_wfo_completed(rec: EvaluationRecord) -> bool:
-    meta = rec.meta if isinstance(rec.meta, dict) else {}
-    if meta.get("is_full_wfo_completion") is True:
-        return True
+    """Independent Full-WFO proof — never trusts ``is_full_wfo_completion`` alone.
+
+    The summary flag may be recorded for provenance, but integrity requires:
+    signal_source, is_full_event_wfo, completed folds, baseline candidate_id match,
+    and actual OOS folds or immutable baseline evidence.
+    """
     train = rec.train_metrics or {}
     baseline = _baseline_artifacts(rec)
     signal = str(
-        baseline.get("signal_source")
-        or train.get("signal_source")
-        or ""
+        baseline.get("signal_source") or train.get("signal_source") or ""
     )
     is_full = bool(
         baseline.get("is_full_event_wfo", train.get("is_full_event_wfo", False))
@@ -276,117 +307,512 @@ def _full_wfo_completed(rec: EvaluationRecord) -> bool:
     completed = int(
         baseline.get("wfo_completed_folds")
         or train.get("wfo_completed_folds")
-        or len(rec.oos_folds)
         or 0
     )
+    if completed <= 0:
+        completed = len(rec.oos_folds)
+    baseline_cid = str(baseline.get("candidate_id") or "").strip()
+    if baseline_cid and baseline_cid != str(rec.candidate_id):
+        return False
+    # Require baseline candidate_id when immutable baseline artifacts exist.
+    has_baseline_blob = bool(baseline)
+    if has_baseline_blob and not baseline_cid:
+        return False
+    if has_baseline_blob and baseline_cid != str(rec.candidate_id):
+        return False
+    has_oos_folds = len(rec.oos_folds) > 0
+    has_baseline_evidence = bool(baseline.get("closed_trades")) or bool(
+        baseline.get("oos_ranges")
+    )
+    if not (has_oos_folds or has_baseline_evidence):
+        return False
     return signal == "candidate_dsl_trees" and is_full and completed > 0
 
 
-def extract_oos_return_series(rec: EvaluationRecord) -> list[float]:
-    """OOS return observations from completed Full WFO fold / trade artifacts."""
+@dataclass(frozen=True)
+class OOSStatisticsSeries:
+    """Coherent OOS observation series for DSR — one explicit observation type."""
+
+    values: tuple[float, ...]
+    observation_type: str
+    normalization_method: str
+    timestamps: tuple[str, ...]
+    observation_count: int
+    frequency: str
+    source_artifact: str
+    input_fingerprint: str
+    reason: str | None = None
+
+    @property
+    def is_sufficient(self) -> bool:
+        return (
+            self.observation_type != OBS_INSUFFICIENT
+            and self.observation_count >= 1
+            and len(self.values) == self.observation_count
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "observation_type": self.observation_type,
+            "normalization_method": self.normalization_method,
+            "source_timestamps": list(self.timestamps),
+            "observation_count": self.observation_count,
+            "frequency": self.frequency,
+            "source_artifact": self.source_artifact,
+            "input_fingerprint": self.input_fingerprint,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class AlignedPerformanceMatrix:
+    """Timestamp/partition-aligned PBO matrix — rows are common market periods."""
+
+    matrix: np.ndarray | None
+    common_time_index: tuple[str, ...]
+    partition_frequency: str
+    candidate_ids: tuple[str, ...]
+    missing_counts: dict[str, int]
+    fill_policy: str
+    alignment_fingerprint: str
+    reason: str | None = None
+
+    @property
+    def is_usable(self) -> bool:
+        return self.matrix is not None and self.reason is None
+
+    def as_dict(self) -> dict[str, Any]:
+        shape = list(self.matrix.shape) if self.matrix is not None else None
+        return {
+            "common_time_index": list(self.common_time_index),
+            "partition_frequency": self.partition_frequency,
+            "candidate_ids": list(self.candidate_ids),
+            "matrix_shape": shape,
+            "missing_counts": dict(self.missing_counts),
+            "fill_policy": self.fill_policy,
+            "alignment_fingerprint": self.alignment_fingerprint,
+            "reason": self.reason,
+        }
+
+
+def _parse_timestamp(val: Any) -> datetime | None:
+    """Parse a real timestamp; never hash malformed strings into artificial hours."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, (int, float)):
+        # Epoch seconds / ms heuristic.
+        x = float(val)
+        if x > 1e12:
+            x = x / 1000.0
+        if x < 1e8:
+            return None
+        try:
+            return datetime.utcfromtimestamp(x)
+        except (OSError, OverflowError, ValueError):
+            return None
+    s = str(val).strip()
+    if not s:
+        return None
+    # ISO-like: YYYY-MM-DD[ T]HH:MM[:SS]
+    iso = s.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError:
+        pass
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(s[:19], fmt) if len(s) >= 10 else None
+        except ValueError:
+            continue
+    return None
+
+
+def _trade_timestamp_str(trade: dict[str, Any]) -> str | None:
+    for key in ("exit_time", "entry_time", "timestamp"):
+        dt = _parse_timestamp(trade.get(key))
+        if dt is not None:
+            return dt.isoformat(sep="T", timespec="seconds")
+    return None
+
+
+def _trade_hour(trade: dict[str, Any]) -> int | None:
+    for key in ("exit_time", "entry_time", "timestamp"):
+        dt = _parse_timestamp(trade.get(key))
+        if dt is not None:
+            return int(dt.hour)
+    return None
+
+
+def _trade_partition_keys(trade: dict[str, Any]) -> dict[str, str]:
+    """Return available calendar/partition keys for a trade (no ordinal inventing)."""
+    keys: dict[str, str] = {}
+    if trade.get("fold_id") is not None:
+        try:
+            keys[PARTITION_WFO_VALIDATION_PERIOD] = f"fold:{int(trade['fold_id'])}"
+        except (TypeError, ValueError):
+            pass
+    for key in ("exit_time", "entry_time", "timestamp"):
+        dt = _parse_timestamp(trade.get(key))
+        if dt is not None:
+            keys[PARTITION_TRADING_DAY] = dt.strftime("%Y-%m-%d")
+            break
+    return keys
+
+
+def _normalized_trade_return(trade: dict[str, Any]) -> tuple[float, str] | None:
+    """Extract a documented normalized trade return — never raw monetary PnL alone."""
+    for key in (
+        "normalized_equity_return",
+        "equity_return",
+        "bar_return",
+        "normalized_bar_return",
+    ):
+        if trade.get(key) is not None:
+            try:
+                return float(trade[key]), NORM_EQUITY_BAR
+            except (TypeError, ValueError):
+                continue
+    for key in (
+        "net_return",
+        "normalized_return",
+        "trade_return",
+        "normalized_net_return",
+    ):
+        if trade.get(key) is not None:
+            try:
+                return float(trade[key]), NORM_TRADE_RETURN_FIELD
+            except (TypeError, ValueError):
+                continue
+    # Explicit ``return`` only when paired with documented capital / exposure.
+    if trade.get("return") is not None and (
+        trade.get("normalization") in {"capital", "notional", "risk", "qty", "exposure"}
+        or trade.get("normalized") is True
+        or trade.get("return_is_normalized") is True
+    ):
+        try:
+            return float(trade["return"]), NORM_TRADE_RETURN_FIELD
+        except (TypeError, ValueError):
+            pass
+    # Documented PnL / exposure normalization.
+    pnl = None
+    for key in ("net_pnl", "realized_pnl", "pnl"):
+        if trade.get(key) is not None:
+            try:
+                pnl = float(trade[key])
+                break
+            except (TypeError, ValueError):
+                continue
+    if pnl is None:
+        return None
+    exposure = None
+    for key in ("notional", "risk_exposure", "position_exposure", "capital", "qty", "quantity"):
+        if trade.get(key) is not None:
+            try:
+                cand_exp = abs(float(trade[key]))
+                if cand_exp > 0:
+                    exposure = cand_exp
+                    break
+            except (TypeError, ValueError):
+                continue
+    if exposure is not None and exposure > 0:
+        return float(pnl) / float(exposure), NORM_PNL_OVER_NOTIONAL
+    return None
+
+
+def extract_oos_statistics_series(rec: EvaluationRecord) -> OOSStatisticsSeries:
+    """Explicit OOS statistics series extractor for DSR.
+
+    Preferred order:
+    1. timestamped normalized equity/bar returns;
+    2. timestamped normalized net trade returns;
+    3. otherwise STATISTICS_INSUFFICIENT_DATA.
+
+    Never silently mixes raw PnL, unlabeled returns, or fold expectancy.
+    """
     baseline = _baseline_artifacts(rec)
     trades = baseline.get("closed_trades")
-    returns: list[float] = []
-    if isinstance(trades, list) and trades:
+    equity_vals: list[float] = []
+    equity_ts: list[str] = []
+    trade_vals: list[float] = []
+    trade_ts: list[str] = []
+    trade_norm = NORM_NONE
+
+    if isinstance(trades, list):
         for t in trades:
             if not isinstance(t, dict):
                 continue
-            for key in ("net_pnl", "realized_pnl", "pnl", "return"):
-                if key in t and t[key] is not None:
-                    try:
-                        returns.append(float(t[key]))
-                        break
-                    except (TypeError, ValueError):
-                        continue
-    if len(returns) >= 2:
-        return returns
-    # Fold-level OOS expectancy is a real WFO artifact — not a fabricated statistic.
-    fold_rets = [float(f.expectancy) for f in rec.oos_folds]
-    return fold_rets
+            got = _normalized_trade_return(t)
+            if got is None:
+                continue
+            val, method = got
+            ts = _trade_timestamp_str(t) or ""
+            if method == NORM_EQUITY_BAR:
+                equity_vals.append(val)
+                equity_ts.append(ts)
+            else:
+                trade_vals.append(val)
+                trade_ts.append(ts)
+                trade_norm = method
+
+    def _pack(
+        values: list[float],
+        timestamps: list[str],
+        *,
+        observation_type: str,
+        normalization_method: str,
+        source_artifact: str,
+        frequency: str,
+    ) -> OOSStatisticsSeries:
+        fp = _stable_fingerprint(
+            {
+                "observation_type": observation_type,
+                "normalization_method": normalization_method,
+                "values": values,
+                "timestamps": timestamps,
+                "candidate_id": rec.candidate_id,
+                "source_artifact": source_artifact,
+            }
+        )
+        return OOSStatisticsSeries(
+            values=tuple(float(v) for v in values),
+            observation_type=observation_type,
+            normalization_method=normalization_method,
+            timestamps=tuple(timestamps),
+            observation_count=len(values),
+            frequency=frequency,
+            source_artifact=source_artifact,
+            input_fingerprint=fp,
+            reason=None,
+        )
+
+    if len(equity_vals) >= 1 and all(equity_ts):
+        return _pack(
+            equity_vals,
+            equity_ts,
+            observation_type=OBS_NORMALIZED_EQUITY_BAR_RETURN,
+            normalization_method=NORM_EQUITY_BAR,
+            source_artifact="baseline_wfo_artifacts.closed_trades",
+            frequency="trade_event",
+        )
+    if len(equity_vals) >= 1:
+        # Equity/bar fields present but missing timestamps → still typed, timed when possible.
+        return _pack(
+            equity_vals,
+            equity_ts,
+            observation_type=OBS_NORMALIZED_EQUITY_BAR_RETURN,
+            normalization_method=NORM_EQUITY_BAR,
+            source_artifact="baseline_wfo_artifacts.closed_trades",
+            frequency="trade_event_partial_timestamps",
+        )
+    if len(trade_vals) >= 1 and all(trade_ts):
+        return _pack(
+            trade_vals,
+            trade_ts,
+            observation_type=OBS_NORMALIZED_TRADE_RETURN,
+            normalization_method=trade_norm,
+            source_artifact="baseline_wfo_artifacts.closed_trades",
+            frequency="trade_event",
+        )
+    if len(trade_vals) >= 1:
+        return _pack(
+            trade_vals,
+            trade_ts,
+            observation_type=OBS_NORMALIZED_TRADE_RETURN,
+            normalization_method=trade_norm,
+            source_artifact="baseline_wfo_artifacts.closed_trades",
+            frequency="trade_event_partial_timestamps",
+        )
+
+    # Fold expectancy is NOT a homogeneous return observation — refuse.
+    reason = STATISTICS_INSUFFICIENT_DATA
+    if isinstance(trades, list) and trades:
+        reason = (
+            f"{STATISTICS_INSUFFICIENT_DATA}:raw_or_unnormalized_pnl_without_"
+            "documented_capital_or_risk_exposure"
+        )
+    elif rec.oos_folds:
+        reason = (
+            f"{STATISTICS_INSUFFICIENT_DATA}:fold_expectancy_is_not_a_return_observation"
+        )
+    else:
+        reason = f"{STATISTICS_INSUFFICIENT_DATA}:{STATISTICS_MISSING_OOS_ARTIFACTS}"
+
+    fp = _stable_fingerprint(
+        {
+            "observation_type": OBS_INSUFFICIENT,
+            "candidate_id": rec.candidate_id,
+            "reason": reason,
+            "n_folds": len(rec.oos_folds),
+            "n_trades": len(trades) if isinstance(trades, list) else 0,
+        }
+    )
+    return OOSStatisticsSeries(
+        values=(),
+        observation_type=OBS_INSUFFICIENT,
+        normalization_method=NORM_NONE,
+        timestamps=(),
+        observation_count=0,
+        frequency="none",
+        source_artifact="none",
+        input_fingerprint=fp,
+        reason=reason,
+    )
+
+
+def extract_oos_return_series(rec: EvaluationRecord) -> list[float]:
+    """Backward-compatible values-only view of ``extract_oos_statistics_series``."""
+    series = extract_oos_statistics_series(rec)
+    if not series.is_sufficient:
+        return []
+    return list(series.values)
 
 
 def extract_trade_timing_vector(
     rec: EvaluationRecord, *, n_bins: int = 16
-) -> tuple[float, ...]:
+) -> tuple[tuple[float, ...], dict[str, Any]]:
+    """Hour-of-day timing histogram from *parsed* timestamps only.
+
+    Returns (vector_or_empty, meta). Does not fabricate bins from ``hash()``,
+    malformed timestamp strings, fold_id, or candidate sequence.
+    """
     baseline = _baseline_artifacts(rec)
     trades = baseline.get("closed_trades")
     counts = [0.0] * n_bins
+    parsed = 0
+    skipped_invalid = 0
     if isinstance(trades, list) and trades:
-        for i, t in enumerate(trades):
+        for t in trades:
             if not isinstance(t, dict):
                 continue
-            # Prefer explicit timestamps; else distribute by fold_id / sequence.
-            hour = None
-            for key in ("exit_time", "entry_time", "timestamp"):
-                val = t.get(key)
-                if val is None:
-                    continue
-                try:
-                    # ISO / epoch / hour int
-                    if isinstance(val, (int, float)):
-                        hour = int(val) % 24
-                    else:
-                        s = str(val)
-                        if "T" in s and len(s) >= 13:
-                            hour = int(s[11:13])
-                        else:
-                            hour = abs(hash(s)) % 24
-                    break
-                except (TypeError, ValueError):
-                    continue
+            hour = _trade_hour(t)
             if hour is None:
-                fold = int(t.get("fold_id") or 0)
-                hour = (fold * 3 + i) % 24
+                # Invalid / missing timestamps: do not invent timing evidence.
+                skipped_invalid += 1
+                continue
             bin_i = int((hour / 24.0) * n_bins) % n_bins
             counts[bin_i] += 1.0
-        total = sum(counts) or 1.0
-        return tuple(c / total for c in counts)
-    # Fold trade-count timing proxy from OOS folds.
-    for i, f in enumerate(rec.oos_folds):
-        counts[i % n_bins] += float(max(0, int(f.n_trades)))
+            parsed += 1
+    meta: dict[str, Any] = {
+        "available": parsed > 0,
+        "parsed_timestamps": parsed,
+        "skipped_invalid_or_missing": skipped_invalid,
+        "status": "ok" if parsed > 0 else TIMING_DATA_UNAVAILABLE,
+    }
+    if parsed <= 0:
+        return tuple(), meta
     total = sum(counts) or 1.0
-    return tuple(c / total for c in counts)
+    return tuple(c / total for c in counts), meta
 
 
-def extract_exposure_vector(rec: EvaluationRecord, *, n_bins: int = 8) -> tuple[float, ...]:
+def extract_exposure_vector(
+    rec: EvaluationRecord, *, n_bins: int = 8
+) -> tuple[tuple[float, ...], dict[str, Any]]:
+    """Exposure histogram from quantity / notional / risk — never absolute PnL."""
     baseline = _baseline_artifacts(rec)
     trades = baseline.get("closed_trades")
+    sizes: list[float] = []
+    skipped_pnl_only = 0
     if isinstance(trades, list) and trades:
-        sizes: list[float] = []
         for t in trades:
             if not isinstance(t, dict):
                 continue
             size = None
-            for key in ("qty", "quantity", "size", "exposure", "notional"):
+            for key in (
+                "qty",
+                "quantity",
+                "size",
+                "exposure",
+                "notional",
+                "risk_exposure",
+                "position_exposure",
+            ):
                 if t.get(key) is not None:
                     try:
-                        size = abs(float(t[key]))
-                        break
+                        cand = abs(float(t[key]))
+                        if cand > 0:
+                            size = cand
+                            break
                     except (TypeError, ValueError):
                         continue
             if size is None:
-                pnl = t.get("net_pnl") or t.get("realized_pnl") or t.get("pnl")
-                try:
-                    size = abs(float(pnl)) if pnl is not None else 1.0
-                except (TypeError, ValueError):
-                    size = 1.0
+                # PnL is not exposure — record gap explicitly.
+                if any(t.get(k) is not None for k in ("net_pnl", "realized_pnl", "pnl")):
+                    skipped_pnl_only += 1
+                continue
             sizes.append(size)
-        if sizes:
-            arr = np.asarray(sizes, dtype=float)
-            # Histogram of exposure magnitudes (normalized).
-            hist, _ = np.histogram(arr, bins=n_bins)
-            total = float(hist.sum()) or 1.0
-            return tuple(float(x) / total for x in hist.tolist())
-    # Fold turnover / trade-count exposure proxy.
-    vec = []
-    for f in rec.oos_folds:
-        turnover = float(getattr(f, "turnover", 0.0) or 0.0)
-        trades_n = float(max(0, int(f.n_trades)))
-        vec.append(turnover if turnover > 0 else trades_n)
-    while len(vec) < n_bins:
-        vec = vec + vec if vec else [0.0]
-    total = sum(vec[:n_bins]) or 1.0
-    return tuple(float(v) / total for v in vec[:n_bins])
+    meta: dict[str, Any] = {
+        "available": len(sizes) > 0,
+        "n_exposure_observations": len(sizes),
+        "skipped_pnl_used_as_exposure": skipped_pnl_only,
+        "status": "ok" if sizes else EXPOSURE_DATA_UNAVAILABLE,
+    }
+    if not sizes:
+        return tuple(), meta
+    arr = np.asarray(sizes, dtype=float)
+    hist, _ = np.histogram(arr, bins=n_bins)
+    total = float(hist.sum()) or 1.0
+    return tuple(float(x) / total for x in hist.tolist()), meta
+
+
+def extract_daily_oos_pnl_vector(
+    rec: EvaluationRecord, *, n_bins: int = 16
+) -> tuple[tuple[float, ...], dict[str, Any]]:
+    """Time-aligned daily OOS PnL (or normalized daily return) for ``daily_pnl``."""
+    baseline = _baseline_artifacts(rec)
+    trades = baseline.get("closed_trades")
+    by_day: dict[str, float] = {}
+    used_return = False
+    if isinstance(trades, list):
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            day = None
+            for key in ("exit_time", "entry_time", "timestamp"):
+                dt = _parse_timestamp(t.get(key))
+                if dt is not None:
+                    day = dt.strftime("%Y-%m-%d")
+                    break
+            if day is None:
+                continue
+            got = _normalized_trade_return(t)
+            if got is not None:
+                by_day[day] = by_day.get(day, 0.0) + float(got[0])
+                used_return = True
+                continue
+            pnl = None
+            for key in ("net_pnl", "realized_pnl", "pnl"):
+                if t.get(key) is not None:
+                    try:
+                        pnl = float(t[key])
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            if pnl is not None:
+                by_day[day] = by_day.get(day, 0.0) + float(pnl)
+    meta: dict[str, Any] = {
+        "available": len(by_day) > 0,
+        "n_days": len(by_day),
+        "value_kind": (
+            "normalized_daily_return" if used_return and by_day else "daily_oos_pnl"
+        ),
+        "common_days": sorted(by_day.keys()),
+    }
+    if not by_day:
+        meta["status"] = "daily_pnl_unavailable"
+        return tuple(), meta
+    ordered = [by_day[d] for d in sorted(by_day.keys())]
+    # Pad/truncate to n_bins for correlation stability while preserving time order.
+    if len(ordered) < n_bins:
+        ordered = ordered + [0.0] * (n_bins - len(ordered))
+    meta["status"] = "ok"
+    return tuple(float(x) for x in ordered[:n_bins]), meta
 
 
 def build_behavioral_signature(
@@ -395,39 +821,71 @@ def build_behavioral_signature(
     *,
     n_bins: int = 16,
 ) -> BehaviorSignature | None:
-    """Build signature from OOS returns, trade timing, exposure (Full WFO artifacts)."""
+    """Build signature from time-aligned daily OOS PnL + timing + exposure.
+
+    Required: Full WFO + daily OOS PnL/returns vector.
+    Timing/exposure may be unavailable → documented reduced signature.
+    Never uses builtin ``hash()``; never treats PnL as exposure.
+    """
     if not _full_wfo_completed(rec):
         return None
-    returns = extract_oos_return_series(rec)
-    if len(returns) < 1:
+    daily, daily_meta = extract_daily_oos_pnl_vector(rec, n_bins=n_bins)
+    if not daily_meta.get("available"):
         return None
-    timing = extract_trade_timing_vector(rec, n_bins=n_bins)
-    exposure = extract_exposure_vector(rec, n_bins=max(4, n_bins // 2))
-    # Signal vector = OOS returns (padded) + timing + exposure for correlation.
-    signal = list(returns)
+    timing, timing_meta = extract_trade_timing_vector(rec, n_bins=n_bins)
+    exposure, exposure_meta = extract_exposure_vector(
+        rec, n_bins=max(4, n_bins // 2)
+    )
+    stats = extract_oos_statistics_series(rec)
+    signal: list[float]
+    if stats.is_sufficient:
+        signal = list(stats.values)
+    else:
+        signal = list(daily)
     while len(signal) < n_bins:
         signal = signal + signal if signal else [0.0]
     signal = signal[:n_bins]
-    # daily_pnl slot carries timing∥exposure blend for pairwise correlation.
-    pnl = list(timing[: n_bins // 2]) + list(exposure[: n_bins - n_bins // 2])
-    while len(pnl) < n_bins:
-        pnl.append(0.0)
+
+    availability = {
+        "daily_pnl": True,
+        "timing": bool(timing_meta.get("available")),
+        "exposure": bool(exposure_meta.get("available")),
+        "normalized_returns": stats.is_sufficient,
+    }
+    if availability["timing"] and availability["exposure"]:
+        weights = {"daily_pnl": 0.4, "timing": 0.2, "exposure": 0.2, "features": 0.2}
+        kind = "full"
+    elif availability["timing"] or availability["exposure"]:
+        weights = {"daily_pnl": 0.6, "timing": 0.15, "exposure": 0.05, "features": 0.2}
+        kind = "reduced_missing_timing_or_exposure"
+    else:
+        weights = {"daily_pnl": 0.8, "timing": 0.0, "exposure": 0.0, "features": 0.2}
+        kind = "reduced_daily_pnl_only"
+
     fit = rec.fitness.fitness if rec.fitness else float("-inf")
     return BehaviorSignature(
         candidate_id=candidate.candidate_id,
         signal_vector=tuple(float(x) for x in signal),
-        daily_pnl=tuple(float(x) for x in pnl[:n_bins]),
+        daily_pnl=tuple(float(x) for x in daily),
         feature_ids=candidate.feature_ids,
         complexity=candidate.complexity_score,
         fitness=float(fit) if fit is not None else float("-inf"),
+        timing_vector=tuple(float(x) for x in timing),
+        exposure_vector=tuple(float(x) for x in exposure),
+        component_availability=tuple(sorted(availability.items())),
+        component_weights=tuple(sorted(weights.items())),
+        signature_kind=kind,
     )
 
 
-def _observed_sharpe_from_folds(folds: Sequence[FoldOOSMetrics]) -> float | None:
-    if not folds:
+def _sharpe_from_returns(returns: Sequence[float]) -> float | None:
+    arr = np.asarray(list(returns), dtype=float)
+    if len(arr) < 2:
         return None
-    sharpes = [float(f.sharpe) for f in folds]
-    return float(np.median(np.asarray(sharpes, dtype=float)))
+    s = float(arr.std(ddof=1))
+    if s < 1e-12:
+        return 0.0
+    return float(arr.mean() / s)
 
 
 def _skew_kurtosis(returns: Sequence[float]) -> tuple[float, float]:
@@ -451,7 +909,7 @@ def build_full_wfo_trial_population(
     Full-WFO completed trial ledger for DSR/PBO.
 
     Includes rejected Full WFO trials (search intensity). Never Top-N only.
-    Returns (population, ordered_candidate_ids, per-trial return series).
+    Trial scores are Sharpe of the same normalized OOS series used for DSR.
     """
     scores: list[float] = []
     ids: list[str] = []
@@ -461,14 +919,13 @@ def build_full_wfo_trial_population(
     for rec in records:
         if not _full_wfo_completed(rec):
             continue
-        rets = extract_oos_return_series(rec)
-        if len(rets) < 1:
+        series = extract_oos_statistics_series(rec)
+        if not series.is_sufficient:
+            failed += 1
             continue
-        sharpe = _observed_sharpe_from_folds(rec.oos_folds)
-        if sharpe is None and rec.fitness is not None and not rec.fitness.rejected:
-            sharpe = float(rec.fitness.fitness)
+        rets = list(series.values)
+        sharpe = _sharpe_from_returns(rets)
         if sharpe is None:
-            # Still count toward intensity when WFO completed but no score.
             failed += 1
             continue
         scores.append(float(sharpe))
@@ -486,47 +943,297 @@ def build_full_wfo_trial_population(
     return population, ids, series_list
 
 
+def _period_series_for_candidate(
+    rec: EvaluationRecord,
+) -> tuple[dict[str, float], str | None]:
+    """Map partition key → period performance for one candidate.
+
+    Prefers WFO validation fold periods; else trading-day aggregation.
+    Returns ({}, None) when only trade-sequence ordering would be possible.
+    """
+    baseline = _baseline_artifacts(rec)
+    trades = baseline.get("closed_trades")
+    if not isinstance(trades, list) or not trades:
+        return {}, None
+
+    fold_map: dict[str, float] = {}
+    day_map: dict[str, float] = {}
+    any_partition = False
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        keys = _trade_partition_keys(t)
+        if not keys:
+            continue
+        any_partition = True
+        value = None
+        got = _normalized_trade_return(t)
+        if got is not None:
+            value = float(got[0])
+        else:
+            for pk in ("net_pnl", "realized_pnl", "pnl"):
+                if t.get(pk) is not None:
+                    try:
+                        value = float(t[pk])
+                        break
+                    except (TypeError, ValueError):
+                        continue
+        if value is None:
+            continue
+        if PARTITION_WFO_VALIDATION_PERIOD in keys:
+            k = keys[PARTITION_WFO_VALIDATION_PERIOD]
+            fold_map[k] = fold_map.get(k, 0.0) + value
+        if PARTITION_TRADING_DAY in keys:
+            k = keys[PARTITION_TRADING_DAY]
+            day_map[k] = day_map.get(k, 0.0) + value
+
+    if not any_partition:
+        return {}, None
+    if fold_map:
+        return fold_map, PARTITION_WFO_VALIDATION_PERIOD
+    if day_map:
+        return day_map, PARTITION_TRADING_DAY
+    return {}, None
+
+
 def align_performance_matrix(
-    series_list: Sequence[Sequence[float]],
-) -> np.ndarray | None:
-    """Align per-trial OOS return series into (n_obs, n_trials); None if unusable."""
-    if len(series_list) < 2:
+    records: Sequence[EvaluationRecord] | Sequence[Sequence[float]] | None = None,
+    *,
+    candidate_ids: Sequence[str] | None = None,
+    fill_policy: str = FILL_ZERO_WHEN_NO_TRADE,
+    min_periods: int = 2,
+    max_missing_fraction: float = 0.75,
+    series_list: Sequence[Sequence[float]] | None = None,
+) -> np.ndarray | AlignedPerformanceMatrix | None:
+    """Align candidates onto a shared market-time partition index.
+
+    Rows are common calendar / WFO validation periods — never trade ordinals.
+    Legacy ``series_list``-only callers receive ``None`` (trade-sequence refuse).
+    """
+    # Legacy path: bare float sequences are trade-ordinal — refuse.
+    if series_list is not None and records is None:
         return None
-    lengths = [len(s) for s in series_list]
-    n_obs = int(min(lengths))
-    if n_obs < 2:
+    if records is not None and records and not isinstance(records[0], EvaluationRecord):
+        # Old API: align_performance_matrix(list_of_float_series)
         return None
-    matrix = np.column_stack(
-        [np.asarray(s[:n_obs], dtype=float) for s in series_list]
+    if records is None:
+        return None
+
+    recs = [r for r in records if isinstance(r, EvaluationRecord)]
+    if candidate_ids is not None:
+        want = list(candidate_ids)
+        by_id = {r.candidate_id: r for r in recs}
+        ordered_recs = [by_id[c] for c in want if c in by_id]
+        ids = [r.candidate_id for r in ordered_recs]
+    else:
+        ordered_recs = list(recs)
+        ids = [r.candidate_id for r in ordered_recs]
+
+    if len(ordered_recs) < 2:
+        return AlignedPerformanceMatrix(
+            matrix=None,
+            common_time_index=(),
+            partition_frequency="",
+            candidate_ids=tuple(ids),
+            missing_counts={},
+            fill_policy=fill_policy,
+            alignment_fingerprint=_stable_fingerprint({"reason": PBO_MATRIX_INSUFFICIENT}),
+            reason=PBO_MATRIX_INSUFFICIENT,
+        )
+
+    per_cand: list[dict[str, float]] = []
+    freqs: list[str] = []
+    for rec in ordered_recs:
+        series, freq = _period_series_for_candidate(rec)
+        if freq is None or not series:
+            return AlignedPerformanceMatrix(
+                matrix=None,
+                common_time_index=(),
+                partition_frequency="",
+                candidate_ids=tuple(ids),
+                missing_counts={},
+                fill_policy=fill_policy,
+                alignment_fingerprint=_stable_fingerprint(
+                    {"reason": PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY, "ids": ids}
+                ),
+                reason=PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY,
+            )
+        per_cand.append(series)
+        freqs.append(freq)
+
+    # Prefer a single common frequency; if mixed, use trading day when available.
+    if all(f == PARTITION_WFO_VALIDATION_PERIOD for f in freqs):
+        partition_frequency = PARTITION_WFO_VALIDATION_PERIOD
+    elif all(f == PARTITION_TRADING_DAY for f in freqs):
+        partition_frequency = PARTITION_TRADING_DAY
+    else:
+        # Re-extract trading-day maps for consistency across candidates.
+        partition_frequency = PARTITION_TRADING_DAY
+        per_cand = []
+        for rec in ordered_recs:
+            baseline = _baseline_artifacts(rec)
+            trades = baseline.get("closed_trades")
+            day_map: dict[str, float] = {}
+            if isinstance(trades, list):
+                for t in trades:
+                    if not isinstance(t, dict):
+                        continue
+                    keys = _trade_partition_keys(t)
+                    if PARTITION_TRADING_DAY not in keys:
+                        continue
+                    value = None
+                    got = _normalized_trade_return(t)
+                    if got is not None:
+                        value = float(got[0])
+                    else:
+                        for pk in ("net_pnl", "realized_pnl", "pnl"):
+                            if t.get(pk) is not None:
+                                try:
+                                    value = float(t[pk])
+                                    break
+                                except (TypeError, ValueError):
+                                    continue
+                    if value is None:
+                        continue
+                    k = keys[PARTITION_TRADING_DAY]
+                    day_map[k] = day_map.get(k, 0.0) + value
+            if not day_map:
+                return AlignedPerformanceMatrix(
+                    matrix=None,
+                    common_time_index=(),
+                    partition_frequency=partition_frequency,
+                    candidate_ids=tuple(ids),
+                    missing_counts={},
+                    fill_policy=fill_policy,
+                    alignment_fingerprint=_stable_fingerprint(
+                        {"reason": PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY}
+                    ),
+                    reason=PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY,
+                )
+            per_cand.append(day_map)
+
+    # Shared sorted partition index = sorted union of all candidate periods.
+    index_set: set[str] = set()
+    for m in per_cand:
+        index_set.update(m.keys())
+    common_index = tuple(sorted(index_set))
+    if len(common_index) < int(min_periods):
+        return AlignedPerformanceMatrix(
+            matrix=None,
+            common_time_index=common_index,
+            partition_frequency=partition_frequency,
+            candidate_ids=tuple(ids),
+            missing_counts={},
+            fill_policy=fill_policy,
+            alignment_fingerprint=_stable_fingerprint(
+                {"reason": PBO_ALIGNMENT_INSUFFICIENT_PERIODS, "index": list(common_index)}
+            ),
+            reason=PBO_ALIGNMENT_INSUFFICIENT_PERIODS,
+        )
+
+    missing_counts: dict[str, int] = {}
+    columns: list[np.ndarray] = []
+    for cid, series in zip(ids, per_cand):
+        col = []
+        missing = 0
+        for period in common_index:
+            if period in series:
+                col.append(float(series[period]))
+            else:
+                missing += 1
+                if fill_policy == FILL_ZERO_WHEN_NO_TRADE:
+                    col.append(0.0)
+                else:
+                    col.append(float("nan"))
+        missing_counts[cid] = missing
+        columns.append(np.asarray(col, dtype=float))
+
+    total_cells = len(common_index) * len(ids)
+    total_missing = sum(missing_counts.values())
+    if total_cells > 0 and (total_missing / total_cells) > float(max_missing_fraction):
+        return AlignedPerformanceMatrix(
+            matrix=None,
+            common_time_index=common_index,
+            partition_frequency=partition_frequency,
+            candidate_ids=tuple(ids),
+            missing_counts=missing_counts,
+            fill_policy=fill_policy,
+            alignment_fingerprint=_stable_fingerprint(
+                {
+                    "reason": PBO_ALIGNMENT_TOO_MANY_MISSING,
+                    "missing_counts": missing_counts,
+                }
+            ),
+            reason=PBO_ALIGNMENT_TOO_MANY_MISSING,
+        )
+
+    matrix = np.column_stack(columns)
+    fp = _stable_fingerprint(
+        {
+            "common_time_index": list(common_index),
+            "partition_frequency": partition_frequency,
+            "candidate_ids": list(ids),
+            "matrix_shape": list(matrix.shape),
+            "missing_counts": missing_counts,
+            "fill_policy": fill_policy,
+            # Content fingerprint via stable hash of rounded values.
+            "matrix_digest": [
+                [round(float(x), 10) for x in matrix[:, j].tolist()]
+                for j in range(matrix.shape[1])
+            ],
+        }
     )
-    return matrix
+    return AlignedPerformanceMatrix(
+        matrix=matrix,
+        common_time_index=common_index,
+        partition_frequency=partition_frequency,
+        candidate_ids=tuple(ids),
+        missing_counts=missing_counts,
+        fill_policy=fill_policy,
+        alignment_fingerprint=fp,
+        reason=None,
+    )
 
 
 def evaluate_candidate_dsr_pbo(
     *,
     rec: EvaluationRecord,
     population: TrialPopulation,
-    performance_matrix: np.ndarray | None,
+    performance_matrix: np.ndarray | AlignedPerformanceMatrix | None,
     trial_column_index: int | None,
     config: ResearchShortlistConfig,
 ) -> tuple[DSRResult, PBOResult | None, dict[str, Any]]:
     """Real DSR (+ optional PBO) — never fabricates OK on insufficient data."""
-    returns = extract_oos_return_series(rec)
-    n_obs = len(returns)
-    observed = _observed_sharpe_from_folds(rec.oos_folds)
+    series = extract_oos_statistics_series(rec)
+    returns = list(series.values) if series.is_sufficient else []
+    n_obs = int(series.observation_count)
+    observed = _sharpe_from_returns(returns) if series.is_sufficient else None
     meta: dict[str, Any] = {
-        "n_observations_source": "closed_trades_or_oos_fold_expectancy",
+        **series.as_dict(),
         "n_observations": n_obs,
         "full_wfo_completed": _full_wfo_completed(rec),
     }
-    if observed is None:
+
+    aligned_meta: dict[str, Any] = {}
+    matrix_arr: np.ndarray | None = None
+    pbo_reason_override: str | None = None
+    if isinstance(performance_matrix, AlignedPerformanceMatrix):
+        aligned_meta = performance_matrix.as_dict()
+        meta["pbo_alignment"] = aligned_meta
+        if performance_matrix.is_usable:
+            matrix_arr = performance_matrix.matrix
+        else:
+            pbo_reason_override = performance_matrix.reason or PBO_MATRIX_INSUFFICIENT
+    elif isinstance(performance_matrix, np.ndarray):
+        matrix_arr = performance_matrix
+
+    if not series.is_sufficient or observed is None:
         dsr = compute_deflated_sharpe(
             0.0,
             population,
             n_observations=n_obs,
             min_observations=config.min_oos_observations_for_dsr,
         )
-        # Force insufficient when no observed sharpe artifact.
         if dsr.status == DSRStatus.OK:
             from metrics.dsr import DSRResult as _DR
 
@@ -548,10 +1255,55 @@ def evaluate_candidate_dsr_pbo(
                 skew=None,
                 kurtosis=None,
                 assumptions=dsr.assumptions,
-                reason=STATISTICS_MISSING_OOS_ARTIFACTS,
+                reason=series.reason or STATISTICS_INSUFFICIENT_DATA,
                 trial_selection=population.selection.value,
             )
+        elif series.reason and dsr.status == DSRStatus.INSUFFICIENT_DATA:
+            from metrics.dsr import DSRResult as _DR
+
+            dsr = _DR(
+                status=dsr.status,
+                deflated_sharpe=dsr.deflated_sharpe,
+                observed_sharpe=None,
+                expected_max_sharpe=dsr.expected_max_sharpe,
+                total_trials=dsr.total_trials,
+                scored_trials=dsr.scored_trials,
+                rejected_trials=dsr.rejected_trials,
+                failed_trials=dsr.failed_trials,
+                effective_independent_trials=dsr.effective_independent_trials,
+                trial_sharpe_variance=dsr.trial_sharpe_variance,
+                mean_correlation=dsr.mean_correlation,
+                n_clusters=dsr.n_clusters,
+                n_observations=n_obs,
+                sample_size=dsr.sample_size,
+                skew=None,
+                kurtosis=None,
+                assumptions=dsr.assumptions,
+                reason=series.reason,
+                trial_selection=dsr.trial_selection,
+            )
         pbo = None
+        if matrix_arr is None:
+            pbo = PBOResult(
+                status=PBOStatus.INSUFFICIENT_DATA,
+                pbo=None,
+                n_combinations=0,
+                n_splits=int(config.pbo_n_splits),
+                total_trials=population.total_trials,
+                scored_trials=population.scored_trials,
+                rejected_trials=population.rejected_trials,
+                failed_trials=population.failed_trials,
+                effective_independent_trials=float(population.total_trials),
+                mean_correlation=None,
+                n_clusters=None,
+                n_observations=n_obs,
+                sample_size=population.scored_trials,
+                median_logit=None,
+                performance_degradation=None,
+                assumptions="PBO requires time-aligned Full WFO performance matrix",
+                reason=pbo_reason_override or PBO_MATRIX_INSUFFICIENT,
+                trial_selection=population.selection.value,
+            )
         return dsr, pbo, meta
 
     skew, kurt = _skew_kurtosis(returns)
@@ -564,7 +1316,7 @@ def evaluate_candidate_dsr_pbo(
         min_observations=config.min_oos_observations_for_dsr,
     )
     pbo: PBOResult | None = None
-    if performance_matrix is None:
+    if matrix_arr is None:
         pbo = PBOResult(
             status=PBOStatus.INSUFFICIENT_DATA,
             pbo=None,
@@ -581,17 +1333,17 @@ def evaluate_candidate_dsr_pbo(
             sample_size=population.scored_trials,
             median_logit=None,
             performance_degradation=None,
-            assumptions="PBO requires aligned Full WFO performance matrix",
-            reason=PBO_MATRIX_INSUFFICIENT,
+            assumptions="PBO requires time-aligned Full WFO performance matrix",
+            reason=pbo_reason_override or PBO_MATRIX_INSUFFICIENT,
             trial_selection=population.selection.value,
         )
     else:
         pbo = compute_pbo(
-            performance_matrix,
+            matrix_arr,
             population=population,
             n_splits=int(config.pbo_n_splits),
         )
-        meta["pbo_matrix_shape"] = list(performance_matrix.shape)
+        meta["pbo_matrix_shape"] = list(matrix_arr.shape)
         meta["trial_column_index"] = trial_column_index
     return dsr, pbo, meta
 
@@ -784,6 +1536,7 @@ def select_best_per_cluster(
 
 
 __all__ = [
+    "AlignedPerformanceMatrix",
     "BEHAVIORALLY_CLUSTERED",
     "CLUSTERING_NOT_ENTERED",
     "CLUSTER_NO_GATE_PASSER",
@@ -793,6 +1546,8 @@ __all__ = [
     "DSR_FAILED",
     "DSR_INSUFFICIENT_DATA",
     "DSR_PASSED",
+    "EXPOSURE_DATA_UNAVAILABLE",
+    "FILL_ZERO_WHEN_NO_TRADE",
     "GATE_DSR_FAILED",
     "GATE_PBO_FAILED",
     "GATE_ROBUSTNESS_FAILED",
@@ -801,7 +1556,16 @@ __all__ = [
     "NOT_CLUSTER_REPRESENTATIVE",
     "NO_BEHAVIORAL_SIGNATURE",
     "NO_ROBUSTNESS_PASSED_FOR_STATISTICS",
+    "OBS_INSUFFICIENT",
+    "OBS_NORMALIZED_EQUITY_BAR_RETURN",
+    "OBS_NORMALIZED_TRADE_RETURN",
+    "OOSStatisticsSeries",
+    "PARTITION_TRADING_DAY",
+    "PARTITION_WFO_VALIDATION_PERIOD",
     "PBO_ABOVE_MAXIMUM",
+    "PBO_ALIGNMENT_INSUFFICIENT_PERIODS",
+    "PBO_ALIGNMENT_TOO_MANY_MISSING",
+    "PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY",
     "PBO_FAILED",
     "PBO_INSUFFICIENT_DATA",
     "PBO_MATRIX_INSUFFICIENT",
@@ -814,6 +1578,7 @@ __all__ = [
     "ResearchShortlistPhaseResult",
     "SHORTLIST_NOT_ENTERED",
     "SHORTLIST_REJECTED",
+    "STATISTICS_INSUFFICIENT_DATA",
     "STATISTICS_MISSING_OOS_ARTIFACTS",
     "STATISTICS_NOT_ENTERED",
     "STATISTICS_REQUIRES_FULL_WFO",
@@ -823,15 +1588,19 @@ __all__ = [
     "STATISTICALLY_PASSED",
     "STATISTICALLY_REJECTED",
     "ShortlistRejectRecord",
+    "TIMING_DATA_UNAVAILABLE",
     "align_performance_matrix",
     "build_behavioral_signature",
     "build_full_wfo_trial_population",
     "evaluate_candidate_dsr_pbo",
+    "extract_daily_oos_pnl_vector",
     "extract_exposure_vector",
     "extract_oos_return_series",
+    "extract_oos_statistics_series",
     "extract_trade_timing_vector",
     "hard_gate_check",
     "select_best_per_cluster",
     "BehavioralDeduper",
     "behavioral_similarity",
+    "_full_wfo_completed",
 ]

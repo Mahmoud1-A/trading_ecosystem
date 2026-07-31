@@ -48,6 +48,7 @@ from discovery.parameter_robustness import (
     SYNTHETIC_ROBUSTNESS_FORBIDDEN,
 )
 from discovery.research_shortlist_pipeline import (
+    AlignedPerformanceMatrix,
     BEHAVIORALLY_CLUSTERED,
     CLUSTERING_NOT_ENTERED,
     CampaignClusteringAccounting,
@@ -2691,11 +2692,32 @@ class MultiFamilyCampaign:
 
         stats_acct.candidates_robustness_passed = len(robustness_passed_ids)
         population, pop_ids, series_list = build_full_wfo_trial_population(all_records)
+        del series_list  # DSR uses per-record extractors; PBO uses time alignment.
         stats_acct.population_total_trials = population.total_trials
         stats_acct.population_scored_trials = population.scored_trials
-        matrix = align_performance_matrix(series_list)
-        if matrix is not None:
-            stats_acct.pbo_matrix_shape = (int(matrix.shape[0]), int(matrix.shape[1]))
+        # Time/partition-aligned PBO matrix (never trade-ordinal stacking).
+        ordered_pop_records: list[EvaluationRecord] = []
+        seen_pop: set[str] = set()
+        for cid in pop_ids:
+            if cid in seen_pop:
+                continue
+            seen_pop.add(cid)
+            for r in all_records:
+                if r.candidate_id == cid:
+                    ordered_pop_records.append(r)
+                    break
+        matrix = align_performance_matrix(
+            ordered_pop_records, candidate_ids=pop_ids
+        )
+        if (
+            isinstance(matrix, AlignedPerformanceMatrix)
+            and matrix.is_usable
+            and matrix.matrix is not None
+        ):
+            stats_acct.pbo_matrix_shape = (
+                int(matrix.matrix.shape[0]),
+                int(matrix.matrix.shape[1]),
+            )
         col_index = {cid: i for i, cid in enumerate(pop_ids)}
 
         self._emit(

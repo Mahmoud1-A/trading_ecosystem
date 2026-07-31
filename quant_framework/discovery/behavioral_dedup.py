@@ -19,6 +19,11 @@ class BehaviorSignature:
     feature_ids: tuple[str, ...]
     complexity: float
     fitness: float
+    timing_vector: tuple[float, ...] = ()
+    exposure_vector: tuple[float, ...] = ()
+    component_availability: tuple[tuple[str, bool], ...] = ()
+    component_weights: tuple[tuple[str, float], ...] = ()
+    signature_kind: str = "full"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -28,6 +33,11 @@ class BehaviorSignature:
             "feature_ids": list(self.feature_ids),
             "complexity": self.complexity,
             "fitness": self.fitness,
+            "timing_vector": list(self.timing_vector),
+            "exposure_vector": list(self.exposure_vector),
+            "component_availability": dict(self.component_availability),
+            "component_weights": dict(self.component_weights),
+            "signature_kind": self.signature_kind,
         }
 
 
