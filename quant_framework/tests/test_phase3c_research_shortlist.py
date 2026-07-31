@@ -36,6 +36,7 @@ from discovery.research_shortlist_pipeline import (
     ResearchShortlistConfig,
     AlignedPerformanceMatrix,
     align_performance_matrix,
+    build_aligned_behavioral_signatures,
     build_behavioral_signature,
     build_full_wfo_trial_population,
     evaluate_candidate_dsr_pbo,
@@ -45,10 +46,16 @@ from discovery.research_shortlist_pipeline import (
     extract_exposure_vector,
     hard_gate_check,
     _full_wfo_completed,
+    _normalized_trade_return,
+    _documented_notional_denominator,
     STATISTICS_INSUFFICIENT_DATA,
     OBS_INSUFFICIENT,
     PARTITION_TRADING_DAY,
     PARTITION_WFO_VALIDATION_PERIOD,
+    PBO_INPUT_UNNORMALIZED,
+    PBO_INSUFFICIENT_DATA,
+    NO_BEHAVIORAL_SIGNATURE,
+    NORM_PNL_OVER_NOTIONAL,
 )
 from discovery.stress_backend import STRESS_BACKEND_KIND
 from discovery.types import CreationMethod, ValueType
@@ -91,6 +98,8 @@ def _closed_trades(candidate_id: str, folds: list[FoldOOSMetrics]) -> list[dict[
                     "phase": "validation_oos",
                     "net_pnl": float(f.expectancy) * (0.8 + 0.1 * t_i),
                     "qty": float(1.0 + (hour % 5) * 0.25),
+                    "notional": 10_000.0,
+                    "net_return": float(f.expectancy) * (0.01 + 0.001 * t_i),
                     "exit_time": f"2024-01-{(f.fold_id % 28) + 1:02d}T{hour:02d}:15:00",
                     "entry_time": f"2024-01-{(f.fold_id % 28) + 1:02d}T{hour:02d}:00:00",
                 }
@@ -947,13 +956,15 @@ class TestPhase3C1StatisticalBehavioralIntegrity:
         assert aligned.common_time_index == ("fold:0", "fold:1", "fold:2")
         # Row 0 = fold 0 for BOTH candidates (not trade#0 vs trade#0 across unequal lengths).
         assert aligned.matrix.shape == (3, 2)
-        assert aligned.missing_counts["cand_a"] == 1  # no fold:1
-        assert aligned.fill_policy
-        assert aligned.alignment_fingerprint
-        # cand_a fold1 filled with 0 under zero-when-no-trade policy.
+        # cand_a has OOS fold coverage including fold:1 (no trade) → valid zero-fill.
+        cov_a = aligned.coverage_by_candidate["cand_a"]
+        assert "fold:1" in cov_a.zero_filled_periods
+        assert "fold:1" not in cov_a.uncovered_periods
         assert float(aligned.matrix[1, 0]) == 0.0
         assert float(aligned.matrix[0, 0]) != 0.0
         assert float(aligned.matrix[0, 1]) != 0.0
+        assert aligned.fill_policy
+        assert aligned.alignment_fingerprint
 
     def test_different_trade_counts_do_not_ordinal_align(self) -> None:
         # Different trade counts + different timestamps: alignment must be by day.
@@ -997,8 +1008,38 @@ class TestPhase3C1StatisticalBehavioralIntegrity:
                 "exit_time": "2024-06-06T12:00:00",
             },
         ]
-        rec_a = _rec_with_trades("a", trades_a, folds=_folds_for_candidate("a", n=2))
-        rec_b = _rec_with_trades("b", trades_b, folds=_folds_for_candidate("b", n=2))
+        rec_a = _rec_with_trades(
+            "a",
+            trades_a,
+            folds=_folds_for_candidate("a", n=2),
+            extra_baseline={
+                "oos_ranges": [
+                    {"start": "2024-06-01", "end": "2024-06-06", "fold_id": "0"},
+                ],
+                "oos_covered_days": [
+                    "2024-06-01",
+                    "2024-06-02",
+                    "2024-06-05",
+                    "2024-06-06",
+                ],
+            },
+        )
+        rec_b = _rec_with_trades(
+            "b",
+            trades_b,
+            folds=_folds_for_candidate("b", n=2),
+            extra_baseline={
+                "oos_ranges": [
+                    {"start": "2024-06-01", "end": "2024-06-06", "fold_id": "0"},
+                ],
+                "oos_covered_days": [
+                    "2024-06-01",
+                    "2024-06-02",
+                    "2024-06-05",
+                    "2024-06-06",
+                ],
+            },
+        )
         aligned = align_performance_matrix([rec_a, rec_b], candidate_ids=["a", "b"])
         assert aligned.is_usable and aligned.matrix is not None
         assert aligned.partition_frequency == PARTITION_TRADING_DAY
@@ -1007,6 +1048,11 @@ class TestPhase3C1StatisticalBehavioralIntegrity:
         # Prove NOT min-length ordinal truncate (that would yield shape (2, 2)).
         assert aligned.matrix.shape[0] == len(aligned.common_time_index)
         assert aligned.matrix.shape[0] >= 3
+        # Covered no-trade day for cand_a (2024-06-02) is zero-filled, not ordinal-shifted.
+        assert "2024-06-02" in aligned.common_time_index
+        idx = list(aligned.common_time_index).index("2024-06-02")
+        assert float(aligned.matrix[idx, 0]) == 0.0
+        assert float(aligned.matrix[idx, 1]) != 0.0
         # Legacy float-series API must refuse (trade-sequence only).
         assert align_performance_matrix([[0.1, 0.2], [0.3, 0.4, 0.5]]) is None
 
@@ -1240,4 +1286,588 @@ print(json.dumps(sig.as_dict(), sort_keys=True))
         assert results[0] == results[1] == results[2]
         assert results[0]["daily_pnl"]
         assert results[0]["signature_kind"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3C.2 adversarial acceptance: normalized PBO + common-calendar behavior
+# ---------------------------------------------------------------------------
+
+
+def _mk_cand(seed: int = 1, features: tuple[str, ...] | None = None):
+    feat = features or ("price.return_5",)
+    return build_candidate(
+        entry_tree=op_node(
+            OperatorId.GREATER_THAN,
+            feature_node(feat[0], ValueType.RETURN),
+            parameter_node("thr", 0.0, ValueType.SCALAR),
+        ),
+        exit_tree=feature_node("price.simple_return_1", ValueType.BOOLEAN),
+        stop=None,
+        target=None,
+        sizing=None,
+        regime_gates=(),
+        strategy_family="momentum",
+        creation_method=CreationMethod.RANDOM,
+        generation=0,
+        parent_ids=(),
+        grammar_version="g1",
+        feature_set_version="f1",
+        cost_model_version="c1",
+        asset_universe=("ES",),
+        random_seed=seed,
+    )
+
+
+class TestPhase3C2NormalizedEvidenceGaps:
+    """Adversarial proofs for PHASE 3C.2 statistical + behavioral integrity."""
+
+    def test_raw_pnl_cannot_enter_pbo_matrix(self) -> None:
+        # Only raw monetary PnL — must not form a PBO period matrix.
+        trades_a = [
+            {
+                "fold_id": i,
+                "net_pnl": 100.0 * (i + 1),
+                "exit_time": f"2024-08-{(i % 28) + 1:02d}T10:00:00",
+            }
+            for i in range(4)
+        ]
+        trades_b = [
+            {
+                "fold_id": i,
+                "realized_pnl": 50.0 * (i + 1),
+                "exit_time": f"2024-08-{(i % 28) + 1:02d}T11:00:00",
+            }
+            for i in range(4)
+        ]
+        rec_a = _rec_with_trades("raw_a", trades_a)
+        rec_b = _rec_with_trades("raw_b", trades_b)
+        aligned = align_performance_matrix(
+            [rec_a, rec_b], candidate_ids=["raw_a", "raw_b"]
+        )
+        assert isinstance(aligned, AlignedPerformanceMatrix)
+        assert aligned.matrix is None
+        assert aligned.reason == PBO_INPUT_UNNORMALIZED
+        # Guard: no raw PnL values smuggled via any residual matrix.
+        assert aligned.is_usable is False
+
+    def test_pnl_over_quantity_alone_rejected(self) -> None:
+        trade = {"net_pnl": 100.0, "qty": 2.0, "exit_time": "2024-08-01T10:00:00"}
+        assert _normalized_trade_return(trade) is None
+        assert _documented_notional_denominator(trade) is None
+        trade_q = {"pnl": 50.0, "quantity": 5.0}
+        assert _normalized_trade_return(trade_q) is None
+
+        # Adversarial: changing qty must not create a misleading return.
+        t1 = {"net_pnl": 100.0, "qty": 1.0}
+        t2 = {"net_pnl": 100.0, "qty": 100.0}
+        assert _normalized_trade_return(t1) is None
+        assert _normalized_trade_return(t2) is None
+
+        rec = _rec_with_trades(
+            "qty_only",
+            [
+                {
+                    "fold_id": i,
+                    "net_pnl": 10.0 * (i + 1),
+                    "qty": float(i + 1),
+                    "exit_time": f"2024-08-{(i % 28) + 1:02d}T10:00:00",
+                }
+                for i in range(6)
+            ],
+        )
+        series = extract_oos_statistics_series(rec)
+        assert series.observation_type == OBS_INSUFFICIENT
+        aligned = align_performance_matrix(
+            [rec, rec], candidate_ids=["qty_only", "qty_only"]
+        )
+        # Duplicate id path still refuses unnormalized inputs when series empty.
+        assert aligned.matrix is None or aligned.reason in {
+            PBO_INPUT_UNNORMALIZED,
+            "PBO_MATRIX_INSUFFICIENT",
+            PBO_INSUFFICIENT_DATA,
+        }
+
+    def test_pnl_over_notional_normalization_accepted(self) -> None:
+        trade = {
+            "net_pnl": 100.0,
+            "notional": 10_000.0,
+            "exit_time": "2024-08-01T10:00:00",
+            "fold_id": 0,
+        }
+        got = _normalized_trade_return(trade)
+        assert got is not None
+        assert abs(got[0] - 0.01) < 1e-12
+        assert got[1] == NORM_PNL_OVER_NOTIONAL
+
+        # Price × qty × multiplier constructs a real notional.
+        trade_px = {
+            "net_pnl": 50.0,
+            "qty": 2.0,
+            "entry_price": 100.0,
+            "contract_multiplier": 5.0,
+        }
+        got_px = _normalized_trade_return(trade_px)
+        assert got_px is not None
+        # 50 / (2 * 100 * 5) = 0.05
+        assert abs(got_px[0] - 0.05) < 1e-12
+
+        # Changing qty *with* price updates notional honestly (not qty-as-return).
+        small = _normalized_trade_return(
+            {"net_pnl": 100.0, "qty": 1.0, "entry_price": 1000.0}
+        )
+        large = _normalized_trade_return(
+            {"net_pnl": 100.0, "qty": 10.0, "entry_price": 1000.0}
+        )
+        assert small is not None and large is not None
+        assert small[0] > large[0]
+
+        trades = [
+            {
+                "fold_id": i,
+                "net_pnl": 100.0,
+                "notional": 10_000.0,
+                "exit_time": f"2024-09-{(i % 28) + 1:02d}T10:00:00",
+            }
+            for i in range(4)
+        ]
+        rec_a = _rec_with_trades("not_a", trades)
+        rec_b = _rec_with_trades(
+            "not_b",
+            [
+                {
+                    "fold_id": i,
+                    "net_pnl": 50.0,
+                    "notional": 10_000.0,
+                    "exit_time": f"2024-09-{(i % 28) + 1:02d}T11:00:00",
+                }
+                for i in range(4)
+            ],
+        )
+        aligned = align_performance_matrix(
+            [rec_a, rec_b], candidate_ids=["not_a", "not_b"]
+        )
+        assert aligned.is_usable and aligned.matrix is not None
+        # Values are returns (≈0.01), not raw PnL (100).
+        assert float(np.max(np.abs(aligned.matrix))) < 1.0
+
+    def test_zero_fill_only_inside_confirmed_oos_coverage(self) -> None:
+        trades_a = [
+            {
+                "fold_id": 0,
+                "net_return": 0.01,
+                "exit_time": "2024-10-01T10:00:00",
+            },
+            {
+                "fold_id": 2,
+                "net_return": 0.02,
+                "exit_time": "2024-10-03T10:00:00",
+            },
+        ]
+        trades_b = [
+            {
+                "fold_id": 0,
+                "net_return": 0.005,
+                "exit_time": "2024-10-01T09:00:00",
+            },
+            {
+                "fold_id": 1,
+                "net_return": 0.007,
+                "exit_time": "2024-10-02T09:00:00",
+            },
+            {
+                "fold_id": 2,
+                "net_return": 0.009,
+                "exit_time": "2024-10-03T09:00:00",
+            },
+        ]
+        # Explicit coverage: cand_a evaluated on folds 0,1,2 (fold:1 = covered no-trade).
+        folds_a = [
+            FoldOOSMetrics(
+                fold_id=i,
+                expectancy=0.05,
+                sharpe=1.0,
+                profit_factor=1.2,
+                calmar=0.4,
+                max_drawdown=-0.03,
+                n_trades=2,
+            )
+            for i in (0, 1, 2)
+        ]
+        rec_a = _rec_with_trades(
+            "cov_a",
+            trades_a,
+            folds=folds_a,
+            extra_baseline={"oos_covered_folds": [0, 1, 2]},
+        )
+        rec_b = _rec_with_trades("cov_b", trades_b)
+        aligned = align_performance_matrix(
+            [rec_a, rec_b], candidate_ids=["cov_a", "cov_b"]
+        )
+        assert aligned.is_usable and aligned.matrix is not None
+        cov = aligned.coverage_by_candidate["cov_a"]
+        assert "fold:1" in cov.covered_periods
+        assert "fold:1" in cov.no_trade_covered_periods
+        assert "fold:1" in cov.zero_filled_periods
+        assert "fold:1" not in cov.uncovered_periods
+        assert float(aligned.matrix[list(aligned.common_time_index).index("fold:1"), 0]) == 0.0
+
+    def test_uncovered_periods_are_not_zero_filled(self) -> None:
+        trades_a = [
+            {
+                "fold_id": 0,
+                "net_return": 0.01,
+                "exit_time": "2024-11-01T10:00:00",
+            },
+            {
+                "fold_id": 2,
+                "net_return": 0.02,
+                "exit_time": "2024-11-03T10:00:00",
+            },
+        ]
+        trades_b = [
+            {
+                "fold_id": 0,
+                "net_return": 0.005,
+                "exit_time": "2024-11-01T09:00:00",
+            },
+            {
+                "fold_id": 1,
+                "net_return": 0.007,
+                "exit_time": "2024-11-02T09:00:00",
+            },
+            {
+                "fold_id": 2,
+                "net_return": 0.009,
+                "exit_time": "2024-11-03T09:00:00",
+            },
+        ]
+        # cand_a coverage is ONLY folds 0 and 2 — fold:1 is uncovered.
+        folds_a = [
+            FoldOOSMetrics(
+                fold_id=i,
+                expectancy=0.05,
+                sharpe=1.0,
+                profit_factor=1.2,
+                calmar=0.4,
+                max_drawdown=-0.03,
+                n_trades=2,
+            )
+            for i in (0, 2)
+        ]
+        rec_a = _rec_with_trades(
+            "uncov_a",
+            trades_a,
+            folds=folds_a,
+            extra_baseline={"oos_covered_folds": [0, 2]},
+        )
+        folds_b = [
+            FoldOOSMetrics(
+                fold_id=i,
+                expectancy=0.05,
+                sharpe=1.0,
+                profit_factor=1.2,
+                calmar=0.4,
+                max_drawdown=-0.03,
+                n_trades=2,
+            )
+            for i in (0, 1, 2)
+        ]
+        rec_b = _rec_with_trades(
+            "uncov_b",
+            trades_b,
+            folds=folds_b,
+            extra_baseline={"oos_covered_folds": [0, 1, 2]},
+        )
+        aligned = align_performance_matrix(
+            [rec_a, rec_b], candidate_ids=["uncov_a", "uncov_b"]
+        )
+        assert aligned.is_usable and aligned.matrix is not None
+        # Common index = coverage intersection → fold:1 excluded (not zero-filled).
+        assert "fold:1" not in aligned.common_time_index
+        cov_a = aligned.coverage_by_candidate["uncov_a"]
+        assert "fold:1" in cov_a.uncovered_periods
+        assert "fold:1" not in cov_a.zero_filled_periods
+        assert aligned.common_time_index == ("fold:0", "fold:2")
+
+    def test_behavioral_daily_vectors_share_common_calendar(self) -> None:
+        from discovery.behavioral_dedup import (
+            align_signatures_to_common_calendar,
+            shared_daily_calendar_index,
+        )
+
+        trades_a = [
+            {
+                "net_return": 0.01,
+                "qty": 1.0,
+                "notional": 1000.0,
+                "exit_time": "2024-12-01T10:00:00",
+                "fold_id": 0,
+            },
+            {
+                "net_return": 0.03,
+                "qty": 1.0,
+                "notional": 1000.0,
+                "exit_time": "2024-12-05T10:00:00",
+                "fold_id": 1,
+            },
+        ]
+        trades_b = [
+            {
+                "net_return": 0.02,
+                "qty": 1.0,
+                "notional": 1000.0,
+                "exit_time": "2024-12-03T10:00:00",
+                "fold_id": 0,
+            },
+            {
+                "net_return": 0.04,
+                "qty": 1.0,
+                "notional": 1000.0,
+                "exit_time": "2024-12-05T11:00:00",
+                "fold_id": 1,
+            },
+        ]
+        cand_a = _mk_cand(11)
+        cand_b = _mk_cand(12)
+        rec_a = _rec_with_trades(cand_a.candidate_id, trades_a)
+        rec_b = _rec_with_trades(cand_b.candidate_id, trades_b)
+        sigs, meta = build_aligned_behavioral_signatures(
+            [(cand_a, rec_a), (cand_b, rec_b)], n_bins=8
+        )
+        assert len(sigs) == 2
+        assert meta["common_day_index"] == [
+            "2024-12-01",
+            "2024-12-03",
+            "2024-12-05",
+        ]
+        assert sigs[0].daily_index == sigs[1].daily_index
+        assert list(sigs[0].daily_index) == meta["common_day_index"]
+        # Not first-active-day ordinal alignment: index[0] is the same calendar date.
+        assert sigs[0].daily_index[0] == "2024-12-01"
+        assert sigs[1].daily_index[0] == "2024-12-01"
+        # cand_b has no trade on 12-01 → missing or zero depending on coverage.
+        assert len(sigs[0].daily_pnl) == len(sigs[1].daily_pnl)
+
+        # Deduper path also shares one calendar.
+        from discovery.behavioral_dedup import BehavioralDeduper
+
+        raw = [
+            build_behavioral_signature(cand_a, rec_a),
+            build_behavioral_signature(cand_b, rec_b),
+        ]
+        assert all(s is not None for s in raw)
+        common = shared_daily_calendar_index(raw)  # type: ignore[arg-type]
+        aligned = align_signatures_to_common_calendar(raw)  # type: ignore[arg-type]
+        assert aligned[0].daily_index == aligned[1].daily_index == common
+        BehavioralDeduper(similarity_threshold=0.99).cluster(raw)  # type: ignore[arg-type]
+
+    def test_mixed_raw_pnl_and_normalized_vectors_rejected(self) -> None:
+        from discovery.behavioral_dedup import (
+            BehaviorSignature,
+            DAILY_KIND_NORMALIZED,
+            DAILY_KIND_RAW_PNL,
+            MIXED_BEHAVIORAL_VALUE_KINDS,
+            behavioral_similarity,
+        )
+
+        a = BehaviorSignature(
+            candidate_id="a",
+            signal_vector=(0.1, 0.2, 0.3, 0.4),
+            daily_pnl=(0.01, 0.02, 0.03, 0.04),
+            feature_ids=("f1",),
+            complexity=1.0,
+            fitness=1.0,
+            daily_index=("2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"),
+            daily_value_kind=DAILY_KIND_NORMALIZED,
+            component_weights=(("daily_pnl", 1.0), ("features", 0.0)),
+        )
+        b = BehaviorSignature(
+            candidate_id="b",
+            signal_vector=(0.1, 0.2, 0.3, 0.4),
+            daily_pnl=(10.0, 20.0, 30.0, 40.0),
+            feature_ids=("f1",),
+            complexity=1.0,
+            fitness=1.0,
+            daily_index=("2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"),
+            daily_value_kind=DAILY_KIND_RAW_PNL,
+            component_weights=(("daily_pnl", 1.0), ("features", 0.0)),
+        )
+        meta: dict[str, Any] = {}
+        sim = behavioral_similarity(a, b, meta_out=meta)
+        assert sim == 0.0
+        assert meta.get("rejected_reason") == MIXED_BEHAVIORAL_VALUE_KINDS
+
+        # Building from mixed trade fields also yields NO_BEHAVIORAL_SIGNATURE.
+        mixed_trades = [
+            {
+                "net_return": 0.01,
+                "exit_time": "2024-12-01T10:00:00",
+                "fold_id": 0,
+            },
+            {
+                "net_pnl": 100.0,
+                "exit_time": "2024-12-02T10:00:00",
+                "fold_id": 1,
+            },
+        ]
+        cand = _mk_cand(21)
+        rec = _rec_with_trades(cand.candidate_id, mixed_trades)
+        assert build_behavioral_signature(cand, rec) is None
+
+    def test_timing_vector_changes_behavioral_similarity(self) -> None:
+        from discovery.behavioral_dedup import BehaviorSignature, behavioral_similarity
+
+        base = dict(
+            signal_vector=(0.1, 0.2, 0.3, 0.4),
+            daily_pnl=(0.01, 0.02, -0.01, 0.03),
+            feature_ids=("f1", "f2"),
+            complexity=1.0,
+            fitness=1.0,
+            daily_index=("d1", "d2", "d3", "d4"),
+            daily_value_kind="normalized_daily_return",
+            exposure_vector=(0.25, 0.25, 0.25, 0.25),
+            component_weights=(
+                ("daily_pnl", 0.2),
+                ("timing", 0.6),
+                ("exposure", 0.1),
+                ("features", 0.1),
+            ),
+        )
+        a = BehaviorSignature(
+            candidate_id="a",
+            timing_vector=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            **base,
+        )
+        b_same = BehaviorSignature(
+            candidate_id="b",
+            timing_vector=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            **base,
+        )
+        b_diff = BehaviorSignature(
+            candidate_id="c",
+            timing_vector=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            **base,
+        )
+        sim_same = behavioral_similarity(a, b_same)
+        sim_diff = behavioral_similarity(a, b_diff)
+        assert sim_same > sim_diff
+
+    def test_exposure_vector_changes_behavioral_similarity(self) -> None:
+        from discovery.behavioral_dedup import BehaviorSignature, behavioral_similarity
+
+        base = dict(
+            signal_vector=(0.1, 0.2, 0.3, 0.4),
+            daily_pnl=(0.01, 0.02, -0.01, 0.03),
+            feature_ids=("f1", "f2"),
+            complexity=1.0,
+            fitness=1.0,
+            daily_index=("d1", "d2", "d3", "d4"),
+            daily_value_kind="normalized_daily_return",
+            timing_vector=(0.5, 0.5, 0.0, 0.0),
+            component_weights=(
+                ("daily_pnl", 0.2),
+                ("timing", 0.1),
+                ("exposure", 0.6),
+                ("features", 0.1),
+            ),
+        )
+        a = BehaviorSignature(
+            candidate_id="a",
+            exposure_vector=(1.0, 0.0, 0.0, 0.0),
+            **base,
+        )
+        b_same = BehaviorSignature(
+            candidate_id="b",
+            exposure_vector=(1.0, 0.0, 0.0, 0.0),
+            **base,
+        )
+        b_diff = BehaviorSignature(
+            candidate_id="c",
+            exposure_vector=(0.0, 0.0, 0.0, 1.0),
+            **base,
+        )
+        assert behavioral_similarity(a, b_same) > behavioral_similarity(a, b_diff)
+
+    def test_component_weights_applied_and_renormalized(self) -> None:
+        from discovery.behavioral_dedup import BehaviorSignature, behavioral_similarity
+
+        # Identical daily/features; timing differs. Heavy timing weight → lower sim.
+        # Zero timing weight → timing ignored after renormalization.
+        daily = (0.01, 0.02, 0.03, 0.04)
+        feats = ("f1",)
+        a = BehaviorSignature(
+            candidate_id="a",
+            signal_vector=daily,
+            daily_pnl=daily,
+            feature_ids=feats,
+            complexity=1.0,
+            fitness=1.0,
+            timing_vector=(1.0, 0.0, 0.0, 0.0),
+            exposure_vector=(),
+            daily_index=("d1", "d2", "d3", "d4"),
+            daily_value_kind="normalized_daily_return",
+            component_weights=(
+                ("daily_pnl", 0.3),
+                ("timing", 0.7),
+                ("exposure", 0.0),
+                ("features", 0.0),
+            ),
+        )
+        b = BehaviorSignature(
+            candidate_id="b",
+            signal_vector=daily,
+            daily_pnl=daily,
+            feature_ids=feats,
+            complexity=1.0,
+            fitness=1.0,
+            timing_vector=(0.0, 0.0, 0.0, 1.0),
+            exposure_vector=(),
+            daily_index=("d1", "d2", "d3", "d4"),
+            daily_value_kind="normalized_daily_return",
+            component_weights=a.component_weights,
+        )
+        meta_heavy: dict[str, Any] = {}
+        sim_heavy = behavioral_similarity(a, b, meta_out=meta_heavy)
+        assert "timing" in meta_heavy["components_used"]
+        assert "exposure" not in meta_heavy["components_used"]
+        # Renormalized weights sum to 1 over used components.
+        assert abs(sum(meta_heavy["renormalized_weights"].values()) - 1.0) < 1e-9
+        assert meta_heavy["renormalized_weights"]["timing"] > 0.5
+
+        a_no_timing = BehaviorSignature(
+            candidate_id="a2",
+            signal_vector=daily,
+            daily_pnl=daily,
+            feature_ids=feats,
+            complexity=1.0,
+            fitness=1.0,
+            timing_vector=(1.0, 0.0, 0.0, 0.0),
+            exposure_vector=(),
+            daily_index=("d1", "d2", "d3", "d4"),
+            daily_value_kind="normalized_daily_return",
+            component_weights=(
+                ("daily_pnl", 1.0),
+                ("timing", 0.0),
+                ("exposure", 0.0),
+                ("features", 0.0),
+            ),
+        )
+        b_no_timing = BehaviorSignature(
+            candidate_id="b2",
+            signal_vector=daily,
+            daily_pnl=daily,
+            feature_ids=feats,
+            complexity=1.0,
+            fitness=1.0,
+            timing_vector=(0.0, 0.0, 0.0, 1.0),
+            exposure_vector=(),
+            daily_index=("d1", "d2", "d3", "d4"),
+            daily_value_kind="normalized_daily_return",
+            component_weights=a_no_timing.component_weights,
+        )
+        meta_light: dict[str, Any] = {}
+        sim_light = behavioral_similarity(a_no_timing, b_no_timing, meta_out=meta_light)
+        assert "timing" not in meta_light["components_used"]
+        assert sim_light > sim_heavy
+        assert abs(sum(meta_light["renormalized_weights"].values()) - 1.0) < 1e-9
 

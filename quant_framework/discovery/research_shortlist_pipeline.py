@@ -71,6 +71,7 @@ STATISTICS_INSUFFICIENT_DATA = "STATISTICS_INSUFFICIENT_DATA"
 PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY = "PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY"
 PBO_ALIGNMENT_INSUFFICIENT_PERIODS = "PBO_ALIGNMENT_INSUFFICIENT_PERIODS"
 PBO_ALIGNMENT_TOO_MANY_MISSING = "PBO_ALIGNMENT_TOO_MANY_MISSING"
+PBO_INPUT_UNNORMALIZED = "PBO_INPUT_UNNORMALIZED"
 TIMING_DATA_UNAVAILABLE = "timing_data_unavailable"
 EXPOSURE_DATA_UNAVAILABLE = "exposure_data_unavailable"
 
@@ -82,13 +83,24 @@ OBS_INSUFFICIENT = "insufficient"
 # Documented normalization methods.
 NORM_EQUITY_BAR = "equity_or_bar_return_field"
 NORM_TRADE_RETURN_FIELD = "explicit_normalized_trade_return_field"
-NORM_PNL_OVER_NOTIONAL = "net_pnl_divided_by_notional_or_qty_exposure"
+NORM_PNL_OVER_NOTIONAL = (
+    "net_pnl_divided_by_documented_notional_capital_or_risk_exposure"
+)
 NORM_NONE = "none"
 
 # PBO partition / fill policy labels.
 PARTITION_WFO_VALIDATION_PERIOD = "wfo_validation_period"
 PARTITION_TRADING_DAY = "trading_day"
 FILL_ZERO_WHEN_NO_TRADE = "zero_return_when_no_trade_in_common_period"
+
+# Allowed direct denominators for PnL→return (quantity alone is NOT allowed).
+_ALLOWED_PNL_DENOMINATORS = (
+    "notional",
+    "allocated_capital",
+    "capital",
+    "risk_exposure",
+    "position_exposure",
+)
 
 PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST = (
     "MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST"
@@ -365,6 +377,28 @@ class OOSStatisticsSeries:
 
 
 @dataclass(frozen=True)
+class CandidatePeriodCoverage:
+    """Per-candidate OOS period coverage accounting for honest PBO zero-fill."""
+
+    covered_periods: tuple[str, ...]
+    traded_periods: tuple[str, ...]
+    no_trade_covered_periods: tuple[str, ...]
+    uncovered_periods: tuple[str, ...]
+    zero_filled_periods: tuple[str, ...]
+    rejected_missing_periods: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "covered_periods": list(self.covered_periods),
+            "traded_periods": list(self.traded_periods),
+            "no_trade_covered_periods": list(self.no_trade_covered_periods),
+            "uncovered_periods": list(self.uncovered_periods),
+            "zero_filled_periods": list(self.zero_filled_periods),
+            "rejected_missing_periods": list(self.rejected_missing_periods),
+        }
+
+
+@dataclass(frozen=True)
 class AlignedPerformanceMatrix:
     """Timestamp/partition-aligned PBO matrix — rows are common market periods."""
 
@@ -376,6 +410,9 @@ class AlignedPerformanceMatrix:
     fill_policy: str
     alignment_fingerprint: str
     reason: str | None = None
+    coverage_by_candidate: dict[str, CandidatePeriodCoverage] = field(
+        default_factory=dict
+    )
 
     @property
     def is_usable(self) -> bool:
@@ -392,6 +429,9 @@ class AlignedPerformanceMatrix:
             "fill_policy": self.fill_policy,
             "alignment_fingerprint": self.alignment_fingerprint,
             "reason": self.reason,
+            "coverage_by_candidate": {
+                cid: cov.as_dict() for cid, cov in self.coverage_by_candidate.items()
+            },
         }
 
 
@@ -466,6 +506,61 @@ def _trade_partition_keys(trade: dict[str, Any]) -> dict[str, str]:
     return keys
 
 
+def _documented_notional_denominator(trade: dict[str, Any]) -> float | None:
+    """Return a documented capital/notional/risk denominator — never qty alone.
+
+    Accepted direct denominators: notional, allocated capital, risk exposure,
+    position exposure. Quantity is accepted only when a real notional can be
+    constructed as entry/reference price × quantity × contract multiplier.
+    """
+    for key in _ALLOWED_PNL_DENOMINATORS:
+        if trade.get(key) is not None:
+            try:
+                cand = abs(float(trade[key]))
+                if cand > 0:
+                    return cand
+            except (TypeError, ValueError):
+                continue
+
+    qty = None
+    for key in ("qty", "quantity"):
+        if trade.get(key) is not None:
+            try:
+                qty = abs(float(trade[key]))
+                if qty > 0:
+                    break
+                qty = None
+            except (TypeError, ValueError):
+                continue
+    if qty is None or qty <= 0:
+        return None
+
+    price = None
+    for key in ("entry_price", "reference_price", "price"):
+        if trade.get(key) is not None:
+            try:
+                price = abs(float(trade[key]))
+                if price > 0:
+                    break
+                price = None
+            except (TypeError, ValueError):
+                continue
+    if price is None or price <= 0:
+        # Quantity alone is not a return denominator.
+        return None
+
+    mult = 1.0
+    if trade.get("contract_multiplier") is not None:
+        try:
+            mult = abs(float(trade["contract_multiplier"]))
+            if mult <= 0:
+                mult = 1.0
+        except (TypeError, ValueError):
+            mult = 1.0
+    notional = float(qty) * float(price) * float(mult)
+    return notional if notional > 0 else None
+
+
 def _normalized_trade_return(trade: dict[str, Any]) -> tuple[float, str] | None:
     """Extract a documented normalized trade return — never raw monetary PnL alone."""
     for key in (
@@ -492,7 +587,8 @@ def _normalized_trade_return(trade: dict[str, Any]) -> tuple[float, str] | None:
                 continue
     # Explicit ``return`` only when paired with documented capital / exposure.
     if trade.get("return") is not None and (
-        trade.get("normalization") in {"capital", "notional", "risk", "qty", "exposure"}
+        trade.get("normalization")
+        in {"capital", "notional", "risk", "exposure", "allocated_capital"}
         or trade.get("normalized") is True
         or trade.get("return_is_normalized") is True
     ):
@@ -500,7 +596,7 @@ def _normalized_trade_return(trade: dict[str, Any]) -> tuple[float, str] | None:
             return float(trade["return"]), NORM_TRADE_RETURN_FIELD
         except (TypeError, ValueError):
             pass
-    # Documented PnL / exposure normalization.
+    # Documented PnL / notional-capital-risk normalization (never PnL/qty alone).
     pnl = None
     for key in ("net_pnl", "realized_pnl", "pnl"):
         if trade.get(key) is not None:
@@ -511,16 +607,7 @@ def _normalized_trade_return(trade: dict[str, Any]) -> tuple[float, str] | None:
                 continue
     if pnl is None:
         return None
-    exposure = None
-    for key in ("notional", "risk_exposure", "position_exposure", "capital", "qty", "quantity"):
-        if trade.get(key) is not None:
-            try:
-                cand_exp = abs(float(trade[key]))
-                if cand_exp > 0:
-                    exposure = cand_exp
-                    break
-            except (TypeError, ValueError):
-                continue
+    exposure = _documented_notional_denominator(trade)
     if exposure is not None and exposure > 0:
         return float(pnl) / float(exposure), NORM_PNL_OVER_NOTIONAL
     return None
@@ -764,11 +851,16 @@ def extract_exposure_vector(
 def extract_daily_oos_pnl_vector(
     rec: EvaluationRecord, *, n_bins: int = 16
 ) -> tuple[tuple[float, ...], dict[str, Any]]:
-    """Time-aligned daily OOS PnL (or normalized daily return) for ``daily_pnl``."""
+    """Time-aligned daily OOS *normalized* returns for ``daily_pnl``.
+
+    Raw monetary PnL alone is never accepted. Mixed raw+normalized is refused.
+    Returns empty vector when normalized common-day behavior is unavailable.
+    """
     baseline = _baseline_artifacts(rec)
     trades = baseline.get("closed_trades")
     by_day: dict[str, float] = {}
-    used_return = False
+    saw_normalized = False
+    saw_raw_only = False
     if isinstance(trades, list):
         for t in trades:
             if not isinstance(t, dict):
@@ -784,35 +876,45 @@ def extract_daily_oos_pnl_vector(
             got = _normalized_trade_return(t)
             if got is not None:
                 by_day[day] = by_day.get(day, 0.0) + float(got[0])
-                used_return = True
+                saw_normalized = True
                 continue
-            pnl = None
-            for key in ("net_pnl", "realized_pnl", "pnl"):
-                if t.get(key) is not None:
-                    try:
-                        pnl = float(t[key])
-                        break
-                    except (TypeError, ValueError):
-                        continue
-            if pnl is not None:
-                by_day[day] = by_day.get(day, 0.0) + float(pnl)
+            # Raw PnL present without normalization — do not mix into the vector.
+            if any(t.get(k) is not None for k in ("net_pnl", "realized_pnl", "pnl")):
+                saw_raw_only = True
+
     meta: dict[str, Any] = {
-        "available": len(by_day) > 0,
+        "available": False,
         "n_days": len(by_day),
-        "value_kind": (
-            "normalized_daily_return" if used_return and by_day else "daily_oos_pnl"
-        ),
+        "value_kind": "",
         "common_days": sorted(by_day.keys()),
+        "daily_index": sorted(by_day.keys()),
     }
-    if not by_day:
-        meta["status"] = "daily_pnl_unavailable"
+    if saw_raw_only and not saw_normalized:
+        meta["status"] = NO_BEHAVIORAL_SIGNATURE
+        meta["reason"] = "raw_pnl_without_normalization"
         return tuple(), meta
-    ordered = [by_day[d] for d in sorted(by_day.keys())]
-    # Pad/truncate to n_bins for correlation stability while preserving time order.
-    if len(ordered) < n_bins:
-        ordered = ordered + [0.0] * (n_bins - len(ordered))
+    if saw_raw_only and saw_normalized:
+        meta["status"] = NO_BEHAVIORAL_SIGNATURE
+        meta["reason"] = "mixed_raw_pnl_and_normalized_returns"
+        return tuple(), meta
+    if not by_day:
+        meta["status"] = NO_BEHAVIORAL_SIGNATURE
+        return tuple(), meta
+
+    # Single-candidate view: traded calendar days only (normalized).
+    # Common-calendar zero-fill for covered no-trade days happens at align time.
+    ordered_days = sorted(by_day.keys())
+    ordered_vals = [float(by_day[d]) for d in ordered_days]
+    covered_days = _candidate_covered_periods(rec, PARTITION_TRADING_DAY)
+
+    meta["available"] = True
+    meta["n_days"] = len(ordered_days)
+    meta["value_kind"] = "normalized_daily_return"
+    meta["common_days"] = list(ordered_days)
+    meta["daily_index"] = list(ordered_days)
+    meta["covered_days"] = sorted(covered_days | set(ordered_days))
     meta["status"] = "ok"
-    return tuple(float(x) for x in ordered[:n_bins]), meta
+    return tuple(float(x) for x in ordered_vals), meta
 
 
 def build_behavioral_signature(
@@ -820,18 +922,39 @@ def build_behavioral_signature(
     rec: EvaluationRecord,
     *,
     n_bins: int = 16,
+    common_day_index: Sequence[str] | None = None,
 ) -> BehaviorSignature | None:
-    """Build signature from time-aligned daily OOS PnL + timing + exposure.
+    """Build signature from normalized daily OOS returns + timing + exposure.
 
-    Required: Full WFO + daily OOS PnL/returns vector.
+    Required: Full WFO + normalized daily OOS return vector.
     Timing/exposure may be unavailable → documented reduced signature.
-    Never uses builtin ``hash()``; never treats PnL as exposure.
+    Never uses builtin ``hash()``; never treats PnL as exposure;
+    never mixes raw PnL into the daily vector.
     """
     if not _full_wfo_completed(rec):
         return None
     daily, daily_meta = extract_daily_oos_pnl_vector(rec, n_bins=n_bins)
     if not daily_meta.get("available"):
         return None
+    daily_index = tuple(str(d) for d in (daily_meta.get("daily_index") or []) if d)
+    daily_vals = list(daily)[: len(daily_index)] if daily_index else list(daily)
+    covered = tuple(
+        str(d) for d in (daily_meta.get("covered_days") or list(daily_index)) if d
+    )
+    if common_day_index is not None:
+        by_day = {d: float(v) for d, v in zip(daily_index, daily_vals) if d}
+        covered_set = set(covered) | set(by_day)
+        aligned: list[float] = []
+        for day in common_day_index:
+            if day in by_day:
+                aligned.append(by_day[day])
+            elif day in covered_set:
+                aligned.append(0.0)
+            else:
+                aligned.append(float("nan"))
+        daily_vals = aligned
+        daily_index = tuple(str(d) for d in common_day_index)
+
     timing, timing_meta = extract_trade_timing_vector(rec, n_bins=n_bins)
     exposure, exposure_meta = extract_exposure_vector(
         rec, n_bins=max(4, n_bins // 2)
@@ -841,7 +964,7 @@ def build_behavioral_signature(
     if stats.is_sufficient:
         signal = list(stats.values)
     else:
-        signal = list(daily)
+        signal = [v for v in daily_vals if np.isfinite(v)]
     while len(signal) < n_bins:
         signal = signal + signal if signal else [0.0]
     signal = signal[:n_bins]
@@ -851,6 +974,7 @@ def build_behavioral_signature(
         "timing": bool(timing_meta.get("available")),
         "exposure": bool(exposure_meta.get("available")),
         "normalized_returns": stats.is_sufficient,
+        "features": True,
     }
     if availability["timing"] and availability["exposure"]:
         weights = {"daily_pnl": 0.4, "timing": 0.2, "exposure": 0.2, "features": 0.2}
@@ -866,7 +990,7 @@ def build_behavioral_signature(
     return BehaviorSignature(
         candidate_id=candidate.candidate_id,
         signal_vector=tuple(float(x) for x in signal),
-        daily_pnl=tuple(float(x) for x in daily),
+        daily_pnl=tuple(float(x) for x in daily_vals),
         feature_ids=candidate.feature_ids,
         complexity=candidate.complexity_score,
         fitness=float(fit) if fit is not None else float("-inf"),
@@ -875,6 +999,459 @@ def build_behavioral_signature(
         component_availability=tuple(sorted(availability.items())),
         component_weights=tuple(sorted(weights.items())),
         signature_kind=kind,
+        daily_index=daily_index,
+        daily_value_kind="normalized_daily_return",
+        covered_days=covered,
+    )
+
+
+def build_aligned_behavioral_signatures(
+    pairs: Sequence[tuple[StrategyCandidate, EvaluationRecord]],
+    *,
+    n_bins: int = 16,
+) -> tuple[list[BehaviorSignature], dict[str, Any]]:
+    """Build signatures on one shared sorted daily OOS calendar.
+
+    Unnormalized / unavailable behavior → candidate omitted with
+    ``NO_BEHAVIORAL_SIGNATURE``.
+    """
+    prelim: list[tuple[StrategyCandidate, EvaluationRecord, BehaviorSignature]] = []
+    rejected: list[str] = []
+    for cand, rec in pairs:
+        sig = build_behavioral_signature(cand, rec, n_bins=n_bins)
+        if sig is None:
+            rejected.append(cand.candidate_id)
+            continue
+        prelim.append((cand, rec, sig))
+    if not prelim:
+        return [], {
+            "common_day_index": [],
+            "rejected": rejected,
+            "reason": NO_BEHAVIORAL_SIGNATURE,
+        }
+    day_set: set[str] = set()
+    for _c, _r, sig in prelim:
+        day_set.update(d for d in sig.daily_index if d)
+    common = tuple(sorted(day_set))
+    aligned: list[BehaviorSignature] = []
+    for cand, rec, _sig in prelim:
+        sig2 = build_behavioral_signature(
+            cand, rec, n_bins=n_bins, common_day_index=common
+        )
+        if sig2 is None:
+            rejected.append(cand.candidate_id)
+            continue
+        aligned.append(sig2)
+    return aligned, {
+        "common_day_index": list(common),
+        "rejected": rejected,
+        "reason": None if aligned else NO_BEHAVIORAL_SIGNATURE,
+    }
+
+
+def _iter_dates(start: datetime, end: datetime) -> list[str]:
+    from datetime import timedelta
+
+    out: list[str] = []
+    cur = start.date()
+    last = end.date()
+    if last < cur:
+        cur, last = last, cur
+    while cur <= last:
+        out.append(cur.isoformat())
+        cur = cur + timedelta(days=1)
+    return out
+
+
+def _candidate_covered_periods(
+    rec: EvaluationRecord, partition_frequency: str
+) -> set[str]:
+    """Real WFO fold/range coverage — not only periods that appear in trades."""
+    covered: set[str] = set()
+    baseline = _baseline_artifacts(rec)
+    oos_ranges = baseline.get("oos_ranges")
+    if isinstance(oos_ranges, list):
+        for r in oos_ranges:
+            if not isinstance(r, dict):
+                continue
+            if partition_frequency == PARTITION_WFO_VALIDATION_PERIOD:
+                if r.get("fold_id") is not None:
+                    try:
+                        covered.add(f"fold:{int(r['fold_id'])}")
+                    except (TypeError, ValueError):
+                        pass
+            elif partition_frequency == PARTITION_TRADING_DAY:
+                start = _parse_timestamp(r.get("start"))
+                end = _parse_timestamp(r.get("end"))
+                if start is not None and end is not None:
+                    covered.update(_iter_dates(start, end))
+                if r.get("fold_id") is not None and start is None:
+                    # Fold-tagged range without parseable dates: still count fold.
+                    pass
+
+    if partition_frequency == PARTITION_WFO_VALIDATION_PERIOD:
+        for f in rec.oos_folds:
+            try:
+                covered.add(f"fold:{int(f.fold_id)}")
+            except (TypeError, ValueError):
+                continue
+        # Explicit covered_periods artifact if present.
+        extra = baseline.get("covered_periods") or baseline.get("oos_covered_folds")
+        if isinstance(extra, (list, tuple)):
+            for item in extra:
+                try:
+                    covered.add(f"fold:{int(item)}")
+                except (TypeError, ValueError):
+                    s = str(item)
+                    if s.startswith("fold:"):
+                        covered.add(s)
+
+    if partition_frequency == PARTITION_TRADING_DAY:
+        extra = baseline.get("covered_periods") or baseline.get("oos_covered_days")
+        if isinstance(extra, (list, tuple)):
+            for item in extra:
+                s = str(item)
+                if len(s) >= 10 and s[4] == "-":
+                    covered.add(s[:10])
+
+    return covered
+
+
+def _period_series_for_candidate(
+    rec: EvaluationRecord,
+) -> tuple[dict[str, float], set[str], str | None, str | None]:
+    """Map partition key → *normalized* period performance for one candidate.
+
+    Returns (series, covered_periods, frequency, reason).
+    Raw monetary PnL never enters the series (PBO_INPUT_UNNORMALIZED).
+    """
+    baseline = _baseline_artifacts(rec)
+    trades = baseline.get("closed_trades")
+    if not isinstance(trades, list) or not trades:
+        return {}, set(), None, PBO_INSUFFICIENT_DATA
+
+    fold_map: dict[str, float] = {}
+    day_map: dict[str, float] = {}
+    any_partition = False
+    saw_raw_unnormalized = False
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        keys = _trade_partition_keys(t)
+        if not keys:
+            continue
+        any_partition = True
+        got = _normalized_trade_return(t)
+        if got is None:
+            if any(t.get(k) is not None for k in ("net_pnl", "realized_pnl", "pnl")):
+                saw_raw_unnormalized = True
+            continue
+        value = float(got[0])
+        if PARTITION_WFO_VALIDATION_PERIOD in keys:
+            k = keys[PARTITION_WFO_VALIDATION_PERIOD]
+            fold_map[k] = fold_map.get(k, 0.0) + value
+        if PARTITION_TRADING_DAY in keys:
+            k = keys[PARTITION_TRADING_DAY]
+            day_map[k] = day_map.get(k, 0.0) + value
+
+    if not any_partition:
+        return {}, set(), None, PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY
+
+    if fold_map:
+        freq = PARTITION_WFO_VALIDATION_PERIOD
+        series = fold_map
+    elif day_map:
+        freq = PARTITION_TRADING_DAY
+        series = day_map
+    else:
+        if saw_raw_unnormalized:
+            return {}, set(), None, PBO_INPUT_UNNORMALIZED
+        return {}, set(), None, PBO_INSUFFICIENT_DATA
+
+    covered = _candidate_covered_periods(rec, freq) | set(series.keys())
+    return series, covered, freq, None
+
+
+def align_performance_matrix(
+    records: Sequence[EvaluationRecord] | Sequence[Sequence[float]] | None = None,
+    *,
+    candidate_ids: Sequence[str] | None = None,
+    fill_policy: str = FILL_ZERO_WHEN_NO_TRADE,
+    min_periods: int = 2,
+    max_missing_fraction: float = 0.75,
+    series_list: Sequence[Sequence[float]] | None = None,
+) -> np.ndarray | AlignedPerformanceMatrix | None:
+    """Align candidates onto a shared market-time partition index.
+
+    Rows are common calendar / WFO validation periods from real OOS coverage —
+    never trade ordinals. Zero-fill only for covered no-trade periods.
+    Uncovered periods are never silently zero-filled.
+    """
+    # Legacy path: bare float sequences are trade-ordinal — refuse.
+    if series_list is not None and records is None:
+        return None
+    if records is not None and records and not isinstance(records[0], EvaluationRecord):
+        # Old API: align_performance_matrix(list_of_float_series)
+        return None
+    if records is None:
+        return None
+
+    recs = [r for r in records if isinstance(r, EvaluationRecord)]
+    if candidate_ids is not None:
+        want = list(candidate_ids)
+        by_id = {r.candidate_id: r for r in recs}
+        ordered_recs = [by_id[c] for c in want if c in by_id]
+        ids = [r.candidate_id for r in ordered_recs]
+    else:
+        ordered_recs = list(recs)
+        ids = [r.candidate_id for r in ordered_recs]
+
+    if len(ordered_recs) < 2:
+        return AlignedPerformanceMatrix(
+            matrix=None,
+            common_time_index=(),
+            partition_frequency="",
+            candidate_ids=tuple(ids),
+            missing_counts={},
+            fill_policy=fill_policy,
+            alignment_fingerprint=_stable_fingerprint({"reason": PBO_MATRIX_INSUFFICIENT}),
+            reason=PBO_MATRIX_INSUFFICIENT,
+        )
+
+    per_cand: list[dict[str, float]] = []
+    covered_list: list[set[str]] = []
+    freqs: list[str] = []
+    for rec in ordered_recs:
+        series, covered, freq, reason = _period_series_for_candidate(rec)
+        if reason == PBO_INPUT_UNNORMALIZED:
+            return AlignedPerformanceMatrix(
+                matrix=None,
+                common_time_index=(),
+                partition_frequency="",
+                candidate_ids=tuple(ids),
+                missing_counts={},
+                fill_policy=fill_policy,
+                alignment_fingerprint=_stable_fingerprint(
+                    {"reason": PBO_INPUT_UNNORMALIZED, "ids": ids}
+                ),
+                reason=PBO_INPUT_UNNORMALIZED,
+            )
+        if freq is None or not series:
+            return AlignedPerformanceMatrix(
+                matrix=None,
+                common_time_index=(),
+                partition_frequency="",
+                candidate_ids=tuple(ids),
+                missing_counts={},
+                fill_policy=fill_policy,
+                alignment_fingerprint=_stable_fingerprint(
+                    {
+                        "reason": reason or PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY,
+                        "ids": ids,
+                    }
+                ),
+                reason=reason or PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY,
+            )
+        per_cand.append(series)
+        covered_list.append(set(covered))
+        freqs.append(freq)
+
+    # Prefer a single common frequency; if mixed, use trading day when available.
+    if all(f == PARTITION_WFO_VALIDATION_PERIOD for f in freqs):
+        partition_frequency = PARTITION_WFO_VALIDATION_PERIOD
+    elif all(f == PARTITION_TRADING_DAY for f in freqs):
+        partition_frequency = PARTITION_TRADING_DAY
+    else:
+        # Re-extract trading-day maps for consistency across candidates.
+        partition_frequency = PARTITION_TRADING_DAY
+        per_cand = []
+        covered_list = []
+        for rec in ordered_recs:
+            baseline = _baseline_artifacts(rec)
+            trades = baseline.get("closed_trades")
+            day_map: dict[str, float] = {}
+            saw_raw = False
+            if isinstance(trades, list):
+                for t in trades:
+                    if not isinstance(t, dict):
+                        continue
+                    keys = _trade_partition_keys(t)
+                    if PARTITION_TRADING_DAY not in keys:
+                        continue
+                    got = _normalized_trade_return(t)
+                    if got is None:
+                        if any(
+                            t.get(k) is not None
+                            for k in ("net_pnl", "realized_pnl", "pnl")
+                        ):
+                            saw_raw = True
+                        continue
+                    k = keys[PARTITION_TRADING_DAY]
+                    day_map[k] = day_map.get(k, 0.0) + float(got[0])
+            if not day_map:
+                reason = (
+                    PBO_INPUT_UNNORMALIZED if saw_raw else PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY
+                )
+                return AlignedPerformanceMatrix(
+                    matrix=None,
+                    common_time_index=(),
+                    partition_frequency=partition_frequency,
+                    candidate_ids=tuple(ids),
+                    missing_counts={},
+                    fill_policy=fill_policy,
+                    alignment_fingerprint=_stable_fingerprint({"reason": reason}),
+                    reason=reason,
+                )
+            covered = _candidate_covered_periods(rec, PARTITION_TRADING_DAY) | set(
+                day_map.keys()
+            )
+            per_cand.append(day_map)
+            covered_list.append(covered)
+
+    # Common index from intersection of real WFO coverage (all evaluated there).
+    # Also record union for uncovered accounting.
+    union_index: set[str] = set()
+    for cov in covered_list:
+        union_index.update(cov)
+    intersection = set(covered_list[0])
+    for cov in covered_list[1:]:
+        intersection &= cov
+    common_index = tuple(sorted(intersection))
+    if len(common_index) < int(min_periods):
+        # Fall back: if coverage artifacts missing and only trade periods exist,
+        # intersection of traded keys may still work when coverage ⊇ trades.
+        trade_intersection = set(per_cand[0].keys())
+        for s in per_cand[1:]:
+            trade_intersection &= set(s.keys())
+        # Prefer coverage intersection; if empty, refuse rather than invent.
+        return AlignedPerformanceMatrix(
+            matrix=None,
+            common_time_index=tuple(sorted(union_index)),
+            partition_frequency=partition_frequency,
+            candidate_ids=tuple(ids),
+            missing_counts={},
+            fill_policy=fill_policy,
+            alignment_fingerprint=_stable_fingerprint(
+                {
+                    "reason": PBO_ALIGNMENT_INSUFFICIENT_PERIODS,
+                    "union": sorted(union_index),
+                    "intersection": list(common_index),
+                }
+            ),
+            reason=PBO_ALIGNMENT_INSUFFICIENT_PERIODS,
+        )
+
+    missing_counts: dict[str, int] = {}
+    columns: list[np.ndarray] = []
+    coverage_by_candidate: dict[str, CandidatePeriodCoverage] = {}
+    any_uncovered_in_union = False
+
+    for cid, series, covered in zip(ids, per_cand, covered_list):
+        col: list[float] = []
+        missing = 0
+        traded = set(series.keys())
+        no_trade_covered = sorted(covered - traded)
+        uncovered_vs_union = sorted(union_index - covered)
+        zero_filled: list[str] = []
+        rejected_missing: list[str] = []
+        if uncovered_vs_union:
+            any_uncovered_in_union = True
+
+        for period in common_index:
+            if period in series:
+                col.append(float(series[period]))
+            elif period in covered:
+                # Confirmed OOS coverage, no trade → valid zero.
+                if fill_policy == FILL_ZERO_WHEN_NO_TRADE:
+                    col.append(0.0)
+                    zero_filled.append(period)
+                else:
+                    col.append(float("nan"))
+                    missing += 1
+                    rejected_missing.append(period)
+            else:
+                # Uncovered — never silent zero-fill.
+                missing += 1
+                rejected_missing.append(period)
+                col.append(float("nan"))
+
+        missing_counts[cid] = missing
+        columns.append(np.asarray(col, dtype=float))
+        coverage_by_candidate[cid] = CandidatePeriodCoverage(
+            covered_periods=tuple(sorted(covered)),
+            traded_periods=tuple(sorted(traded)),
+            no_trade_covered_periods=tuple(no_trade_covered),
+            uncovered_periods=tuple(uncovered_vs_union),
+            zero_filled_periods=tuple(zero_filled),
+            rejected_missing_periods=tuple(rejected_missing),
+        )
+
+    # If the usable common index is coverage-intersection, uncovered-vs-union
+    # is informational. But if any cell in the matrix is non-finite → insufficient.
+    matrix = np.column_stack(columns)
+    if not np.isfinite(matrix).all():
+        return AlignedPerformanceMatrix(
+            matrix=None,
+            common_time_index=common_index,
+            partition_frequency=partition_frequency,
+            candidate_ids=tuple(ids),
+            missing_counts=missing_counts,
+            fill_policy=fill_policy,
+            alignment_fingerprint=_stable_fingerprint(
+                {
+                    "reason": PBO_INSUFFICIENT_DATA,
+                    "missing_counts": missing_counts,
+                }
+            ),
+            reason=PBO_INSUFFICIENT_DATA,
+            coverage_by_candidate=coverage_by_candidate,
+        )
+
+    total_cells = len(common_index) * len(ids)
+    total_missing = sum(missing_counts.values())
+    if total_cells > 0 and (total_missing / total_cells) > float(max_missing_fraction):
+        return AlignedPerformanceMatrix(
+            matrix=None,
+            common_time_index=common_index,
+            partition_frequency=partition_frequency,
+            candidate_ids=tuple(ids),
+            missing_counts=missing_counts,
+            fill_policy=fill_policy,
+            alignment_fingerprint=_stable_fingerprint(
+                {
+                    "reason": PBO_ALIGNMENT_TOO_MANY_MISSING,
+                    "missing_counts": missing_counts,
+                }
+            ),
+            reason=PBO_ALIGNMENT_TOO_MANY_MISSING,
+            coverage_by_candidate=coverage_by_candidate,
+        )
+
+    fp = _stable_fingerprint(
+        {
+            "common_time_index": list(common_index),
+            "partition_frequency": partition_frequency,
+            "candidate_ids": list(ids),
+            "matrix_shape": list(matrix.shape),
+            "missing_counts": missing_counts,
+            "fill_policy": fill_policy,
+            "matrix_digest": [
+                [round(float(x), 10) for x in matrix[:, j].tolist()]
+                for j in range(matrix.shape[1])
+            ],
+            "any_uncovered_in_union": any_uncovered_in_union,
+        }
+    )
+    return AlignedPerformanceMatrix(
+        matrix=matrix,
+        common_time_index=common_index,
+        partition_frequency=partition_frequency,
+        candidate_ids=tuple(ids),
+        missing_counts=missing_counts,
+        fill_policy=fill_policy,
+        alignment_fingerprint=fp,
+        reason=None,
+        coverage_by_candidate=coverage_by_candidate,
     )
 
 
@@ -941,258 +1518,6 @@ def build_full_wfo_trial_population(
         selection=TrialSelection.ALL_TRIALS,
     )
     return population, ids, series_list
-
-
-def _period_series_for_candidate(
-    rec: EvaluationRecord,
-) -> tuple[dict[str, float], str | None]:
-    """Map partition key → period performance for one candidate.
-
-    Prefers WFO validation fold periods; else trading-day aggregation.
-    Returns ({}, None) when only trade-sequence ordering would be possible.
-    """
-    baseline = _baseline_artifacts(rec)
-    trades = baseline.get("closed_trades")
-    if not isinstance(trades, list) or not trades:
-        return {}, None
-
-    fold_map: dict[str, float] = {}
-    day_map: dict[str, float] = {}
-    any_partition = False
-    for t in trades:
-        if not isinstance(t, dict):
-            continue
-        keys = _trade_partition_keys(t)
-        if not keys:
-            continue
-        any_partition = True
-        value = None
-        got = _normalized_trade_return(t)
-        if got is not None:
-            value = float(got[0])
-        else:
-            for pk in ("net_pnl", "realized_pnl", "pnl"):
-                if t.get(pk) is not None:
-                    try:
-                        value = float(t[pk])
-                        break
-                    except (TypeError, ValueError):
-                        continue
-        if value is None:
-            continue
-        if PARTITION_WFO_VALIDATION_PERIOD in keys:
-            k = keys[PARTITION_WFO_VALIDATION_PERIOD]
-            fold_map[k] = fold_map.get(k, 0.0) + value
-        if PARTITION_TRADING_DAY in keys:
-            k = keys[PARTITION_TRADING_DAY]
-            day_map[k] = day_map.get(k, 0.0) + value
-
-    if not any_partition:
-        return {}, None
-    if fold_map:
-        return fold_map, PARTITION_WFO_VALIDATION_PERIOD
-    if day_map:
-        return day_map, PARTITION_TRADING_DAY
-    return {}, None
-
-
-def align_performance_matrix(
-    records: Sequence[EvaluationRecord] | Sequence[Sequence[float]] | None = None,
-    *,
-    candidate_ids: Sequence[str] | None = None,
-    fill_policy: str = FILL_ZERO_WHEN_NO_TRADE,
-    min_periods: int = 2,
-    max_missing_fraction: float = 0.75,
-    series_list: Sequence[Sequence[float]] | None = None,
-) -> np.ndarray | AlignedPerformanceMatrix | None:
-    """Align candidates onto a shared market-time partition index.
-
-    Rows are common calendar / WFO validation periods — never trade ordinals.
-    Legacy ``series_list``-only callers receive ``None`` (trade-sequence refuse).
-    """
-    # Legacy path: bare float sequences are trade-ordinal — refuse.
-    if series_list is not None and records is None:
-        return None
-    if records is not None and records and not isinstance(records[0], EvaluationRecord):
-        # Old API: align_performance_matrix(list_of_float_series)
-        return None
-    if records is None:
-        return None
-
-    recs = [r for r in records if isinstance(r, EvaluationRecord)]
-    if candidate_ids is not None:
-        want = list(candidate_ids)
-        by_id = {r.candidate_id: r for r in recs}
-        ordered_recs = [by_id[c] for c in want if c in by_id]
-        ids = [r.candidate_id for r in ordered_recs]
-    else:
-        ordered_recs = list(recs)
-        ids = [r.candidate_id for r in ordered_recs]
-
-    if len(ordered_recs) < 2:
-        return AlignedPerformanceMatrix(
-            matrix=None,
-            common_time_index=(),
-            partition_frequency="",
-            candidate_ids=tuple(ids),
-            missing_counts={},
-            fill_policy=fill_policy,
-            alignment_fingerprint=_stable_fingerprint({"reason": PBO_MATRIX_INSUFFICIENT}),
-            reason=PBO_MATRIX_INSUFFICIENT,
-        )
-
-    per_cand: list[dict[str, float]] = []
-    freqs: list[str] = []
-    for rec in ordered_recs:
-        series, freq = _period_series_for_candidate(rec)
-        if freq is None or not series:
-            return AlignedPerformanceMatrix(
-                matrix=None,
-                common_time_index=(),
-                partition_frequency="",
-                candidate_ids=tuple(ids),
-                missing_counts={},
-                fill_policy=fill_policy,
-                alignment_fingerprint=_stable_fingerprint(
-                    {"reason": PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY, "ids": ids}
-                ),
-                reason=PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY,
-            )
-        per_cand.append(series)
-        freqs.append(freq)
-
-    # Prefer a single common frequency; if mixed, use trading day when available.
-    if all(f == PARTITION_WFO_VALIDATION_PERIOD for f in freqs):
-        partition_frequency = PARTITION_WFO_VALIDATION_PERIOD
-    elif all(f == PARTITION_TRADING_DAY for f in freqs):
-        partition_frequency = PARTITION_TRADING_DAY
-    else:
-        # Re-extract trading-day maps for consistency across candidates.
-        partition_frequency = PARTITION_TRADING_DAY
-        per_cand = []
-        for rec in ordered_recs:
-            baseline = _baseline_artifacts(rec)
-            trades = baseline.get("closed_trades")
-            day_map: dict[str, float] = {}
-            if isinstance(trades, list):
-                for t in trades:
-                    if not isinstance(t, dict):
-                        continue
-                    keys = _trade_partition_keys(t)
-                    if PARTITION_TRADING_DAY not in keys:
-                        continue
-                    value = None
-                    got = _normalized_trade_return(t)
-                    if got is not None:
-                        value = float(got[0])
-                    else:
-                        for pk in ("net_pnl", "realized_pnl", "pnl"):
-                            if t.get(pk) is not None:
-                                try:
-                                    value = float(t[pk])
-                                    break
-                                except (TypeError, ValueError):
-                                    continue
-                    if value is None:
-                        continue
-                    k = keys[PARTITION_TRADING_DAY]
-                    day_map[k] = day_map.get(k, 0.0) + value
-            if not day_map:
-                return AlignedPerformanceMatrix(
-                    matrix=None,
-                    common_time_index=(),
-                    partition_frequency=partition_frequency,
-                    candidate_ids=tuple(ids),
-                    missing_counts={},
-                    fill_policy=fill_policy,
-                    alignment_fingerprint=_stable_fingerprint(
-                        {"reason": PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY}
-                    ),
-                    reason=PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY,
-                )
-            per_cand.append(day_map)
-
-    # Shared sorted partition index = sorted union of all candidate periods.
-    index_set: set[str] = set()
-    for m in per_cand:
-        index_set.update(m.keys())
-    common_index = tuple(sorted(index_set))
-    if len(common_index) < int(min_periods):
-        return AlignedPerformanceMatrix(
-            matrix=None,
-            common_time_index=common_index,
-            partition_frequency=partition_frequency,
-            candidate_ids=tuple(ids),
-            missing_counts={},
-            fill_policy=fill_policy,
-            alignment_fingerprint=_stable_fingerprint(
-                {"reason": PBO_ALIGNMENT_INSUFFICIENT_PERIODS, "index": list(common_index)}
-            ),
-            reason=PBO_ALIGNMENT_INSUFFICIENT_PERIODS,
-        )
-
-    missing_counts: dict[str, int] = {}
-    columns: list[np.ndarray] = []
-    for cid, series in zip(ids, per_cand):
-        col = []
-        missing = 0
-        for period in common_index:
-            if period in series:
-                col.append(float(series[period]))
-            else:
-                missing += 1
-                if fill_policy == FILL_ZERO_WHEN_NO_TRADE:
-                    col.append(0.0)
-                else:
-                    col.append(float("nan"))
-        missing_counts[cid] = missing
-        columns.append(np.asarray(col, dtype=float))
-
-    total_cells = len(common_index) * len(ids)
-    total_missing = sum(missing_counts.values())
-    if total_cells > 0 and (total_missing / total_cells) > float(max_missing_fraction):
-        return AlignedPerformanceMatrix(
-            matrix=None,
-            common_time_index=common_index,
-            partition_frequency=partition_frequency,
-            candidate_ids=tuple(ids),
-            missing_counts=missing_counts,
-            fill_policy=fill_policy,
-            alignment_fingerprint=_stable_fingerprint(
-                {
-                    "reason": PBO_ALIGNMENT_TOO_MANY_MISSING,
-                    "missing_counts": missing_counts,
-                }
-            ),
-            reason=PBO_ALIGNMENT_TOO_MANY_MISSING,
-        )
-
-    matrix = np.column_stack(columns)
-    fp = _stable_fingerprint(
-        {
-            "common_time_index": list(common_index),
-            "partition_frequency": partition_frequency,
-            "candidate_ids": list(ids),
-            "matrix_shape": list(matrix.shape),
-            "missing_counts": missing_counts,
-            "fill_policy": fill_policy,
-            # Content fingerprint via stable hash of rounded values.
-            "matrix_digest": [
-                [round(float(x), 10) for x in matrix[:, j].tolist()]
-                for j in range(matrix.shape[1])
-            ],
-        }
-    )
-    return AlignedPerformanceMatrix(
-        matrix=matrix,
-        common_time_index=common_index,
-        partition_frequency=partition_frequency,
-        candidate_ids=tuple(ids),
-        missing_counts=missing_counts,
-        fill_policy=fill_policy,
-        alignment_fingerprint=fp,
-        reason=None,
-    )
 
 
 def evaluate_candidate_dsr_pbo(
@@ -1568,6 +1893,7 @@ __all__ = [
     "PBO_ALIGNMENT_TRADE_SEQUENCE_ONLY",
     "PBO_FAILED",
     "PBO_INSUFFICIENT_DATA",
+    "PBO_INPUT_UNNORMALIZED",
     "PBO_MATRIX_INSUFFICIENT",
     "PBO_PASSED",
     "PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST",
@@ -1589,7 +1915,9 @@ __all__ = [
     "STATISTICALLY_REJECTED",
     "ShortlistRejectRecord",
     "TIMING_DATA_UNAVAILABLE",
+    "CandidatePeriodCoverage",
     "align_performance_matrix",
+    "build_aligned_behavioral_signatures",
     "build_behavioral_signature",
     "build_full_wfo_trial_population",
     "evaluate_candidate_dsr_pbo",
@@ -1603,4 +1931,6 @@ __all__ = [
     "BehavioralDeduper",
     "behavioral_similarity",
     "_full_wfo_completed",
+    "_normalized_trade_return",
+    "_documented_notional_denominator",
 ]
