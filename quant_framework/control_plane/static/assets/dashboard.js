@@ -577,6 +577,10 @@ function multiFamilyBudgetError(body) {
   if (!(totalBudget >= initialPop)) {
     return "MULTI_FAMILY_INVALID: total candidate budget is smaller than the initial population";
   }
+  const runtime = Number(mf.max_runtime_seconds);
+  if (!Number.isFinite(runtime) || !(runtime > 0)) {
+    return "MULTI_FAMILY_INVALID: max_runtime_seconds must be a finite number greater than zero";
+  }
   return null;
 }
 function collectRunBody() {
@@ -625,6 +629,7 @@ function collectRunBody() {
       min_candidates_per_family: perFamily,
       total_candidate_budget: totalBudget,
       max_full_wfo: Number(body.search_budget.max_full_wfo_evaluations),
+      max_runtime_seconds: Number(budget.max_runtime_seconds ?? 7200),
       adaptive_reallocation: !!( $("#mf_adaptive") && $("#mf_adaptive").checked ),
       family_ids: familyIds,
       seed,
@@ -950,7 +955,7 @@ async function renderAlpha() {
     ${report.silver_resolution ? `<div class="panel"><h3>Silver artifacts</h3><pre class="mono">${JSON.stringify(report.silver_resolution, null, 2)}</pre></div>` : ""}
     ${report.wfo_summary ? `<div class="panel"><h3>WFO</h3><pre class="mono">${JSON.stringify(report.wfo_summary, null, 2)}</pre></div>` : ""}
     <div class="grid">
-      <div class="stat"><div class="label">Generated</div><div class="value">${report.generated_candidates ?? run.generated_count ?? 0}</div></div>
+      <div class="stat"><div class="label">Generated</div><div class="value">${report.generation_accounting?.generated_total ?? report.budget_allocation?.generated_total ?? report.budget_allocation?.campaign_generated ?? report.generated_candidates ?? run.generated_count ?? 0}</div></div>
       <div class="stat"><div class="label">Invalid</div><div class="value">${report.invalid_candidates ?? report.invalid ?? 0}</div></div>
       <div class="stat"><div class="label">Duplicates</div><div class="value">${report.duplicate_candidates ?? 0}</div></div>
       <div class="stat"><div class="label">Precheck rejected</div><div class="value">${report.precheck_rejected ?? 0}</div></div>

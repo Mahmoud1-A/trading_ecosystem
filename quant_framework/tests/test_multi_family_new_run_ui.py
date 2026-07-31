@@ -248,6 +248,40 @@ class TestNewRunDashboardControls:
         # search_budget overrides for campaign caps happen only inside the multi branch.
         assert "max_evaluated_candidates: totalBudget" not in before_multi
         assert "max_evaluated_candidates: totalBudget" in body_fn[body_fn.index("if (multi) {") :]
+        # Runtime propagation is Multi-Family only; single-family keeps search_budget alone.
+        assert "max_runtime_seconds: Number(budget.max_runtime_seconds ?? 7200)" not in before_multi
+
+    def test_search_budget_runtime_propagated_to_multi_family(self, client: TestClient) -> None:
+        js = _js(client)
+        body_fn = _collect_run_body_fn(js)
+        mf_block = body_fn[body_fn.index("body.multi_family = {") :]
+        # Same Search Budget JSON drives both search_budget and multi_family runtime.
+        assert "max_runtime_seconds: Number(budget.max_runtime_seconds ?? 7200)" in mf_block
+        assert "max_runtime_seconds" in body_fn
+        # Frozen preview serializes the full body, so both keys appear together.
+        assert "JSON.stringify(body, null, 2)" in js
+        # Default fallback is the campaign-facing 7200, not the backend FamilyCampaignConfig 600.
+        assert "?? 7200)" in mf_block
+        assert "?? 600)" not in mf_block
+        assert "max_runtime_seconds: 600" not in mf_block
+
+    def test_invalid_multi_family_runtime_rejected(self, client: TestClient) -> None:
+        js = _js(client)
+        assert "function multiFamilyBudgetError" in js
+        assert (
+            "MULTI_FAMILY_INVALID: max_runtime_seconds must be a finite number greater than zero"
+            in js
+        )
+        err_fn = js[js.index("function multiFamilyBudgetError") : js.index("function collectRunBody")]
+        assert "Number.isFinite(runtime)" in err_fn
+        assert "runtime > 0" in err_fn
+        assert "mf.max_runtime_seconds" in err_fn
+
+    def test_generated_card_prefers_campaign_total(self, client: TestClient) -> None:
+        js = _js(client)
+        assert "generation_accounting?.generated_total" in js
+        assert "budget_allocation?.generated_total" in js
+        assert "budget_allocation?.campaign_generated" in js
 
     def test_cross_family_crossover_forced_false(self, client: TestClient) -> None:
         body_fn = _collect_run_body_fn(_js(client))
@@ -342,7 +376,7 @@ class TestCreateRunMultiFamilyContract:
                 "max_evaluated_candidates": 24,
                 "max_full_wfo_evaluations": 8,
                 "population_size": 4,
-                "max_runtime_seconds": 20,
+                "max_runtime_seconds": 7200,
             },
             "multi_family": {
                 "enabled": True,
@@ -350,6 +384,7 @@ class TestCreateRunMultiFamilyContract:
                 "min_candidates_per_family": 6,
                 "total_candidate_budget": 24,
                 "max_full_wfo": 8,
+                "max_runtime_seconds": 7200,
                 "adaptive_reallocation": True,
                 "family_ids": [
                     "mean_reversion",
@@ -425,6 +460,20 @@ class TestCreateRunMultiFamilyContract:
         assert mf.get("max_pbo") == 0.5
         assert mf.get("allow_cross_family_crossover") is False
         assert snap.get("live_trading_enabled") is False
+        # Search-budget runtime must land on multi_family (not backend 600 default).
+        assert (snap.get("search_budget") or {}).get("max_runtime_seconds") == 7200
+        assert mf.get("max_runtime_seconds") == 7200
+        client.post(f"/api/runs/{run_id}/cancel")
+
+    def test_launch_stores_runtime_7200_not_backend_default(self, client: TestClient) -> None:
+        resp = client.post("/api/runs", json=self._mf_payload())
+        assert resp.status_code == 200, resp.text
+        run_id = resp.json()["run_id"]
+        snap = client.get(f"/api/runs/{run_id}").json().get("config_snapshot") or {}
+        assert (snap.get("search_budget") or {}).get("max_runtime_seconds") == 7200
+        assert (snap.get("multi_family") or {}).get("max_runtime_seconds") == 7200
+        # Explicit campaign value must not collapse to FamilyCampaignConfig default.
+        assert (snap.get("multi_family") or {}).get("max_runtime_seconds") != 600
         client.post(f"/api/runs/{run_id}/cancel")
 
     def test_launch_stores_complete_pipeline_in_multi_family(self, client: TestClient) -> None:
