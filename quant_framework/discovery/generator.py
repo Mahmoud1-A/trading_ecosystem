@@ -443,18 +443,35 @@ class CandidateGenerator:
             return op_node(op, feat, self._signed_param("entry_threshold", mag, negative=not long_side))
 
         if pattern in {"breakout_distance", "compression_release"}:
-            # Breakout: upside breakout -> ENTRY_LONG, downside breakout -> ENTRY_SHORT.
+            # Breakout patterns use separate signed distance features:
+            #   LONG  : breakout_distance_20 > +entry_threshold
+            #   SHORT : breakdown_distance_20 < -entry_threshold
+            # compression_release additionally requires prior compression context
+            # (never a direction vote) with its own compression_threshold param.
             if long_side:
-                feat = self._pick_feature(
-                    rng, "price.breakout_distance_20", "vol.range_compression_20", "liq.volume_pct_20"
+                feat = self._pick_feature(rng, "price.breakout_distance_20")
+                op = OperatorId.GREATER_THAN
+                thr = self._signed_param(
+                    "entry_threshold",
+                    self._sample_magnitude(rng, "entry_threshold", 0.0005, 0.01),
+                    negative=False,
                 )
             else:
-                # No dedicated "breakdown distance" feature — use the return
-                # feature's negative-magnitude side as the downside-breakout proxy.
-                feat = self._pick_feature(rng, "price.return_5", "vol.range_compression_20")
-            mag = self._sample_magnitude(rng, "entry_threshold", 0.0, 0.05)
-            op = OperatorId.GREATER_THAN if long_side else OperatorId.LESS_THAN
-            return op_node(op, feat, self._signed_param("entry_threshold", mag, negative=not long_side))
+                feat = self._pick_feature(rng, "price.breakdown_distance_20")
+                op = OperatorId.LESS_THAN
+                thr = self._signed_param(
+                    "entry_threshold",
+                    self._sample_magnitude(rng, "entry_threshold", 0.0005, 0.01),
+                    negative=True,
+                )
+            directional = op_node(op, feat, thr)
+            if pattern == "compression_release":
+                compression = self._pick_feature(rng, "vol.prior_range_compression_20")
+                comp_thr = self._sample_param(rng, "compression_threshold", 0.25, 0.85)
+                context = op_node(OperatorId.LESS_THAN, compression, comp_thr)
+                if self.grammar.allows_operator(OperatorId.AND):
+                    return op_node(OperatorId.AND, context, directional)
+            return directional
 
         if pattern in {"gap_fade_entry", "vwap_gap_reversion"}:
             # Gap fade: positive opening gap -> ENTRY_SHORT (fade it down),
@@ -522,14 +539,16 @@ class CandidateGenerator:
             cond = op_node(OperatorId.GREATER_THAN, feat, thr)
         return op_node(OperatorId.EXIT_SIGNAL, cond)
 
-    def generate_entry(self, seed: int) -> ExprNode:
+    def generate_entry(self, seed: int) -> tuple[ExprNode, str | None]:
         rng = self._rng(seed)
         prefer_short = bool(rng.random() < 0.45) and self.grammar.allows_operator(OperatorId.ENTRY_SHORT)
         entry_op = OperatorId.ENTRY_SHORT if prefer_short else OperatorId.ENTRY_LONG
+        selected_pattern: str | None = None
         if self.family_spec is not None and self.family_spec.entry_patterns:
             pattern = self.family_spec.entry_patterns[
                 int(rng.integers(0, len(self.family_spec.entry_patterns)))
             ]
+            selected_pattern = pattern
             cond, forced_direction = self._pattern_entry_cond(pattern, rng)
             # Direction-linked patterns: the condition's sign already determined
             # the direction inside _pattern_entry_cond — never re-randomize here.
@@ -538,7 +557,7 @@ class CandidateGenerator:
             entry = op_node(entry_op, cond)
             entry = repair_entry(clamp_lookbacks(entry, self.grammar), self.grammar)
             check_ast_types(entry, path="entry", operation="generate")
-            return entry
+            return entry, selected_pattern
         counter = [0]
         raw = self._grow(
             rng,
@@ -552,7 +571,7 @@ class CandidateGenerator:
         elif entry.value_type is ValueType.BOOLEAN:
             entry = op_node(entry_op, entry)
         check_ast_types(entry, path="entry", operation="generate")
-        return entry
+        return entry, selected_pattern
 
     def generate_exit(self, seed: int) -> ExprNode:
         rng = self._rng(seed + 17)
@@ -587,7 +606,7 @@ class CandidateGenerator:
         for attempt in range(max_attempts):
             s = seed + attempt * 997
             try:
-                entry = self.generate_entry(s)
+                entry, selected_pattern = self.generate_entry(s)
                 exit_tree = self.generate_exit(s) if with_exit else None
                 stop = None
                 target = None
@@ -634,6 +653,9 @@ class CandidateGenerator:
                     "direction": direction,
                     "regime_gates_compiled": [c for c in (self.family_spec.regime_constraints if self.family_spec else ())],
                 }
+                if selected_pattern is not None:
+                    prov["entry_pattern"] = selected_pattern
+                    prov["selected_pattern"] = selected_pattern
                 cand = build_candidate(
                     entry_tree=entry,
                     exit_tree=exit_tree,
@@ -693,3 +715,140 @@ class CandidateGenerator:
             candidate_id=cand.candidate_id,
         )
         return cand
+
+    def _family_seed_exit_stop_target(
+        self, seed: int
+    ) -> tuple[ExprNode, ExprNode | None, ExprNode | None]:
+        atr = feature_node("vol.atr_14", ValueType.VOLATILITY)
+        exit_feat = self._pick_feature(
+            self._rng(seed + 11),
+            "price.breakout_distance_20",
+            "price.breakdown_distance_20",
+            "price.return_5",
+        )
+        exit_thr = parameter_node("exit_threshold", 0.0)
+        exit_tree = op_node(
+            OperatorId.EXIT_SIGNAL,
+            op_node(OperatorId.LESS_THAN, exit_feat, exit_thr),
+        )
+        stop = None
+        target = None
+        if any(l.feature_id == "vol.atr_14" for l in self.grammar.feature_leaves):
+            # Symmetric RR — avoids free-lunch asymmetry on null/shuffled bars.
+            stop = op_node(OperatorId.ATR_STOP, atr, constant_node(2.0))
+            target = op_node(OperatorId.ATR_TARGET, atr, constant_node(2.0))
+        return exit_tree, stop, target
+
+    def _build_breakout_seed(
+        self,
+        *,
+        seed: int,
+        pattern: str,
+        long_side: bool,
+        entry_threshold: float,
+        compression_threshold: float | None = None,
+    ) -> StrategyCandidate:
+        if long_side:
+            feat = feature_node("price.breakout_distance_20", ValueType.RATIO)
+            directional = op_node(
+                OperatorId.GREATER_THAN,
+                feat,
+                parameter_node("entry_threshold", abs(entry_threshold)),
+            )
+            entry_op = OperatorId.ENTRY_LONG
+        else:
+            feat = feature_node("price.breakdown_distance_20", ValueType.RATIO)
+            directional = op_node(
+                OperatorId.LESS_THAN,
+                feat,
+                parameter_node("entry_threshold", -abs(entry_threshold)),
+            )
+            entry_op = OperatorId.ENTRY_SHORT
+        if pattern == "compression_release":
+            if compression_threshold is None:
+                raise ValueError("compression_release seed requires compression_threshold")
+            compression = feature_node("vol.prior_range_compression_20", ValueType.RATIO)
+            context = op_node(
+                OperatorId.LESS_THAN,
+                compression,
+                parameter_node("compression_threshold", float(compression_threshold)),
+            )
+            cond = op_node(OperatorId.AND, context, directional)
+        else:
+            cond = directional
+        entry = op_node(entry_op, cond)
+        exit_tree, stop, target = self._family_seed_exit_stop_target(seed)
+        direction = "ENTRY_LONG" if long_side else "ENTRY_SHORT"
+        prov = {
+            **self._family_provenance(),
+            "direction": direction,
+            "entry_pattern": pattern,
+            "selected_pattern": pattern,
+            "grammar_seed_template": True,
+        }
+        cand = build_candidate(
+            entry_tree=entry,
+            exit_tree=exit_tree,
+            stop=stop,
+            target=target,
+            strategy_family=self.strategy_family,
+            creation_method=CreationMethod.SEED_TEMPLATE,
+            grammar_version=self.grammar.version,
+            feature_set_version=self.feature_set_version,
+            cost_model_version=self.cost_model_version,
+            random_seed=seed,
+            family_provenance=prov,
+        )
+        check_strategy_trees(
+            cand.entry_tree,
+            cand.exit_tree,
+            cand.stop,
+            cand.target,
+            operation="seed_template",
+            candidate_id=cand.candidate_id,
+        )
+        domain_reason = validate_tree_threshold_domains(cand.entry_tree, self.grammar)
+        if domain_reason is not None:
+            raise DSLValidationError(domain_reason)
+        return cand
+
+    def grammar_seed_templates(self, seed: int = 0) -> list[StrategyCandidate]:
+        """Deterministic FamilySpec grammar seeds for initial population coverage.
+
+        General per-family templates (not planted-test injections). Breakout seeds
+        cover upside, downside, and compression-release both sides.
+        """
+        if self.family_spec is None:
+            return []
+        fid = self.family_spec.family_id
+        if fid != "breakout":
+            return []
+        templates = [
+            self._build_breakout_seed(
+                seed=seed + 1,
+                pattern="breakout_distance",
+                long_side=True,
+                entry_threshold=0.002,
+            ),
+            self._build_breakout_seed(
+                seed=seed + 2,
+                pattern="breakout_distance",
+                long_side=False,
+                entry_threshold=0.002,
+            ),
+            self._build_breakout_seed(
+                seed=seed + 3,
+                pattern="compression_release",
+                long_side=True,
+                entry_threshold=0.002,
+                compression_threshold=0.55,
+            ),
+            self._build_breakout_seed(
+                seed=seed + 4,
+                pattern="compression_release",
+                long_side=False,
+                entry_threshold=0.002,
+                compression_threshold=0.55,
+            ),
+        ]
+        return templates

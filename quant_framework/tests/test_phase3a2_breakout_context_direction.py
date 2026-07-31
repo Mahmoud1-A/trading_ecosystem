@@ -85,16 +85,16 @@ class TestBreakoutContextNotDirectional:
             entry_op=OperatorId.ENTRY_SHORT,
             conditions=[
                 (
-                    "price.breakout_distance_20",
+                    "price.breakdown_distance_20",
                     ValueType.RATIO,
                     OperatorId.LESS_THAN,
                     -0.02,
                 ),
                 (
-                    "vol.range_compression_20",
+                    "vol.prior_range_compression_20",
                     ValueType.RATIO,
-                    OperatorId.GREATER_THAN,
-                    0.3,
+                    OperatorId.LESS_THAN,
+                    0.5,
                 ),
             ],
         )
@@ -103,7 +103,7 @@ class TestBreakoutContextNotDirectional:
         assert result.details["expected_direction"] == "ENTRY_SHORT"
         assert result.details["entry_direction"] == "ENTRY_SHORT"
         assert any(
-            e["condition_feature"] == "vol.range_compression_20"
+            e["condition_feature"] == "vol.prior_range_compression_20"
             for e in result.details["context_evidence"]
         )
 
@@ -132,7 +132,7 @@ class TestBreakoutContextNotDirectional:
             entry_op=OperatorId.ENTRY_LONG,
             conditions=[
                 (
-                    "price.breakout_distance_20",
+                    "price.breakdown_distance_20",
                     ValueType.RATIO,
                     OperatorId.LESS_THAN,
                     -0.02,
@@ -151,10 +151,10 @@ class TestBreakoutContextNotDirectional:
             entry_op=OperatorId.ENTRY_LONG,
             conditions=[
                 (
-                    "vol.range_compression_20",
+                    "vol.prior_range_compression_20",
                     ValueType.RATIO,
-                    OperatorId.GREATER_THAN,
-                    0.3,
+                    OperatorId.LESS_THAN,
+                    0.5,
                 ),
             ],
         )
@@ -171,10 +171,10 @@ class TestBreakoutContextNotDirectional:
             entry_op=OperatorId.ENTRY_SHORT,
             conditions=[
                 (
-                    "vol.range_compression_20",
+                    "vol.prior_range_compression_20",
                     ValueType.RATIO,
-                    OperatorId.GREATER_THAN,
-                    0.3,
+                    OperatorId.LESS_THAN,
+                    0.5,
                 ),
             ],
         )
@@ -207,21 +207,21 @@ class TestBreakoutContextNotDirectional:
         )
 
     def test_downside_breakout_not_rejected_merely_for_compression_context(self) -> None:
-        """Compression > threshold must not cast a LONG vote against SHORT breakout."""
+        """Prior compression context must not cast a LONG vote against SHORT breakdown."""
         spec = materialize_family_spec("breakout", seed=1)
         cand = _breakout_cand(
             entry_op=OperatorId.ENTRY_SHORT,
             conditions=[
                 (
-                    "price.breakout_distance_20",
+                    "price.breakdown_distance_20",
                     ValueType.RATIO,
                     OperatorId.LESS_THAN,
                     -0.02,
                 ),
                 (
-                    "vol.range_compression_20",
+                    "vol.prior_range_compression_20",
                     ValueType.RATIO,
-                    OperatorId.GREATER_THAN,
+                    OperatorId.LESS_THAN,
                     0.5,
                 ),
             ],
@@ -232,9 +232,28 @@ class TestBreakoutContextNotDirectional:
         assert result.details["coherence_reason"] != "conflicting_directional_conditions"
         assert all(
             e.get("expected_direction") is None or "expected_direction" not in e
-            or e["condition_feature"] != "vol.range_compression_20"
+            or e["condition_feature"] != "vol.prior_range_compression_20"
             for e in result.details["directional_evidence"]
         )
+
+    def test_negative_breakout_distance_does_not_prove_short(self) -> None:
+        """Negative distance from prior maximum is not a downside-breakout proof."""
+        spec = materialize_family_spec("breakout", seed=1)
+        cand = _breakout_cand(
+            entry_op=OperatorId.ENTRY_SHORT,
+            conditions=[
+                (
+                    "price.breakout_distance_20",
+                    ValueType.RATIO,
+                    OperatorId.LESS_THAN,
+                    -0.02,
+                ),
+            ],
+        )
+        result = validate_family_direction_coherence(cand, spec)
+        assert not result.coherent
+        assert result.rejection_reason == FAMILY_DIRECTION_INCOHERENT
+        assert result.details["coherence_reason"] == "breakout_distance_does_not_prove_short"
 
     def test_conflicting_genuine_directional_conditions_rejected(self) -> None:
         spec = materialize_family_spec("breakout", seed=1)

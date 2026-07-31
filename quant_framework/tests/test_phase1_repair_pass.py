@@ -54,15 +54,11 @@ _DIRECTION_FEATURES: dict[str, tuple[str, ...]] = {
     "cross_momentum": ("price.return_5", "price.simple_return_1"),
     "breakout_distance": (
         "price.breakout_distance_20",
-        "vol.range_compression_20",
-        "liq.volume_pct_20",
-        "price.return_5",
+        "price.breakdown_distance_20",
     ),
     "compression_release": (
         "price.breakout_distance_20",
-        "vol.range_compression_20",
-        "liq.volume_pct_20",
-        "price.return_5",
+        "price.breakdown_distance_20",
     ),
     "gap_fade_entry": ("price.close_to_open",),
     "vwap_gap_reversion": ("price.close_to_open", "liq.dist_session_vwap"),

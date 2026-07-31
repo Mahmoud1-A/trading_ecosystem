@@ -112,8 +112,10 @@ FAMILY_BLUEPRINTS: dict[str, dict[str, Any]] = {
         hypothesis="Price breakouts beyond recent range expand with volume confirmation.",
         features=(
             "price.breakout_distance_20",
-            "liq.volume_pct_20",
+            "price.breakdown_distance_20",
+            "vol.prior_range_compression_20",
             "vol.range_compression_20",
+            "liq.volume_pct_20",
             "price.return_5",
         ),
         operators=(
@@ -128,13 +130,10 @@ FAMILY_BLUEPRINTS: dict[str, dict[str, Any]] = {
         exit_patterns=("breakout_failure", "trailing_range_exit"),
         parameter_ranges={
             # Matched to the realistic scale of price.breakout_distance_20 /
-            # price.return_5 (typically well under 1%) — previously (0.0,0.05)
-            # allowed magnitudes an order of magnitude above what these
-            # ratio/return features ever reach, making the entry structurally
-            # unreachable now that direction-aware generation always samples a
-            # strictly-signed magnitude (no more accidental near-zero/negative
-            # "always true" thresholds slipping through parameter jitter).
+            # price.breakdown_distance_20 (typically well under 1%).
             "entry_threshold": (0.0005, 0.01),
+            # Compression ratio units — separate from entry distance thresholds.
+            "compression_threshold": (0.25, 0.85),
             "exit_threshold": (-0.02, 0.02),
             "lookback": (10.0, 40.0),
         },

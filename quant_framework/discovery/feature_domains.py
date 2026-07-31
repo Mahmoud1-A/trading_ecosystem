@@ -80,6 +80,9 @@ _FEATURE_OVERRIDES: dict[str, FeatureDomain] = {
     "price.breakout_distance_20": FeatureDomain(
         "price.breakout_distance_20", "ratio", ValueType.RATIO, (-1.0, 1.0), (-0.02, 0.05)
     ),
+    "price.breakdown_distance_20": FeatureDomain(
+        "price.breakdown_distance_20", "ratio", ValueType.RATIO, (-1.0, 1.0), (-0.05, 0.02)
+    ),
     "price.rolling_rank_20": FeatureDomain(
         "price.rolling_rank_20", "rank", ValueType.RANK, (0.0, 1.0), (0.05, 0.95)
     ),
@@ -100,6 +103,9 @@ _FEATURE_OVERRIDES: dict[str, FeatureDomain] = {
     ),
     "vol.range_compression_20": FeatureDomain(
         "vol.range_compression_20", "ratio", ValueType.RATIO, (0.0, 2.0), (0.2, 1.2)
+    ),
+    "vol.prior_range_compression_20": FeatureDomain(
+        "vol.prior_range_compression_20", "ratio", ValueType.RATIO, (0.0, 2.0), (0.2, 1.0)
     ),
     "temp.minutes_since_open": FeatureDomain(
         "temp.minutes_since_open", "minutes", ValueType.TIME, (0.0, 24 * 60.0), (0.0, 390.0)

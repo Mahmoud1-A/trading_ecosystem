@@ -15,6 +15,49 @@ from discovery.typecheck import check_ast_types, check_strategy_trees, parse_dsl
 from discovery.types import CreationMethod, NodeKind, ValueType
 
 
+# Feature roles for mutation preservation (mirrors campaign direction coherence).
+_CONTEXT_ONLY_FEATURES = frozenset(
+    {
+        "vol.range_compression_20",
+        "vol.prior_range_compression_20",
+        "liq.volume_pct_20",
+    }
+)
+_FOLLOW_UP_FEATURES = frozenset({"price.breakout_distance_20"})
+_FOLLOW_DOWN_FEATURES = frozenset({"price.breakdown_distance_20"})
+_FOLLOW_FEATURES = frozenset(
+    {
+        "price.return_5",
+        "price.simple_return_1",
+        "price.log_return_1",
+        *_FOLLOW_UP_FEATURES,
+        *_FOLLOW_DOWN_FEATURES,
+    }
+)
+_FADE_FEATURES = frozenset(
+    {
+        "price.rolling_z_20",
+        "liq.dist_session_vwap",
+        "price.dist_rolling_mean_20",
+        "price.close_to_open",
+    }
+)
+
+
+def _feature_role(feature_id: str) -> str | None:
+    if feature_id in _CONTEXT_ONLY_FEATURES:
+        return "context"
+    if feature_id in _FOLLOW_UP_FEATURES:
+        return "follow_up"
+    if feature_id in _FOLLOW_DOWN_FEATURES:
+        return "follow_down"
+    if feature_id in _FOLLOW_FEATURES:
+        return "follow"
+    if feature_id in _FADE_FEATURES:
+        return "fade"
+    return None
+
+
 class MutationRejected(ValueError):
     """Raised when a strict mutation produces an invalid descendant."""
 
@@ -22,6 +65,15 @@ class MutationRejected(ValueError):
 class Mutator:
     def __init__(self, grammar: Grammar | None = None) -> None:
         self.grammar = grammar or Grammar()
+
+    def _compatible_feature_leaves(self, feature_id: str, value_type: ValueType) -> list:
+        """Restrict feature swaps so direction/context roles are preserved."""
+        same = [l for l in self.grammar.feature_leaves if l.value_type is value_type]
+        role = _feature_role(feature_id)
+        if role is None:
+            # Untyped leaves may not become context-only (would erase direction).
+            return [l for l in same if _feature_role(l.feature_id) != "context"]
+        return [l for l in same if _feature_role(l.feature_id) == role]
 
     def _nodes(self, tree: ExprNode) -> list[ExprNode]:
         return list(tree.walk())
@@ -86,7 +138,7 @@ class Mutator:
         choice = int(rng.integers(0, 5))
 
         if choice == 0 and node.kind is NodeKind.FEATURE:
-            same = [l for l in self.grammar.feature_leaves if l.value_type is node.value_type]
+            same = self._compatible_feature_leaves(node.name, node.value_type)
             if not same:
                 return tree
             leaf = same[int(rng.integers(0, len(same)))]
@@ -142,7 +194,40 @@ class Mutator:
         if node.value_type is ValueType.BOOLEAN:
             from discovery.types import NUMERIC_TYPES
 
-            numeric = [l for l in self.grammar.feature_leaves if l.value_type in NUMERIC_TYPES]
+            # Prefer preserving a directional feature when the parent tree has one.
+            directional = [
+                n
+                for n in nodes
+                if n.kind is NodeKind.FEATURE and _feature_role(n.name) in {
+                    "follow", "follow_up", "follow_down", "fade"
+                }
+            ]
+            if directional:
+                src = directional[int(rng.integers(0, len(directional)))]
+                role = _feature_role(src.name)
+                if role == "follow_up":
+                    op = OperatorId.GREATER_THAN
+                    thr = abs(float(rng.uniform(0.0005, 0.01)))
+                elif role == "follow_down":
+                    op = OperatorId.LESS_THAN
+                    thr = -abs(float(rng.uniform(0.0005, 0.01)))
+                elif role == "fade":
+                    op = OperatorId.LESS_THAN
+                    thr = -abs(float(rng.uniform(0.5, 2.5)))
+                else:
+                    op = OperatorId.GREATER_THAN
+                    thr = abs(float(rng.uniform(0.0005, 0.02)))
+                simplified = op_node(
+                    op,
+                    feature_node(src.name, src.value_type),
+                    constant_node(thr),
+                )
+                return self._replace(tree, idx, simplified)
+            numeric = [
+                l
+                for l in self.grammar.feature_leaves
+                if l.value_type in NUMERIC_TYPES and _feature_role(l.feature_id) != "context"
+            ]
             leaf = numeric[int(rng.integers(0, len(numeric)))] if numeric else self.grammar.feature_leaves[0]
             simplified = op_node(
                 OperatorId.LESS_THAN,
@@ -159,13 +244,57 @@ class Mutator:
             entry_op = OperatorId(node.name) if node.kind is NodeKind.OPERATOR else OperatorId.ENTRY_LONG
             if entry_op not in {OperatorId.ENTRY_LONG, OperatorId.ENTRY_SHORT}:
                 entry_op = OperatorId.ENTRY_LONG
-            numeric = [l for l in self.grammar.feature_leaves if l.value_type in NUMERIC_TYPES]
-            leaf = numeric[int(rng.integers(0, len(numeric)))] if numeric else self.grammar.feature_leaves[0]
-            cond = op_node(
-                OperatorId.LESS_THAN,
-                feature_node(leaf.feature_id, leaf.value_type),
-                constant_node(float(rng.normal())),
-            )
+            long_side = entry_op is OperatorId.ENTRY_LONG
+            # Prefer role-matching directional features for the wrapper direction.
+            if long_side:
+                preferred_roles = {"follow_up", "follow", "fade"}
+            else:
+                preferred_roles = {"follow_down", "follow", "fade"}
+            preferred = [
+                l
+                for l in self.grammar.feature_leaves
+                if l.value_type in NUMERIC_TYPES and _feature_role(l.feature_id) in preferred_roles
+            ]
+            if preferred:
+                leaf = preferred[int(rng.integers(0, len(preferred)))]
+                role = _feature_role(leaf.feature_id)
+                if role == "follow_up" or (role == "follow" and long_side):
+                    cond = op_node(
+                        OperatorId.GREATER_THAN,
+                        feature_node(leaf.feature_id, leaf.value_type),
+                        constant_node(abs(float(rng.uniform(0.0005, 0.01)))),
+                    )
+                elif role == "follow_down" or (role == "follow" and not long_side):
+                    cond = op_node(
+                        OperatorId.LESS_THAN,
+                        feature_node(leaf.feature_id, leaf.value_type),
+                        constant_node(-abs(float(rng.uniform(0.0005, 0.01)))),
+                    )
+                else:  # fade
+                    if long_side:
+                        cond = op_node(
+                            OperatorId.LESS_THAN,
+                            feature_node(leaf.feature_id, leaf.value_type),
+                            constant_node(-abs(float(rng.uniform(0.5, 2.5)))),
+                        )
+                    else:
+                        cond = op_node(
+                            OperatorId.GREATER_THAN,
+                            feature_node(leaf.feature_id, leaf.value_type),
+                            constant_node(abs(float(rng.uniform(0.5, 2.5)))),
+                        )
+            else:
+                numeric = [
+                    l
+                    for l in self.grammar.feature_leaves
+                    if l.value_type in NUMERIC_TYPES and _feature_role(l.feature_id) != "context"
+                ]
+                leaf = numeric[int(rng.integers(0, len(numeric)))] if numeric else self.grammar.feature_leaves[0]
+                cond = op_node(
+                    OperatorId.LESS_THAN if long_side else OperatorId.GREATER_THAN,
+                    feature_node(leaf.feature_id, leaf.value_type),
+                    constant_node(float(rng.normal())),
+                )
             return self._replace(tree, idx, op_node(entry_op, cond))
         return tree
 

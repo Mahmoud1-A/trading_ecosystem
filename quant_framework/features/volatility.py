@@ -40,6 +40,11 @@ def range_compression(bars: pd.DataFrame, lookback: int) -> pd.Series:
     return rng / mean_rng
 
 
+def prior_range_compression(bars: pd.DataFrame, lookback: int) -> pd.Series:
+    """Causal prior-bar compression — available before the current signal bar."""
+    return range_compression(bars, lookback).shift(1)
+
+
 def signed_vol(close: pd.Series, lookback: int, *, side: str) -> pd.Series:
     rets = close.pct_change()
     if side == "down":
@@ -61,6 +66,7 @@ def compute_volatility_features(bars: pd.DataFrame) -> pd.DataFrame:
             "vol.realized_20": realized_volatility(bars["close"], 20),
             "vol.parkinson_20": parkinson_volatility(bars, 20),
             "vol.range_compression_20": range_compression(bars, 20),
+            "vol.prior_range_compression_20": prior_range_compression(bars, 20),
             "vol.downside_20": signed_vol(bars["close"], 20, side="down"),
             "vol.upside_20": signed_vol(bars["close"], 20, side="up"),
             "regime.vol_of_vol_20": a.diff().rolling(20, min_periods=20).std(ddof=0),

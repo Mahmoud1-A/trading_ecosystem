@@ -132,6 +132,145 @@ def _wfo_cfg() -> WalkForwardConfig:
     )
 
 
+def _extract_entry_diagnostics(entry_tree: dict | None) -> dict:
+    """Pull directional/context features and thresholds from a serialized entry AST."""
+    if not isinstance(entry_tree, dict):
+        return {
+            "entry_direction": None,
+            "entry_ast": None,
+            "directional_feature": None,
+            "context_features": [],
+            "entry_threshold_values": [],
+            "exit_ast": None,
+        }
+    direction = entry_tree.get("name")
+    directional_feature = None
+    context_features: list[str] = []
+    thresholds: list[dict] = []
+    context_ids = {
+        "vol.range_compression_20",
+        "vol.prior_range_compression_20",
+        "liq.volume_pct_20",
+    }
+    directional_ids = {
+        "price.breakout_distance_20",
+        "price.breakdown_distance_20",
+        "price.return_5",
+        "price.simple_return_1",
+        "price.log_return_1",
+        "price.rolling_z_20",
+        "liq.dist_session_vwap",
+        "price.dist_rolling_mean_20",
+        "price.close_to_open",
+    }
+    cmp_ops = {"GREATER_THAN", "LESS_THAN", "GREATER_EQUAL", "LESS_EQUAL", "CROSS_ABOVE", "CROSS_BELOW"}
+
+    def _walk(node: dict) -> None:
+        nonlocal directional_feature
+        if not isinstance(node, dict):
+            return
+        name = node.get("name")
+        children = node.get("children") or []
+        if name in cmp_ops and len(children) >= 2:
+            left, right = children[0], children[1]
+            feat = left.get("name") if isinstance(left, dict) else None
+            if left.get("name") == "ABS" and left.get("children"):
+                feat = left["children"][0].get("name")
+            thr = None
+            if isinstance(right, dict):
+                meta = right.get("meta") or {}
+                thr = meta.get("default", meta.get("value"))
+            if feat in directional_ids:
+                directional_feature = directional_feature or feat
+                thresholds.append({"feature": feat, "op": name, "threshold": thr})
+            elif feat in context_ids:
+                context_features.append(feat)
+                thresholds.append({"feature": feat, "op": name, "threshold": thr, "role": "context"})
+        for child in children:
+            _walk(child)
+
+    _walk(entry_tree)
+    return {
+        "entry_direction": direction,
+        "entry_ast": entry_tree,
+        "directional_feature": directional_feature,
+        "context_features": sorted(set(context_features)),
+        "entry_threshold_values": thresholds,
+    }
+
+
+def _candidate_recovery_row(
+    *,
+    candidate_id: str,
+    snap: dict,
+    rejection_reason: str | None,
+    fold_records: list | None,
+    net_metrics: dict | None,
+    precheck: str | None = None,
+    semantic_domain_violations: list | None = None,
+    direction_coherence: dict | None = None,
+) -> dict:
+    prov = dict(snap.get("family_provenance") or {})
+    entry_diag = _extract_entry_diagnostics(snap.get("expression_tree"))
+    train = {}
+    if isinstance(net_metrics, dict):
+        train = dict(net_metrics.get("train_diagnostic") or {})
+        if not train and "fold_trade_funnels" in net_metrics:
+            train = net_metrics
+    funnels = list(train.get("fold_trade_funnels") or [])
+    oos_funnels = [f for f in funnels if f.get("phase") == "validation_oos"]
+    per_fold = []
+    for f in oos_funnels:
+        per_fold.append(
+            {
+                "fold_id": f.get("fold_id"),
+                "entry_signals": f.get("entry_true_count"),
+                "orders": f.get("orders_submitted"),
+                "fills": f.get("fills"),
+                "closed_trades": f.get("positions_closed"),
+            }
+        )
+    # Fall back to fold_records n_trades when funnel missing.
+    if not per_fold and fold_records:
+        for fr in fold_records:
+            per_fold.append(
+                {
+                    "fold_id": fr.get("fold_id"),
+                    "entry_signals": None,
+                    "orders": None,
+                    "fills": None,
+                    "closed_trades": fr.get("n_trades"),
+                }
+            )
+    total_oos = sum(int(p.get("closed_trades") or 0) for p in per_fold)
+    stop_ast = snap.get("stop")
+    target_ast = snap.get("target")
+    # stop/target may only live on candidate; trial snapshot may omit them.
+    return {
+        "candidate_id": candidate_id,
+        "generation": snap.get("generation"),
+        "creation_method": snap.get("creation_method") or prov.get("creation_method"),
+        "parent_ids": list(snap.get("parent_ids") or []),
+        "selected_entry_pattern": prov.get("selected_pattern") or prov.get("entry_pattern"),
+        "entry_ast": entry_diag["entry_ast"],
+        "entry_direction": entry_diag["entry_direction"] or prov.get("direction"),
+        "directional_feature": entry_diag["directional_feature"],
+        "context_features": entry_diag["context_features"],
+        "entry_threshold_values": entry_diag["entry_threshold_values"],
+        "exit_ast": snap.get("exit_tree"),
+        "stop_target": {"stop": stop_ast, "target": target_ast},
+        "precheck_result": precheck,
+        "semantic_domain_violations": list(semantic_domain_violations or []),
+        "direction_coherence_result": direction_coherence,
+        "entry_signals_per_fold": [p.get("entry_signals") for p in per_fold],
+        "orders_per_fold": [p.get("orders") for p in per_fold],
+        "fills_per_fold": [p.get("fills") for p in per_fold],
+        "closed_trades_per_fold": [p.get("closed_trades") for p in per_fold],
+        "total_oos_trades": total_oos,
+        "final_rejection_reason": rejection_reason,
+    }
+
+
 def _run_family_search(
     bars: pd.DataFrame,
     *,
@@ -174,11 +313,73 @@ def _run_family_search(
     stats = result.family_stats[0]
     # Inspect signal_source on evaluated trials / discovery records
     signal_sources = []
+    candidate_funnels: list[dict] = []
+    seen_ids: set[str] = set()
     for trial in registry.all_trials():
         snap = trial.config_snapshot or {}
         if snap.get("is_full_event_wfo") or snap.get("evaluation_path") == "event_driven_wfo":
             signal_sources.append("candidate_dsl_trees")
+        row = _candidate_recovery_row(
+            candidate_id=trial.candidate_id,
+            snap=snap,
+            rejection_reason=trial.rejection_reason,
+            fold_records=list(trial.fold_records or []),
+            net_metrics={
+                **dict(trial.net_metrics or {}),
+                **(
+                    {"train_diagnostic": (trial.gross_metrics or {}).get("train_diagnostic")}
+                    if isinstance(trial.gross_metrics, dict)
+                    and (trial.gross_metrics or {}).get("train_diagnostic")
+                    else {}
+                ),
+            },
+            precheck=None,
+            semantic_domain_violations=(
+                (trial.net_metrics or {}).get("violations")
+                if isinstance(trial.net_metrics, dict)
+                else None
+            ),
+        )
+        candidate_funnels.append(row)
+        seen_ids.add(trial.candidate_id)
+
+    # Descendants rejected before Full WFO (direction / domain / grammar).
+    for greg in result.generation_records or []:
+        for rejected in greg.rejected_descendants or []:
+            cid = str(rejected.get("candidate_id") or "")
+            if not cid or cid in seen_ids:
+                continue
+            details = dict(rejected.get("details") or {})
+            snap = {
+                "generation": rejected.get("generation"),
+                "creation_method": rejected.get("creation_method") or details.get("creation_method"),
+                "parent_ids": list(rejected.get("parent_ids") or details.get("parent_ids") or []),
+                "expression_tree": details.get("expression_tree") or details.get("entry_tree"),
+                "family_provenance": dict(details.get("family_provenance") or {}),
+            }
+            candidate_funnels.append(
+                _candidate_recovery_row(
+                    candidate_id=cid,
+                    snap=snap,
+                    rejection_reason=rejected.get("rejection_reason"),
+                    fold_records=None,
+                    net_metrics=None,
+                    precheck=details.get("precheck_result"),
+                    semantic_domain_violations=details.get("semantic_domain_violations")
+                    or details.get("violations"),
+                    direction_coherence=details.get("direction_coherence")
+                    or details.get("coherence_details"),
+                )
+            )
+            seen_ids.add(cid)
+
     disc = result.discovery_results[0] if result.discovery_results else None
+    recovered = [
+        c
+        for c in candidate_funnels
+        if c.get("final_rejection_reason") in (None, "")
+        and int(c.get("total_oos_trades") or 0) >= 3
+    ]
     return {
         "family_id": family_id,
         "score_qualified": int(stats.score_qualified),
@@ -191,6 +392,8 @@ def _run_family_search(
         "evaluated": int(stats.evaluated),
         "full_wfo": int(stats.full_wfo),
         "discovery_evaluated": int(disc.evaluated) if disc else 0,
+        "candidate_funnels": candidate_funnels,
+        "recovered_candidates": recovered,
     }
 
 

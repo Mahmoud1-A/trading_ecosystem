@@ -171,12 +171,18 @@ _FOLLOW_FEATURES = frozenset(
         "price.simple_return_1",
         "price.log_return_1",
         "price.breakout_distance_20",
+        "price.breakdown_distance_20",
     }
 )
+# Upside breakout distance proves LONG only; downside breakdown proves SHORT only.
+# Negative distance from the prior maximum is not a downside-breakout proof.
+_FOLLOW_UP_ONLY_FEATURES = frozenset({"price.breakout_distance_20"})
+_FOLLOW_DOWN_ONLY_FEATURES = frozenset({"price.breakdown_distance_20"})
 # Volatility / liquidity / participation context — never casts a direction vote.
 _CONTEXT_ONLY_FEATURES = frozenset(
     {
         "vol.range_compression_20",
+        "vol.prior_range_compression_20",
         "liq.volume_pct_20",
     }
 )
@@ -302,9 +308,22 @@ def _expected_direction_from_comparison(
     mechanism: str,
     op_name: str,
     threshold: float | None,
+    feature_id: str | None = None,
 ) -> tuple[str | None, str]:
     """Map a signed comparison onto the economically required entry direction."""
     is_up = op_name in _UP_OPS
+    if feature_id in _FOLLOW_UP_ONLY_FEATURES:
+        if not is_up:
+            return None, "breakout_distance_does_not_prove_short"
+        if threshold is not None and threshold < 0:
+            return None, "follow_long_requires_non_negative_threshold"
+        return "ENTRY_LONG", "follow_up_signed_condition"
+    if feature_id in _FOLLOW_DOWN_ONLY_FEATURES:
+        if is_up:
+            return None, "breakdown_distance_does_not_prove_long"
+        if threshold is not None and threshold > 0:
+            return None, "follow_short_requires_non_positive_threshold"
+        return "ENTRY_SHORT", "follow_down_signed_condition"
     if mechanism == "fade":
         expected = "ENTRY_SHORT" if is_up else "ENTRY_LONG"
         if threshold is not None:
@@ -439,6 +458,7 @@ def validate_family_direction_coherence(
             mechanism=mechanism,
             op_name=node.name,
             threshold=thr,
+            feature_id=feature_id,
         )
         directional_evidence.append(
             {
@@ -3143,10 +3163,35 @@ class MultiFamilyCampaign:
         details: dict[str, Any],
         reject_counts: dict[str, int],
     ) -> None:
+        # Provenance for diagnostics — strip run-specific keys so campaign
+        # fingerprints stay reproducible across discovery_run_id values.
+        prov = {
+            k: v
+            for k, v in dict(child.family_provenance or {}).items()
+            if k
+            not in {
+                "campaign_id",
+                "campaign_seed",
+                "ordinal",
+            }
+        }
+        enriched = {
+            "candidate_id": child.candidate_id,
+            "generation": child.generation,
+            "parent_ids": list(child.parent_ids),
+            "creation_method": (
+                child.creation_method.value
+                if hasattr(child.creation_method, "value")
+                else str(child.creation_method)
+            ),
+            "expression_tree": child.entry_tree.as_dict() if child.entry_tree is not None else None,
+            "family_provenance": prov,
+            **dict(details),
+        }
         payload = {
             "rejection_reason": rejection_reason,
             "creation_kind": kind,
-            **dict(details),
+            **enriched,
         }
         greg.rejected_descendants.append(payload)
         reject_counts[rejection_reason] = reject_counts.get(rejection_reason, 0) + 1
@@ -3174,6 +3219,30 @@ class MultiFamilyCampaign:
             full_wfo_counts[fid] = full_wfo_counts.get(fid, 0) + 1
         return rec
 
+    def _force_generation_zero(self, cand: StrategyCandidate) -> StrategyCandidate:
+        if cand.generation == 0:
+            return cand
+        from discovery.candidate import build_candidate
+
+        return build_candidate(
+            entry_tree=cand.entry_tree,
+            exit_tree=cand.exit_tree,
+            stop=cand.stop,
+            target=cand.target,
+            sizing=cand.sizing,
+            regime_gates=cand.regime_gates,
+            strategy_family=cand.strategy_family,
+            creation_method=cand.creation_method,
+            generation=0,
+            parent_ids=cand.parent_ids,
+            grammar_version=cand.grammar_version,
+            feature_set_version=cand.feature_set_version,
+            cost_model_version=cand.cost_model_version,
+            asset_universe=cand.asset_universe,
+            random_seed=cand.random_seed,
+            family_provenance=dict(cand.family_provenance or {}),
+        )
+
     def _generate_initial_population(
         self,
         *,
@@ -3184,6 +3253,41 @@ class MultiFamilyCampaign:
         cfg = self.config
         generator = CandidateGenerator.from_family_spec(spec)
         pool: list[StrategyCandidate] = []
+
+        # Deterministic grammar-derived seed templates first (family coverage).
+        seed_base = int(stable_seed(cfg.seed, spec.family_id, 0, salt=331) % (2**31 - 1))
+        for tmpl in generator.grammar_seed_templates(seed=seed_base):
+            if len(pool) >= target:
+                break
+            cand = self._force_generation_zero(tmpl)
+            if cand.strategy_family == "dsl_generated":
+                raise RuntimeError(
+                    f"FAMILY_LABEL_COLLAPSE: seed template dsl_generated under {spec.family_id!r}"
+                )
+            if cand.candidate_id in seen:
+                continue
+            # Seed templates must still pass the same direction / domain gates.
+            coherence = validate_family_direction_coherence(cand, spec)
+            if not coherence.coherent:
+                continue
+            grammar = spec.to_grammar()
+            domain_reason = validate_tree_threshold_domains(cand.entry_tree, grammar)
+            if domain_reason is not None:
+                continue
+            seen.add(cand.candidate_id)
+            pool.append(cand)
+            self._emit(
+                "CANDIDATE_GENERATED",
+                {
+                    "candidate_id": cand.candidate_id,
+                    "family": cand.strategy_family,
+                    "family_id": spec.family_id,
+                    "generation": 0,
+                    "creation_method": "SEED_TEMPLATE",
+                    "entry_pattern": (cand.family_provenance or {}).get("entry_pattern"),
+                },
+            )
+
         attempts = 0
         while len(pool) < target and attempts < target * 8:
             attempts += 1
@@ -3196,34 +3300,10 @@ class MultiFamilyCampaign:
                 raise RuntimeError(
                     f"FAMILY_LABEL_COLLAPSE: generated dsl_generated under {spec.family_id!r}"
                 )
+            cand = self._force_generation_zero(cand)
             if cand.candidate_id in seen:
                 continue
             seen.add(cand.candidate_id)
-            # Force generation index 0 for the initial queue.
-            if cand.generation != 0:
-                from discovery.candidate import build_candidate
-
-                cand = build_candidate(
-                    entry_tree=cand.entry_tree,
-                    exit_tree=cand.exit_tree,
-                    stop=cand.stop,
-                    target=cand.target,
-                    sizing=cand.sizing,
-                    regime_gates=cand.regime_gates,
-                    strategy_family=cand.strategy_family,
-                    creation_method=cand.creation_method,
-                    generation=0,
-                    parent_ids=cand.parent_ids,
-                    grammar_version=cand.grammar_version,
-                    feature_set_version=cand.feature_set_version,
-                    cost_model_version=cand.cost_model_version,
-                    asset_universe=cand.asset_universe,
-                    random_seed=cand.random_seed,
-                    family_provenance=dict(cand.family_provenance or {}),
-                )
-                if cand.candidate_id in seen:
-                    continue
-                seen.add(cand.candidate_id)
             pool.append(cand)
             self._emit(
                 "CANDIDATE_GENERATED",

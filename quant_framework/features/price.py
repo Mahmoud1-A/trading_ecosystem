@@ -64,6 +64,12 @@ def breakout_distance(close: pd.Series, lookback: int) -> pd.Series:
     return close / prior_max - 1.0
 
 
+def breakdown_distance(close: pd.Series, lookback: int) -> pd.Series:
+    # Causal downside symmetric: rolling min of prior bars only.
+    prior_min = close.shift(1).rolling(lookback, min_periods=lookback).min()
+    return close / prior_min - 1.0
+
+
 def gap_size(open_: pd.Series, close: pd.Series) -> pd.Series:
     return open_ - close.shift(1)
 
@@ -85,6 +91,7 @@ def compute_price_features(bars: pd.DataFrame) -> pd.DataFrame:
             "price.rolling_rank_20": rolling_rank(c, 20),
             "price.rolling_z_20": rolling_zscore(c, 20),
             "price.breakout_distance_20": breakout_distance(c, 20),
+            "price.breakdown_distance_20": breakdown_distance(c, 20),
             "price.gap_size": gap_size(o, c),
         },
         index=bars.index,

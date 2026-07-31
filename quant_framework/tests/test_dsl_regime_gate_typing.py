@@ -86,7 +86,7 @@ class TestGenerationMutationCrossover:
         failures = 0
         for seed in range(500):
             try:
-                entry = gen.generate_entry(seed)
+                entry, _pattern = gen.generate_entry(seed)
                 check_ast_types(entry)
             except Exception:  # noqa: BLE001
                 failures += 1

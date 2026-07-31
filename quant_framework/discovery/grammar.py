@@ -42,6 +42,7 @@ DEFAULT_FEATURE_LEAVES: tuple[FeatureLeaf, ...] = (
     FeatureLeaf("price.rolling_z_20", ValueType.ZSCORE),
     FeatureLeaf("price.dist_rolling_mean_20", ValueType.RATIO),
     FeatureLeaf("price.breakout_distance_20", ValueType.RATIO),
+    FeatureLeaf("price.breakdown_distance_20", ValueType.RATIO),
     FeatureLeaf("price.rolling_rank_20", ValueType.RANK),
     FeatureLeaf("liq.dist_session_vwap", ValueType.RATIO),
     FeatureLeaf("liq.volume_pct_20", ValueType.RANK),
@@ -49,6 +50,7 @@ DEFAULT_FEATURE_LEAVES: tuple[FeatureLeaf, ...] = (
     FeatureLeaf("vol.norm_atr_14", ValueType.RATIO),
     FeatureLeaf("vol.realized_20", ValueType.VOLATILITY),
     FeatureLeaf("vol.range_compression_20", ValueType.RATIO),
+    FeatureLeaf("vol.prior_range_compression_20", ValueType.RATIO),
     FeatureLeaf("temp.minutes_since_open", ValueType.TIME),
     FeatureLeaf("temp.dow", ValueType.SCALAR),
     # Regime leaves — required so REGIME_GATE child[1] never falls back to SCALAR

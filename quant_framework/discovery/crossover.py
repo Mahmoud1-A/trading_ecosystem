@@ -115,6 +115,31 @@ class Crossover:
                 raise CrossoverError(f"crossover tree failure: {exc}") from exc
             e1, e2 = parent_a.entry_tree, parent_b.entry_tree
 
+        # Preserve ENTRY wrapper direction: never let a typed subtree swap flip
+        # ENTRY_LONG <-> ENTRY_SHORT while leaving an incompatible condition.
+        def _preserve_entry_wrapper(child: ExprNode, parent: ExprNode) -> ExprNode:
+            if (
+                parent.kind.value == "OPERATOR"
+                and parent.name in {"ENTRY_LONG", "ENTRY_SHORT"}
+                and child.kind.value == "OPERATOR"
+                and child.name in {"ENTRY_LONG", "ENTRY_SHORT"}
+                and child.name != parent.name
+                and child.children
+            ):
+                from discovery.operators import OperatorId
+                from discovery.expression_tree import op_node as _op
+
+                wrapper = (
+                    OperatorId.ENTRY_LONG
+                    if parent.name == "ENTRY_LONG"
+                    else OperatorId.ENTRY_SHORT
+                )
+                return _op(wrapper, child.children[0])
+            return child
+
+        e1 = _preserve_entry_wrapper(e1, parent_a.entry_tree)
+        e2 = _preserve_entry_wrapper(e2, parent_b.entry_tree)
+
         child_generation = (
             int(generation)
             if generation is not None
