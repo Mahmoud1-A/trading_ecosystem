@@ -729,6 +729,12 @@ async function renderAlpha() {
   }
 
   const run = await api(`/api/runs/${id}`);
+  let summary = {};
+  try {
+    summary = await api(`/api/runs/${id}/summary`);
+  } catch {
+    summary = run.summary || {};
+  }
   let report = {};
   try { report = await api(`/api/runs/${id}/alpha_miner`); } catch { report = {}; }
   let cands = {candidates: report.candidates || [], tables: report.tables || {}, registry_total: (report.candidates || []).length, rejected_visible: true};
@@ -753,8 +759,16 @@ async function renderAlpha() {
   const failures = tables.evaluation_failures || rows.filter(c => ["EVALUATION_ERROR","WFO_FAILED","INVALID"].includes(c.evaluation_stage));
   const noFinalists = Number(report.finalist_count ?? (typeof report.finalists === "number" ? report.finalists : 0)) === 0;
   const isFailed = run.state === "FAILED" || report.software_execution_status === "SOFTWARE_FAILURE" || report.discovery_result === "SOFTWARE_FAILURE" || report.software_failure_banner === true;
-  const provenance = report.runtime_provenance || summary.runtime_provenance || {};
-  const signalSource = report.signal_source || summary.signal_source || "unknown";
+  const provenance =
+    report.runtime_provenance ||
+    summary.runtime_provenance ||
+    run.summary?.runtime_provenance ||
+    {};
+  const signalSource =
+    report.signal_source ||
+    summary.signal_source ||
+    run.summary?.signal_source ||
+    "unknown";
   const softwareErr = statusText(report.terminal_reason || run.terminal_reason || report.error, "SOFTWARE_FAILURE");
   const budget = report.search_budget_consumed || {};
   const dist = report.rejection_reason_distribution || {};

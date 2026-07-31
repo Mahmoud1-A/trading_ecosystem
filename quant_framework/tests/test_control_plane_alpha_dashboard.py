@@ -226,3 +226,42 @@ class TestAlphaMinerDashboard:
         assert not any(r["run_id"] == run_id for r in active)
         recent = client.get("/api/runs", params={"filter": "DEFAULT"}).json()["runs"]
         assert any(r["run_id"] == run_id and r["state"] == "COMPLETED" for r in recent)
+
+
+def _render_alpha_fn(js: str) -> str:
+    start = js.index("async function renderAlpha()")
+    next_markers = (
+        "\nfunction scheduleAlphaRefresh(",
+        "\nfunction wireAlpha(",
+        "\nasync function renderWfo(",
+        "\nasync function renderRegistry(",
+    )
+    ends = [js.index(m, start + 1) for m in next_markers if m in js[start + 1 :]]
+    end = min(ends) if ends else len(js)
+    return js[start:end]
+
+
+class TestAlphaMinerRenderSummaryGuard:
+    def test_render_alpha_defines_summary_before_use(self, client: TestClient) -> None:
+        js = client.get("/assets/dashboard.js").text
+        body = _render_alpha_fn(js)
+        assert "const run = await api(`/api/runs/${id}`);" in body
+        assert "let summary = {};" in body
+        assert "summary = await api(`/api/runs/${id}/summary`);" in body
+        assert "summary = run.summary || {};" in body
+        # Provenance / signal_source fallbacks use defined summary + run.summary
+        assert "summary.runtime_provenance" in body
+        assert "run.summary?.runtime_provenance" in body
+        assert "summary.signal_source" in body
+        assert "run.summary?.signal_source" in body
+        # summary must be declared before first property access
+        decl = body.index("let summary = {};")
+        first_use = min(
+            body.index("summary.runtime_provenance"),
+            body.index("summary.signal_source"),
+        )
+        assert decl < first_use
+        # No bare undeclared summary identifier left as the only path
+        assert "catch {\n    summary = run.summary || {};\n  }" in body or (
+            "summary = run.summary || {};" in body
+        )
