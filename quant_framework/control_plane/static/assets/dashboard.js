@@ -579,7 +579,7 @@ function multiFamilyBudgetError(body) {
   }
   const runtime = Number(mf.max_runtime_seconds);
   if (!Number.isFinite(runtime) || !(runtime > 0)) {
-    return "MULTI_FAMILY_INVALID: max_runtime_seconds must be a finite number greater than zero";
+    return "MULTI_FAMILY_INVALID: max_runtime_seconds must be a positive finite number";
   }
   return null;
 }

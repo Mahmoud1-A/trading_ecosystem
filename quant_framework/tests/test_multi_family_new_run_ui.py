@@ -269,7 +269,7 @@ class TestNewRunDashboardControls:
         js = _js(client)
         assert "function multiFamilyBudgetError" in js
         assert (
-            "MULTI_FAMILY_INVALID: max_runtime_seconds must be a finite number greater than zero"
+            "MULTI_FAMILY_INVALID: max_runtime_seconds must be a positive finite number"
             in js
         )
         err_fn = js[js.index("function multiFamilyBudgetError") : js.index("function collectRunBody")]
