@@ -39,8 +39,13 @@ _PIPELINE_FIELDS = (
 )
 
 _FROZEN_PREVIEW_MARKERS = (
+    '"requested_family_count": 8',
+    '"min_candidates_per_family": 6',
+    '"total_candidate_budget": 96',
+    '"max_evaluated_candidates": 96',
+    '"max_full_wfo": 32',
     '"family_local_evolution": true',
-    '"evolution_generations": 2',
+    '"evolution_generations": 3',
     '"max_stress_evaluations": 24',
     '"max_robustness_candidates": 3',
     '"min_dsr": 0.95',
@@ -71,6 +76,10 @@ class TestNewRunDashboardControls:
         assert 'value="multi">Multi-Family Generated' in js
         assert 'id="mf_family_count"' in js
         assert 'id="mf_per_family"' in js
+        assert 'id="mf_total_budget"' in js
+        assert "Initial candidates per family" in js
+        assert "Total candidate budget" in js
+        assert "<label>Candidates per family</label>" not in js
         assert 'id="mf_blueprints"' in js
         assert 'id="mf_adaptive"' in js
         assert 'id="mf_family_local_evolution"' in js
@@ -96,6 +105,7 @@ class TestNewRunDashboardControls:
         assert "collectRunBody" in js
         assert "strategy_family: multi ? \"multi_family_generated\"" in js
         assert "MULTI_FAMILY_TOO_FEW" in js
+        assert "MULTI_FAMILY_INVALID" in js
 
     def test_frozen_preview_includes_family_specs_path(self, client: TestClient) -> None:
         js = _js(client)
@@ -110,21 +120,28 @@ class TestNewRunDashboardControls:
         body_fn = _collect_run_body_fn(js)
         # Defaults wired into multi_family so frozen preview shows them.
         assert "family_local_evolution:" in body_fn
-        assert 'mfNum("mf_evolution_generations", 2)' in body_fn
+        assert 'mfNum("mf_evolution_generations", 3)' in body_fn
         assert 'mfNum("mf_max_stress_evaluations", 24)' in body_fn
         assert 'mfNum("mf_max_robustness_candidates", 3)' in body_fn
         assert 'mfNum("mf_min_dsr", 0.95)' in body_fn
         assert 'mfNum("mf_max_pbo", 0.5)' in body_fn
         assert 'id="mf_family_local_evolution" checked' in js
-        assert 'id="mf_evolution_generations" type="number" min="1" max="50" value="2"' in js
+        assert 'id="mf_family_count" type="number" min="2" max="8" value="8"' in js
+        assert 'id="mf_per_family" type="number" min="1" max="100" value="6"' in js
+        assert 'id="mf_total_budget" type="number" min="1" max="10000" value="96"' in js
+        assert 'id="mf_evolution_generations" type="number" min="1" max="50" value="3"' in js
         assert 'id="mf_max_stress_evaluations" type="number" min="0" max="500" value="24"' in js
         assert 'id="mf_max_robustness_candidates" type="number" min="0" max="50" value="3"' in js
         assert 'id="mf_min_dsr" type="number" min="0" max="5" step="0.01" value="0.95"' in js
         assert 'id="mf_max_pbo" type="number" min="0" max="1" step="0.01" value="0.5"' in js
+        # Campaign 0.1: 8×6 initial = 48, total budget 96 → 48 evolutionary slots;
+        # max_full_wfo = floor(96/3) = 32; max_evaluated_candidates = 96.
+        assert "max_evaluated_candidates: totalBudget" in body_fn
+        assert "Math.floor(totalBudget / 3)" in body_fn
         for marker in _FROZEN_PREVIEW_MARKERS:
             # Proof markers: UI defaults + collectRunBody wiring produce these keys.
             key = marker.split(":")[0].strip().strip('"')
-            assert key in body_fn
+            assert key in body_fn or key in js
 
     def test_collect_run_body_sends_complete_multifamily_pipeline(self, client: TestClient) -> None:
         body_fn = _collect_run_body_fn(_js(client))
@@ -152,6 +169,74 @@ class TestNewRunDashboardControls:
         assert "min_dsr" not in budget_assign
         assert "max_stress_evaluations" not in budget_assign
 
+    def test_initial_population_and_total_budget_are_independent(self, client: TestClient) -> None:
+        js = _js(client)
+        body_fn = _collect_run_body_fn(js)
+        assert 'id="mf_total_budget"' in js
+        assert "mf_total_budget" in body_fn
+        assert "total_candidate_budget: totalBudget" in body_fn
+        assert "min_candidates_per_family: perFamily" in body_fn
+        # Must NOT auto-derive total as family_count * initial candidates.
+        assert "totalBudget = perFamily * familyCount" not in body_fn
+        assert "totalBudget = familyCount * perFamily" not in body_fn
+        assert "Independent of initial population" in body_fn
+        assert "|| 96)" in body_fn
+
+    def test_campaign_01_budget_defaults_accepted(self, client: TestClient) -> None:
+        js = _js(client)
+        body_fn = _collect_run_body_fn(js)
+        # 8 families × 6 initial with total budget 96 is the accepted Campaign 0.1 shape.
+        assert 'id="mf_family_count" type="number" min="2" max="8" value="8"' in js
+        assert 'id="mf_per_family" type="number" min="1" max="100" value="6"' in js
+        assert 'id="mf_total_budget" type="number" min="1" max="10000" value="96"' in js
+        assert "total_candidate_budget: totalBudget" in body_fn
+        assert "min_candidates_per_family: perFamily" in body_fn
+        assert "requested_family_count: familyCount" in body_fn
+        # Validation accepts when total >= initial population (8*6=48 <= 96).
+        assert "totalBudget >= initialPop" in js
+        assert "total candidate budget is smaller than the initial population" in js
+
+    def test_total_budget_below_initial_population_rejected(self, client: TestClient) -> None:
+        js = _js(client)
+        assert "function multiFamilyBudgetError" in js
+        assert (
+            "MULTI_FAMILY_INVALID: total candidate budget is smaller than the initial population"
+            in js
+        )
+        assert "multiFamilyBudgetError(body)" in js
+        # Start is blocked when validation fails.
+        start_idx = js.index('$("#start_btn").onclick')
+        start_chunk = js[start_idx : start_idx + 900]
+        assert "mfBudgetErr" in start_chunk
+        assert "return;" in start_chunk
+
+    def test_total_budget_above_max_generated_syncs_upward(self, client: TestClient) -> None:
+        body_fn = _collect_run_body_fn(_js(client))
+        # Explicit synchronization: raise max_generated_candidates to at least totalBudget.
+        assert "Math.max(rawMaxGen, totalBudget)" in body_fn
+        assert "max_generated_candidates: maxGenerated" in body_fn
+        assert "synchronize generated cap upward" in body_fn
+
+    def test_frozen_preview_contains_independent_budget_values(self, client: TestClient) -> None:
+        js = _js(client)
+        body_fn = _collect_run_body_fn(js)
+        for key in (
+            "requested_family_count",
+            "min_candidates_per_family",
+            "total_candidate_budget",
+            "max_evaluated_candidates",
+            "max_full_wfo",
+            "family_local_evolution",
+            "evolution_generations",
+        ):
+            assert key in body_fn
+        assert 'id="mf_family_count" type="number" min="2" max="8" value="8"' in js
+        assert 'id="mf_per_family" type="number" min="1" max="100" value="6"' in js
+        assert 'id="mf_total_budget" type="number" min="1" max="10000" value="96"' in js
+        assert 'id="mf_evolution_generations" type="number" min="1" max="50" value="3"' in js
+        assert "max_evaluated_candidates: totalBudget" in body_fn
+        assert "Math.floor(totalBudget / 3)" in body_fn
+
     def test_single_family_requests_omit_multi_family(self, client: TestClient) -> None:
         body_fn = _collect_run_body_fn(_js(client))
         assert "const multi = isMultiFamilyMode();" in body_fn
@@ -160,6 +245,9 @@ class TestNewRunDashboardControls:
         before_multi = body_fn[: body_fn.index("if (multi) {")]
         assert "body.multi_family" not in before_multi
         assert 'strategy_family: multi ? "multi_family_generated" : $("#family").value' in body_fn
+        # search_budget overrides for campaign caps happen only inside the multi branch.
+        assert "max_evaluated_candidates: totalBudget" not in before_multi
+        assert "max_evaluated_candidates: totalBudget" in body_fn[body_fn.index("if (multi) {") :]
 
     def test_cross_family_crossover_forced_false(self, client: TestClient) -> None:
         body_fn = _collect_run_body_fn(_js(client))

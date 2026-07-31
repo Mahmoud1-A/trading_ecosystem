@@ -180,8 +180,9 @@ function newRunForm(datasets) {
         <h3>Strategy Family Generator</h3>
         <p class="sub">Hypothesis-driven families with distinct DSL grammars. strategy_family is forced to <span class="mono">multi_family_generated</span>.</p>
         <div class="row">
-          <div><label>Family count</label><input id="mf_family_count" type="number" min="2" max="8" value="6" /></div>
-          <div><label>Candidates per family</label><input id="mf_per_family" type="number" min="1" max="100" value="10" /></div>
+          <div><label>Family count</label><input id="mf_family_count" type="number" min="2" max="8" value="8" /></div>
+          <div><label>Initial candidates per family</label><input id="mf_per_family" type="number" min="1" max="100" value="6" /></div>
+          <div><label>Total candidate budget</label><input id="mf_total_budget" type="number" min="1" max="10000" value="96" /></div>
         </div>
         <label>Family blueprints (multiselect — hold Ctrl/Cmd)</label>
         <select id="mf_blueprints" multiple size="8" style="width:100%;min-height:9rem"></select>
@@ -194,7 +195,7 @@ function newRunForm(datasets) {
           <span>Enable family-local evolution</span>
         </div>
         <div class="row">
-          <div><label>Evolution generations</label><input id="mf_evolution_generations" type="number" min="1" max="50" value="2" /></div>
+          <div><label>Evolution generations</label><input id="mf_evolution_generations" type="number" min="1" max="50" value="3" /></div>
           <div><label>Stagnation generations</label><input id="mf_stagnation_generations" type="number" min="1" max="99" value="1" /></div>
           <div><label>Minimum improvement</label><input id="mf_minimum_improvement" type="number" min="0" step="0.0001" value="0.0001" /></div>
         </div>
@@ -410,7 +411,7 @@ async function loadFamilyBlueprints() {
   }).join("");
   if (!prev.size) {
     // Default: select first N matching family count (at least 2).
-    const want = Math.max(2, Number(($("#mf_family_count") && $("#mf_family_count").value) || 6));
+    const want = Math.max(2, Number(($("#mf_family_count") && $("#mf_family_count").value) || 8));
     Array.from(sel.options).forEach((o, i) => { o.selected = i < want; });
   }
   syncRunModePanels();
@@ -462,7 +463,10 @@ async function wireNewRun() {
     const prev = state.constraints ? resolveBackendPreview(state.constraints) : {};
     let mfBlock = "";
     let mfSpecs = null;
-    if (body.multi_family && body.multi_family.enabled) {
+    const mfBudgetErr = multiFamilyBudgetError(body);
+    if (mfBudgetErr) {
+      mfBlock = `<div class="warn-box" style="border-color:#c0392b;color:#c0392b"><strong>Multi-Family:</strong> ${mfBudgetErr}</div>`;
+    } else if (body.multi_family && body.multi_family.enabled) {
       mfSpecs = await fetchMultiFamilyPreview(body);
       if (mfSpecs && mfSpecs.error) {
         mfBlock = `<div class="warn-box" style="border-color:#c0392b;color:#c0392b"><strong>Multi-Family:</strong> ${mfSpecs.error}</div>`;
@@ -507,7 +511,7 @@ async function wireNewRun() {
     if (previewTimer) clearTimeout(previewTimer);
     previewTimer = setTimeout(() => { preview().catch(() => {}); }, 120);
   };
-  ["run_type","dataset","symbols","timeframe","family","seed","cost","risk","features","budget","wfo","c_miner","c_smoke","c_vault","c_paper","run_mode","mf_family_count","mf_per_family","mf_blueprints","mf_adaptive","mf_family_local_evolution","mf_evolution_generations","mf_stagnation_generations","mf_minimum_improvement","mf_stress_scenarios","mf_max_stress_evaluations","mf_max_stress_scenarios_per_candidate","mf_min_stress_pass_rate","mf_max_robustness_candidates","mf_max_robustness_evaluations","mf_max_parameters_per_candidate","mf_max_points_per_parameter","mf_min_valid_neighborhood_points","mf_min_dsr","mf_max_pbo","mf_pbo_n_splits","mf_min_oos_observations_for_dsr","mf_behavioral_similarity_threshold"]
+  ["run_type","dataset","symbols","timeframe","family","seed","cost","risk","features","budget","wfo","c_miner","c_smoke","c_vault","c_paper","run_mode","mf_family_count","mf_per_family","mf_total_budget","mf_blueprints","mf_adaptive","mf_family_local_evolution","mf_evolution_generations","mf_stagnation_generations","mf_minimum_improvement","mf_stress_scenarios","mf_max_stress_evaluations","mf_max_stress_scenarios_per_candidate","mf_min_stress_pass_rate","mf_max_robustness_candidates","mf_max_robustness_evaluations","mf_max_parameters_per_candidate","mf_max_points_per_parameter","mf_min_valid_neighborhood_points","mf_min_dsr","mf_max_pbo","mf_pbo_n_splits","mf_min_oos_observations_for_dsr","mf_behavioral_similarity_threshold"]
     .forEach(id => {
       const el = $(`#${id}`);
       if (!el) return;
@@ -537,6 +541,11 @@ async function wireNewRun() {
         }
       }
       const body = collectRunBody();
+      const mfBudgetErr = multiFamilyBudgetError(body);
+      if (mfBudgetErr) {
+        $("#create_msg").textContent = mfBudgetErr;
+        return;
+      }
       if (body.multi_family && body.multi_family.enabled) {
         const mfPrev = await fetchMultiFamilyPreview(body);
         if (mfPrev && mfPrev.error) {
@@ -558,14 +567,28 @@ async function wireNewRun() {
     }
   };
 }
+function multiFamilyBudgetError(body) {
+  if (!body || !body.multi_family || !body.multi_family.enabled) return null;
+  const mf = body.multi_family;
+  const familyCount = Number(mf.requested_family_count || 0);
+  const perFamily = Number(mf.min_candidates_per_family || 0);
+  const totalBudget = Number(mf.total_candidate_budget || 0);
+  const initialPop = familyCount * perFamily;
+  if (!(totalBudget >= initialPop)) {
+    return "MULTI_FAMILY_INVALID: total candidate budget is smaller than the initial population";
+  }
+  return null;
+}
 function collectRunBody() {
   let budget = {}, wfo = {};
   try { budget = JSON.parse($("#budget").value || "{}"); } catch {}
   try { wfo = JSON.parse($("#wfo").value || "{}"); } catch {}
   const multi = isMultiFamilyMode();
   const seed = Number($("#seed").value);
-  const perFamily = Math.max(1, Number(($("#mf_per_family") && $("#mf_per_family").value) || 10));
-  const familyCount = Math.max(2, Number(($("#mf_family_count") && $("#mf_family_count").value) || 6));
+  const perFamily = Math.max(1, Number(($("#mf_per_family") && $("#mf_per_family").value) || 6));
+  const familyCount = Math.max(2, Number(($("#mf_family_count") && $("#mf_family_count").value) || 8));
+  // Independent of initial population (familyCount * perFamily); do not auto-derive.
+  const totalBudget = Math.max(1, Number(($("#mf_total_budget") && $("#mf_total_budget").value) || 96));
   const familyIds = selectedBlueprintIds();
   const body = {
     run_type: $("#run_type").value,
@@ -585,12 +608,16 @@ function collectRunBody() {
     confirm_paper: $("#c_paper").checked,
   };
   if (multi) {
-    const totalBudget = perFamily * familyCount;
+    const rawMaxGen = Number(budget.max_generated_candidates);
+    // Explicitly synchronize generated cap upward when total budget exceeds it.
+    const maxGenerated = Number.isFinite(rawMaxGen)
+      ? Math.max(rawMaxGen, totalBudget)
+      : totalBudget;
     body.search_budget = {
       ...budget,
-      max_generated_candidates: budget.max_generated_candidates ?? totalBudget,
-      max_evaluated_candidates: budget.max_evaluated_candidates ?? totalBudget,
-      max_full_wfo_evaluations: budget.max_full_wfo_evaluations ?? Math.max(1, Math.floor(totalBudget * 0.3)),
+      max_generated_candidates: maxGenerated,
+      max_evaluated_candidates: totalBudget,
+      max_full_wfo_evaluations: Math.max(1, Math.floor(totalBudget / 3)),
     };
     body.multi_family = {
       enabled: true,
@@ -603,7 +630,7 @@ function collectRunBody() {
       seed,
       max_oos_drawdown: Number(budget.max_oos_drawdown ?? 0.2),
       family_local_evolution: !!( $("#mf_family_local_evolution") && $("#mf_family_local_evolution").checked ),
-      evolution_generations: mfNum("mf_evolution_generations", 2),
+      evolution_generations: mfNum("mf_evolution_generations", 3),
       stagnation_generations: mfNum("mf_stagnation_generations", 1),
       minimum_improvement: mfNum("mf_minimum_improvement", 0.0001),
       allow_cross_family_crossover: false,
