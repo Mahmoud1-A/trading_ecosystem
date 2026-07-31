@@ -99,6 +99,7 @@ STRUCTURAL_PARENT_ELIGIBLE = "STRUCTURAL_PARENT_ELIGIBLE"
 SCORE_QUALIFIED = "SCORE_QUALIFIED"
 NOT_PARENT_ELIGIBLE = "NOT_PARENT_ELIGIBLE"
 FAMILY_DIRECTION_INCOHERENT = "FAMILY_DIRECTION_INCOHERENT"
+NO_STRUCTURAL_PARENTS = "NO_STRUCTURAL_PARENTS"
 
 # Phase 3B.1 candidate status events (sequence-ordered; not wall-clock).
 FULL_WFO_COMPLETED = "FULL_WFO_COMPLETED"
@@ -665,8 +666,17 @@ EMPTY_COLLECTIONS_REASONS_AFTER_SHORTLIST: dict[str, list[str]] = {
 
 @dataclass
 class FamilyCampaignConfig:
+    """Multi-family campaign configuration.
+
+    ``initial_candidates_per_family`` is the **exact** generation-0 population
+    per family under family-local evolution. When omitted, ``min_candidates_per_family``
+    maps to that exact initial size for compatibility (it is no longer only a
+    floor that lets the full ``total_candidate_budget`` expand generation 0).
+    """
+
     requested_family_count: int = 6
     min_candidates_per_family: int = 10
+    initial_candidates_per_family: int | None = None
     total_candidate_budget: int = 60
     max_full_wfo: int = 18
     adaptive_reallocation: bool = True
@@ -703,10 +713,17 @@ class FamilyCampaignConfig:
     behavioral_similarity_threshold: float = 0.85
     min_oos_observations_for_dsr: int = 20
 
+    def effective_initial_candidates_per_family(self) -> int:
+        """Exact generation-0 size per family (never expanded to exhaust total budget)."""
+        if self.initial_candidates_per_family is not None:
+            return max(1, int(self.initial_candidates_per_family))
+        return max(1, int(self.min_candidates_per_family))
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "requested_family_count": self.requested_family_count,
             "min_candidates_per_family": self.min_candidates_per_family,
+            "initial_candidates_per_family": self.effective_initial_candidates_per_family(),
             "total_candidate_budget": self.total_candidate_budget,
             "max_full_wfo": self.max_full_wfo,
             "adaptive_reallocation": self.adaptive_reallocation,
@@ -768,6 +785,13 @@ class FamilyStats:
     constraints: dict[str, Any] = field(default_factory=dict)
     parent_status_counts: dict[str, int] = field(default_factory=dict)
     allocation_detail: dict[str, Any] = field(default_factory=dict)
+    generation_0_generated: int = 0
+    descendants_generated: int = 0
+    mutation_children: int = 0
+    crossover_children: int = 0
+    highest_generation_reached: int = 0
+    structural_parents_found: int = 0
+    family_stop_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -793,6 +817,13 @@ class FamilyStats:
             "constraints": dict(self.constraints),
             "parent_status_counts": dict(self.parent_status_counts),
             "allocation_detail": dict(self.allocation_detail),
+            "generation_0_generated": self.generation_0_generated,
+            "descendants_generated": self.descendants_generated,
+            "mutation_children": self.mutation_children,
+            "crossover_children": self.crossover_children,
+            "highest_generation_reached": self.highest_generation_reached,
+            "structural_parents_found": self.structural_parents_found,
+            "family_stop_reason": self.family_stop_reason,
         }
 
 
@@ -1260,6 +1291,58 @@ def equal_initial_allocation(
             rem -= 1
             i += 1
     return alloc
+
+
+def evolution_budget_split(
+    *,
+    family_ids: list[str],
+    total_budget: int,
+    initial_per_family: int,
+) -> dict[str, Any]:
+    """Split total candidate budget into exact initial population + evolutionary reserve.
+
+    Generation 0 is never expanded merely to exhaust ``total_budget``. Remaining
+    slots are reserved for mutation/crossover descendants.
+    """
+    n = len(family_ids)
+    if n == 0:
+        return {
+            "initial_alloc": {},
+            "evolutionary_alloc": {},
+            "generated_cap_alloc": {},
+            "initial_population_budget": 0,
+            "evolutionary_candidate_budget": 0,
+            "generated_cap": int(total_budget),
+        }
+    initial_per = max(1, int(initial_per_family))
+    initial_population_budget = n * initial_per
+    if total_budget < initial_population_budget:
+        raise ValueError(
+            f"total_candidate_budget={total_budget} cannot satisfy "
+            f"initial_candidates_per_family={initial_per} for {n} families "
+            f"(need >={initial_population_budget})"
+        )
+    evolutionary_candidate_budget = int(total_budget) - initial_population_budget
+    initial_alloc = {fid: initial_per for fid in family_ids}
+    if evolutionary_candidate_budget <= 0:
+        evolutionary_alloc = {fid: 0 for fid in family_ids}
+    else:
+        evolutionary_alloc = equal_initial_allocation(
+            family_ids=family_ids,
+            total_budget=evolutionary_candidate_budget,
+            min_per_family=0,
+        )
+    generated_cap_alloc = {
+        fid: int(initial_alloc[fid]) + int(evolutionary_alloc[fid]) for fid in family_ids
+    }
+    return {
+        "initial_alloc": initial_alloc,
+        "evolutionary_alloc": evolutionary_alloc,
+        "generated_cap_alloc": generated_cap_alloc,
+        "initial_population_budget": initial_population_budget,
+        "evolutionary_candidate_budget": evolutionary_candidate_budget,
+        "generated_cap": int(total_budget),
+    }
 
 
 def equal_wfo_allocation(
@@ -3220,7 +3303,7 @@ class MultiFamilyCampaign:
         return rec
 
     def _force_generation_zero(self, cand: StrategyCandidate) -> StrategyCandidate:
-        if cand.generation == 0:
+        if cand.generation == 0 and not cand.parent_ids:
             return cand
         from discovery.candidate import build_candidate
 
@@ -3234,7 +3317,7 @@ class MultiFamilyCampaign:
             strategy_family=cand.strategy_family,
             creation_method=cand.creation_method,
             generation=0,
-            parent_ids=cand.parent_ids,
+            parent_ids=(),
             grammar_version=cand.grammar_version,
             feature_set_version=cand.feature_set_version,
             cost_model_version=cand.cost_model_version,
@@ -3243,16 +3326,65 @@ class MultiFamilyCampaign:
             family_provenance=dict(cand.family_provenance or {}),
         )
 
+    def _stamp_candidate_budget_metadata(
+        self,
+        cand: StrategyCandidate,
+        *,
+        family_id: str,
+        generation_budget_consumed: int,
+        initial_or_descendant: str,
+    ) -> StrategyCandidate:
+        """Attach required generation-budget metadata without claiming false lineage."""
+        from discovery.candidate import build_candidate
+
+        creation = (
+            cand.creation_method.value
+            if hasattr(cand.creation_method, "value")
+            else str(cand.creation_method)
+        )
+        prov = dict(cand.family_provenance or {})
+        prov.update(
+            {
+                "family_id": family_id or prov.get("family_id") or cand.strategy_family,
+                "generation": int(cand.generation),
+                "creation_method": creation,
+                "parent_ids": list(cand.parent_ids),
+                "initial_or_descendant": initial_or_descendant,
+                "generation_budget_consumed": int(generation_budget_consumed),
+            }
+        )
+        return build_candidate(
+            entry_tree=cand.entry_tree,
+            exit_tree=cand.exit_tree,
+            stop=cand.stop,
+            target=cand.target,
+            sizing=cand.sizing,
+            regime_gates=cand.regime_gates,
+            strategy_family=cand.strategy_family,
+            creation_method=cand.creation_method,
+            generation=int(cand.generation),
+            parent_ids=tuple(cand.parent_ids),
+            grammar_version=cand.grammar_version,
+            feature_set_version=cand.feature_set_version,
+            cost_model_version=cand.cost_model_version,
+            asset_universe=cand.asset_universe,
+            random_seed=cand.random_seed,
+            lineage_id=cand.lineage_id,
+            family_provenance=prov,
+        )
+
     def _generate_initial_population(
         self,
         *,
         spec: FamilySpec,
         target: int,
         seen: set[str],
+        budget_consumed_start: int = 0,
     ) -> list[StrategyCandidate]:
         cfg = self.config
         generator = CandidateGenerator.from_family_spec(spec)
         pool: list[StrategyCandidate] = []
+        consumed = int(budget_consumed_start)
 
         # Deterministic grammar-derived seed templates first (family coverage).
         seed_base = int(stable_seed(cfg.seed, spec.family_id, 0, salt=331) % (2**31 - 1))
@@ -3274,6 +3406,13 @@ class MultiFamilyCampaign:
             domain_reason = validate_tree_threshold_domains(cand.entry_tree, grammar)
             if domain_reason is not None:
                 continue
+            consumed += 1
+            cand = self._stamp_candidate_budget_metadata(
+                cand,
+                family_id=spec.family_id,
+                generation_budget_consumed=consumed,
+                initial_or_descendant="initial",
+            )
             seen.add(cand.candidate_id)
             pool.append(cand)
             self._emit(
@@ -3284,6 +3423,9 @@ class MultiFamilyCampaign:
                     "family_id": spec.family_id,
                     "generation": 0,
                     "creation_method": "SEED_TEMPLATE",
+                    "parent_ids": [],
+                    "initial_or_descendant": "initial",
+                    "generation_budget_consumed": consumed,
                     "entry_pattern": (cand.family_provenance or {}).get("entry_pattern"),
                 },
             )
@@ -3303,8 +3445,20 @@ class MultiFamilyCampaign:
             cand = self._force_generation_zero(cand)
             if cand.candidate_id in seen:
                 continue
+            consumed += 1
+            cand = self._stamp_candidate_budget_metadata(
+                cand,
+                family_id=spec.family_id,
+                generation_budget_consumed=consumed,
+                initial_or_descendant="initial",
+            )
             seen.add(cand.candidate_id)
             pool.append(cand)
+            creation = (
+                cand.creation_method.value
+                if hasattr(cand.creation_method, "value")
+                else str(cand.creation_method)
+            )
             self._emit(
                 "CANDIDATE_GENERATED",
                 {
@@ -3312,6 +3466,10 @@ class MultiFamilyCampaign:
                     "family": cand.strategy_family,
                     "family_id": spec.family_id,
                     "generation": 0,
+                    "creation_method": creation,
+                    "parent_ids": [],
+                    "initial_or_descendant": "initial",
+                    "generation_budget_consumed": consumed,
                 },
             )
         return pool
@@ -3341,15 +3499,44 @@ class MultiFamilyCampaign:
         families: list[FamilySpec],
         gen_alloc: dict[str, int],
         wfo_alloc: dict[str, int],
+        initial_alloc: dict[str, int] | None = None,
+        evolutionary_alloc: dict[str, int] | None = None,
+        initial_population_budget: int | None = None,
+        evolutionary_candidate_budget: int | None = None,
     ) -> MultiFamilyCampaignResult:
         """Deterministic per-family generation queues with mutation/crossover."""
         cfg = self.config
         t0 = time.perf_counter()
         pipeline = PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_STRESS_SCREENING
         family_ids = [f.family_id for f in families]
+        initial_per = cfg.effective_initial_candidates_per_family()
+        if initial_alloc is None:
+            initial_alloc = {fid: initial_per for fid in family_ids}
+        if evolutionary_alloc is None:
+            evolutionary_alloc = {
+                fid: max(0, int(gen_alloc[fid]) - int(initial_alloc[fid])) for fid in family_ids
+            }
+        if initial_population_budget is None:
+            initial_population_budget = sum(initial_alloc.values())
+        if evolutionary_candidate_budget is None:
+            evolutionary_candidate_budget = max(
+                0, int(cfg.total_candidate_budget) - int(initial_population_budget)
+            )
+        # Mutable per-family generated caps (evolutionary remainder may reallocate).
+        family_gen_caps: dict[str, int] = {
+            fid: int(initial_alloc[fid]) + int(evolutionary_alloc[fid]) for fid in family_ids
+        }
+        evo_reallocation_pool = 0
         records_by_family: dict[str, list[EvaluationRecord]] = {fid: [] for fid in family_ids}
         full_wfo_counts: dict[str, int] = {fid: 0 for fid in family_ids}
         generated_counts: dict[str, int] = {fid: 0 for fid in family_ids}
+        generation_0_counts: dict[str, int] = {fid: 0 for fid in family_ids}
+        descendant_counts: dict[str, int] = {fid: 0 for fid in family_ids}
+        mutation_counts: dict[str, int] = {fid: 0 for fid in family_ids}
+        crossover_counts: dict[str, int] = {fid: 0 for fid in family_ids}
+        highest_generation: dict[str, int] = {fid: 0 for fid in family_ids}
+        structural_parents_found: dict[str, int] = {fid: 0 for fid in family_ids}
+        family_stop_reasons: dict[str, str | None] = {fid: None for fid in family_ids}
         descendant_reject_counts: dict[str, dict[str, int]] = {fid: {} for fid in family_ids}
         cand_by_id: dict[str, StrategyCandidate] = {}
         generation_records: list[GenerationRecord] = []
@@ -3367,7 +3554,15 @@ class MultiFamilyCampaign:
 
         self._emit(
             "MULTI_FAMILY_EVOLUTION_STARTED",
-            {"families": family_ids, "gen_alloc": gen_alloc, "wfo_alloc": wfo_alloc},
+            {
+                "families": family_ids,
+                "gen_alloc": dict(family_gen_caps),
+                "wfo_alloc": wfo_alloc,
+                "initial_alloc": dict(initial_alloc),
+                "evolutionary_alloc": dict(evolutionary_alloc),
+                "initial_population_budget": initial_population_budget,
+                "evolutionary_candidate_budget": evolutionary_candidate_budget,
+            },
         )
 
         for spec in families:
@@ -3375,28 +3570,40 @@ class MultiFamilyCampaign:
             grammar = spec.to_grammar()
             mutator = Mutator(grammar=grammar)
             crossover = Crossover(grammar=grammar)
-            family_gen_cap = int(gen_alloc[fid])
+            family_gen_cap = int(family_gen_caps[fid])
             family_wfo_cap = int(wfo_alloc[fid])
-            initial_n = max(2, min(int(cfg.population_size), family_gen_cap))
-            # Leave headroom for descendants when allocation allows.
-            if family_gen_cap > initial_n + 1:
-                initial_n = min(initial_n, max(2, family_gen_cap // 2))
+            # Exact initial population — never expand gen-0 to exhaust total budget.
+            initial_n = int(initial_alloc[fid])
+            # Reserve Full-WFO slots for evolutionary descendants when possible.
+            # Do not spend the entire family WFO quota on generation 0 alone.
+            wfo_reserve_for_descendants = 0
+            if int(evolutionary_alloc.get(fid, 0)) > 0 and max(0, int(cfg.evolution_generations) - 1) >= 1:
+                if family_wfo_cap >= 2:
+                    wfo_reserve_for_descendants = max(1, family_wfo_cap // 2)
+                elif family_wfo_cap == 1 and int(evolutionary_alloc.get(fid, 0)) > 0:
+                    # Prefer leaving the single slot for a descendant after one gen-0 parent.
+                    wfo_reserve_for_descendants = 0
 
             # --- Generation 0 queue (initial population only) ---
             gen_queues: dict[int, list[StrategyCandidate]] = {
                 0: self._generate_initial_population(
-                    spec=spec, target=initial_n, seen=seen_ids
+                    spec=spec,
+                    target=initial_n,
+                    seen=seen_ids,
+                    budget_consumed_start=campaign_generated,
                 )
             }
-            if len(gen_queues[0]) < 2:
+            if len(gen_queues[0]) < initial_n:
                 raise RuntimeError(
                     f"FAMILY_GENERATION_SHORTFALL: {fid} produced {len(gen_queues[0])} "
-                    f"< 2 required for family-local evolution"
+                    f"< initial_candidates_per_family={initial_n}"
                 )
             generated_counts[fid] = len(gen_queues[0])
+            generation_0_counts[fid] = len(gen_queues[0])
             campaign_generated += len(gen_queues[0])
             for c in gen_queues[0]:
                 cand_by_id[c.candidate_id] = c
+            highest_generation[fid] = 0
 
             best_score_so_far = float("-inf")
             stagnation_count = 0
@@ -3461,6 +3668,13 @@ class MultiFamilyCampaign:
                     break
 
                 wfo_room = min(remaining_wfo, remaining_campaign_wfo, eval_cap)
+                if gen == 0 and wfo_reserve_for_descendants > 0:
+                    # Keep reserved Full-WFO capacity for later generations.
+                    gen0_wfo_limit = max(0, family_wfo_cap - wfo_reserve_for_descendants)
+                    wfo_room = min(wfo_room, max(0, gen0_wfo_limit - full_wfo_counts[fid]))
+                    if wfo_room <= 0:
+                        # Still evaluate at least one gen-0 candidate when family has WFO.
+                        wfo_room = min(1, remaining_wfo, remaining_campaign_wfo, eval_cap)
                 ev = self._make_evaluator(
                     spec=spec,
                     wfo_cap=max(wfo_room, 1),
@@ -3477,7 +3691,11 @@ class MultiFamilyCampaign:
                         None if best_score_so_far == float("-inf") else float(best_score_so_far)
                     ),
                 )
-                take = queue[:eval_cap]
+                # Cap how many queue members we attempt when gen-0 WFO is reserved.
+                take_n = eval_cap
+                if gen == 0 and wfo_reserve_for_descendants > 0:
+                    take_n = min(eval_cap, max(wfo_room, 1))
+                take = queue[:take_n]
                 greg.generated_count = len(queue)
                 valid_eval_count = 0
                 gen_scores: list[float] = []
@@ -3487,6 +3705,10 @@ class MultiFamilyCampaign:
                         family_stop = "max_evaluated_candidates"
                         stop_reason = "max_evaluated_candidates"
                         break
+                    if gen == 0 and wfo_reserve_for_descendants > 0:
+                        gen0_wfo_limit = max(1, family_wfo_cap - wfo_reserve_for_descendants)
+                        if full_wfo_counts[fid] >= gen0_wfo_limit:
+                            break
                     if full_wfo_counts[fid] >= family_wfo_cap and campaign_full_wfo >= 0:
                         # Still allow non-WFO rejects (invalid) but evaluator may no-op WFO.
                         if ev.counters.full_wfo >= ev.budget.max_full_wfo_evaluations:
@@ -3613,13 +3835,46 @@ class MultiFamilyCampaign:
                     )
                     eligible_scored.append((prev_c, prev_rec, fit))
 
-                n_parents = min(max(2, int(cfg.population_size)), len(eligible_scored))
+                structural_parents_found[fid] = max(
+                    structural_parents_found[fid], len(eligible_scored)
+                )
+
+                # No structural parents after gen-0: reserve unused evo budget; never
+                # refill with extra random generation-0 candidates.
+                if gen == 0 and not eligible_scored:
+                    family_stop = NO_STRUCTURAL_PARENTS
+                    stop_reason = NO_STRUCTURAL_PARENTS
+                    greg.stop_reason = NO_STRUCTURAL_PARENTS
+                    generation_records.append(greg)
+                    unused_evo = max(0, family_gen_cap - generated_counts[fid])
+                    if cfg.adaptive_reallocation and unused_evo > 0:
+                        evo_reallocation_pool += unused_evo
+                        family_gen_caps[fid] = generated_counts[fid]
+                        family_gen_cap = generated_counts[fid]
+                    break
+
+                n_parents = min(max(1, int(cfg.population_size)), len(eligible_scored))
+                # Prefer at least 2 parents when available so family-local crossover can run.
+                if len(eligible_scored) >= 2:
+                    n_parents = max(n_parents, min(2, len(eligible_scored)))
                 parents, parent_reasons = self._select_parents_deterministic(
                     eligible=eligible_scored, n_parents=n_parents
                 )
                 greg.selected_parent_ids = [p.candidate_id for p in parents]
                 greg.parent_selection_reasons = dict(parent_reasons)
                 population = list(parents) if parents else list(population)
+
+                # Active evolving family may receive unused evolutionary remainder.
+                if (
+                    parents
+                    and cfg.adaptive_reallocation
+                    and evo_reallocation_pool > 0
+                ):
+                    family_gen_caps[fid] = int(family_gen_caps[fid]) + int(
+                        evo_reallocation_pool
+                    )
+                    family_gen_cap = int(family_gen_caps[fid])
+                    evo_reallocation_pool = 0
 
                 # If this was the last generation index, do not breed further.
                 if gen >= max_gen_index or family_stop:
@@ -3639,11 +3894,24 @@ class MultiFamilyCampaign:
                 )
 
                 if breed_budget <= 0 or len(parents) < 1:
-                    greg.stop_reason = family_stop or "budget_exhausted_before_breed"
+                    greg.stop_reason = family_stop or (
+                        NO_STRUCTURAL_PARENTS
+                        if not parents
+                        else "budget_exhausted_before_breed"
+                    )
+                    if not parents:
+                        family_stop = NO_STRUCTURAL_PARENTS
+                        stop_reason = NO_STRUCTURAL_PARENTS
                     generation_records.append(greg)
+                    unused_evo = max(0, family_gen_cap - generated_counts[fid])
+                    if cfg.adaptive_reallocation and unused_evo > 0:
+                        evo_reallocation_pool += unused_evo
+                        family_gen_caps[fid] = generated_counts[fid]
+                        family_gen_cap = generated_counts[fid]
                     break
 
                 breed_seed_base = int(stable_seed(cfg.seed, fid, next_gen, salt=4242) % (2**31 - 1))
+                parent_id_set = {p.candidate_id for p in parents}
 
                 def _accept_descendant(
                     child: StrategyCandidate,
@@ -3659,6 +3927,25 @@ class MultiFamilyCampaign:
                     if child.generation != next_gen:
                         return False
                     if child.strategy_family != family_ref:
+                        return False
+                    # Never claim a crossover/mutation descendant that is an unchanged parent.
+                    if child.candidate_id in parent_id_set:
+                        self._record_rejected_descendant(
+                            greg=greg,
+                            child=child,
+                            kind=kind,
+                            rejection_reason="UNCHANGED_PARENT_CLONE",
+                            details={
+                                "candidate_id": child.candidate_id,
+                                "family_id": fid,
+                                "parent_ids": list(child.parent_ids),
+                            },
+                            reject_counts=descendant_reject_counts[fid],
+                        )
+                        return False
+                    if kind == "mutation" and len(child.parent_ids) != 1:
+                        return False
+                    if kind == "crossover" and len(child.parent_ids) != 2:
                         return False
                     # Type / structural validity already enforced by Mutator/Crossover
                     # strict mode. Re-check semantic domain, family grammar, and
@@ -3716,15 +4003,41 @@ class MultiFamilyCampaign:
                             reject_counts=descendant_reject_counts[fid],
                         )
                         return False
-                    seen_ids.add(child.candidate_id)
-                    next_queue.append(child)
-                    cand_by_id[child.candidate_id] = child
+                    stamped = self._stamp_candidate_budget_metadata(
+                        child,
+                        family_id=fid,
+                        generation_budget_consumed=campaign_generated + 1,
+                        initial_or_descendant="descendant",
+                    )
+                    if stamped.candidate_id != child.candidate_id:
+                        # Identity must remain stable; provenance-only stamp.
+                        stamped = child
+                    seen_ids.add(stamped.candidate_id)
+                    next_queue.append(stamped)
+                    cand_by_id[stamped.candidate_id] = stamped
                     generated_counts[fid] += 1
+                    descendant_counts[fid] += 1
                     campaign_generated += 1
+                    highest_generation[fid] = max(highest_generation[fid], next_gen)
                     if kind == "crossover":
-                        greg.crossover_candidate_ids.append(child.candidate_id)
+                        greg.crossover_candidate_ids.append(stamped.candidate_id)
+                        crossover_counts[fid] += 1
                     else:
-                        greg.mutation_candidate_ids.append(child.candidate_id)
+                        greg.mutation_candidate_ids.append(stamped.candidate_id)
+                        mutation_counts[fid] += 1
+                    self._emit(
+                        "CANDIDATE_GENERATED",
+                        {
+                            "candidate_id": stamped.candidate_id,
+                            "family": stamped.strategy_family,
+                            "family_id": fid,
+                            "generation": next_gen,
+                            "creation_method": kind.upper(),
+                            "parent_ids": list(stamped.parent_ids),
+                            "initial_or_descendant": "descendant",
+                            "generation_budget_consumed": campaign_generated,
+                        },
+                    )
                     return True
 
                 def _try_mutate(parent: StrategyCandidate, salt: int) -> bool:
@@ -3806,6 +4119,20 @@ class MultiFamilyCampaign:
             ):
                 pass  # stop_reason already recorded on last greg when possible
 
+            # Resolve family stop reason from last generation record when unset.
+            if family_stop is None:
+                fam_gregs = [g for g in generation_records if g.family_id == fid]
+                if fam_gregs and fam_gregs[-1].stop_reason:
+                    family_stop = fam_gregs[-1].stop_reason
+                else:
+                    family_stop = "evolution_generations_completed"
+            family_stop_reasons[fid] = family_stop
+            # Return unused evolutionary slots for adaptive reallocation.
+            unused_evo = max(0, int(family_gen_caps[fid]) - int(generated_counts[fid]))
+            if cfg.adaptive_reallocation and unused_evo > 0:
+                evo_reallocation_pool += unused_evo
+                family_gen_caps[fid] = int(generated_counts[fid])
+
         # Phase 3B.1: Score Qualified → real Stress.
         stress_accounting = self._run_stress_phase(
             families=families,
@@ -3848,33 +4175,56 @@ class MultiFamilyCampaign:
 
         family_stats = []
         for spec in families:
+            fid = spec.family_id
             st = self._stats_from_records(
                 spec=spec,
-                records=records_by_family[spec.family_id],
-                generated=generated_counts[spec.family_id],
-                allocation_generated=gen_alloc[spec.family_id],
-                allocation_wfo=wfo_alloc[spec.family_id],
-                full_wfo=full_wfo_counts[spec.family_id],
+                records=records_by_family[fid],
+                generated=generated_counts[fid],
+                allocation_generated=int(family_gen_caps[fid]),
+                allocation_wfo=wfo_alloc[fid],
+                full_wfo=full_wfo_counts[fid],
             )
-            for reason, count in descendant_reject_counts.get(spec.family_id, {}).items():
+            for reason, count in descendant_reject_counts.get(fid, {}).items():
                 st.rejection_reasons[reason] = st.rejection_reasons.get(reason, 0) + int(count)
-            fam_cids = {r.candidate_id for r in records_by_family[spec.family_id]}
+            fam_cids = {r.candidate_id for r in records_by_family[fid]}
             st.stress_passed = sum(1 for cid in stress_passed_ids if cid in fam_cids)
             st.robustness_passed = sum(1 for cid in robustness_passed_ids if cid in fam_cids)
             st.statistically_passed = sum(
                 1 for cid in statistically_passed_ids if cid in fam_cids
             )
             st.research_shortlisted = sum(1 for cid in shortlist_ids if cid in fam_cids)
+            st.generation_0_generated = int(generation_0_counts[fid])
+            st.descendants_generated = int(descendant_counts[fid])
+            st.mutation_children = int(mutation_counts[fid])
+            st.crossover_children = int(crossover_counts[fid])
+            st.highest_generation_reached = int(highest_generation[fid])
+            st.structural_parents_found = int(structural_parents_found[fid])
+            st.family_stop_reason = family_stop_reasons.get(fid)
             family_stats.append(st)
+
+        initial_candidates_generated = sum(generation_0_counts.values())
+        evolutionary_candidates_generated = sum(descendant_counts.values())
+        unused_evolutionary_budget = max(
+            0,
+            int(evolutionary_candidate_budget) - int(evolutionary_candidates_generated),
+        )
 
         # Budget invariant assertions (soft: encode into stop / payload).
         assert campaign_generated <= cfg.total_candidate_budget + 0  # noqa: S101
         assert campaign_full_wfo <= cfg.max_full_wfo
         assert campaign_evaluated <= max_evaluated
+        assert initial_candidates_generated == len(family_ids) * initial_per
+        assert campaign_generated == (
+            initial_candidates_generated + evolutionary_candidates_generated
+        )
         for fid in family_ids:
-            assert generated_counts[fid] <= gen_alloc[fid]
             assert full_wfo_counts[fid] <= wfo_alloc[fid]
-
+            assert generation_0_counts[fid] == int(initial_alloc[fid])
+            assert (
+                generated_counts[fid]
+                == generation_0_counts[fid] + descendant_counts[fid]
+            )
+            assert generated_counts[fid] <= cfg.total_candidate_budget
         rankings: list[dict[str, Any]] = []
         for st in family_stats:
             for cid in st.best_candidate_ids:
@@ -3922,13 +4272,20 @@ class MultiFamilyCampaign:
             paper_candidates=[],
         )
         allocation_payload = {
-            "generated": gen_alloc,
+            "generated": {fid: int(family_gen_caps[fid]) for fid in family_ids},
+            "generated_cap_alloc": {
+                fid: int(initial_alloc[fid]) + int(evolutionary_alloc[fid])
+                for fid in family_ids
+            },
+            "initial_alloc": dict(initial_alloc),
+            "evolutionary_alloc": dict(evolutionary_alloc),
             "full_wfo_initial": wfo_alloc,
             "full_wfo_early": wfo_alloc,
             "full_wfo_final": wfo_alloc,
-            "adaptive_reallocation": False,
+            "adaptive_reallocation": bool(cfg.adaptive_reallocation),
             "allocation_detail": {},
             "min_candidates_per_family": cfg.min_candidates_per_family,
+            "initial_candidates_per_family": initial_per,
             "total_candidate_budget": cfg.total_candidate_budget,
             "max_full_wfo": cfg.max_full_wfo,
             "family_local_evolution": True,
@@ -3947,6 +4304,34 @@ class MultiFamilyCampaign:
             "campaign_generated": campaign_generated,
             "campaign_evaluated": campaign_evaluated,
             "campaign_full_wfo": campaign_full_wfo,
+            "initial_population_budget": int(initial_population_budget),
+            "initial_candidates_generated": int(initial_candidates_generated),
+            "evolutionary_candidate_budget": int(evolutionary_candidate_budget),
+            "evolutionary_candidates_generated": int(evolutionary_candidates_generated),
+            "unused_evolutionary_budget": int(unused_evolutionary_budget),
+            "generated_total": int(campaign_generated),
+            "generated_cap": int(cfg.total_candidate_budget),
+            "generation_0_generated": int(initial_candidates_generated),
+            "descendants_generated": int(evolutionary_candidates_generated),
+            "mutation_children": int(sum(mutation_counts.values())),
+            "crossover_children": int(sum(crossover_counts.values())),
+            "highest_generation_reached": int(
+                max(highest_generation.values()) if highest_generation else 0
+            ),
+            "per_family_generation_counts": {
+                fid: {
+                    "generation_0_generated": int(generation_0_counts[fid]),
+                    "descendants_generated": int(descendant_counts[fid]),
+                    "mutation_children": int(mutation_counts[fid]),
+                    "crossover_children": int(crossover_counts[fid]),
+                    "highest_generation_reached": int(highest_generation[fid]),
+                    "structural_parents_found": int(structural_parents_found[fid]),
+                    "generated_total": int(generated_counts[fid]),
+                    "family_stop_reason": family_stop_reasons.get(fid),
+                }
+                for fid in family_ids
+            },
+            "family_stop_reasons": dict(family_stop_reasons),
             "stress_accounting": stress_accounting.as_dict(),
             "robustness_accounting": robustness_accounting.as_dict(),
             "statistics_accounting": shortlist_phase.statistics_accounting.as_dict(),
@@ -4032,11 +4417,27 @@ class MultiFamilyCampaign:
                 )
 
         family_ids = [f.family_id for f in families]
-        gen_alloc = equal_initial_allocation(
-            family_ids=family_ids,
-            total_budget=cfg.total_candidate_budget,
-            min_per_family=cfg.min_candidates_per_family,
-        )
+        if cfg.family_local_evolution:
+            evo_split = evolution_budget_split(
+                family_ids=family_ids,
+                total_budget=cfg.total_candidate_budget,
+                initial_per_family=cfg.effective_initial_candidates_per_family(),
+            )
+            gen_alloc = dict(evo_split["generated_cap_alloc"])
+            initial_alloc = dict(evo_split["initial_alloc"])
+            evolutionary_alloc = dict(evo_split["evolutionary_alloc"])
+            initial_population_budget = int(evo_split["initial_population_budget"])
+            evolutionary_candidate_budget = int(evo_split["evolutionary_candidate_budget"])
+        else:
+            gen_alloc = equal_initial_allocation(
+                family_ids=family_ids,
+                total_budget=cfg.total_candidate_budget,
+                min_per_family=cfg.min_candidates_per_family,
+            )
+            initial_alloc = {}
+            evolutionary_alloc = {}
+            initial_population_budget = 0
+            evolutionary_candidate_budget = 0
         wfo_floor = 1 if cfg.max_full_wfo >= len(family_ids) else 0
         initial_wfo = equal_wfo_allocation(
             family_ids=family_ids,
@@ -4045,12 +4446,17 @@ class MultiFamilyCampaign:
         )
 
         if cfg.family_local_evolution:
-            # Evolution uses the same equal allocations; adaptive reallocation is
-            # intentionally not applied inside the family-local generation loop.
+            # Exact initial population + reserved evolutionary slots.
+            # Adaptive reallocation may move unused evolutionary remainder only
+            # to families with active structural parents.
             return self._run_family_local_evolution(
                 families=families,
                 gen_alloc=gen_alloc,
                 wfo_alloc=initial_wfo,
+                initial_alloc=initial_alloc,
+                evolutionary_alloc=evolutionary_alloc,
+                initial_population_budget=initial_population_budget,
+                evolutionary_candidate_budget=evolutionary_candidate_budget,
             )
 
         self._emit(
@@ -4301,6 +4707,11 @@ def family_campaign_from_config(raw: dict[str, Any] | None) -> FamilyCampaignCon
     return FamilyCampaignConfig(
         requested_family_count=int(raw.get("requested_family_count", raw.get("family_count", 6))),
         min_candidates_per_family=int(raw.get("min_candidates_per_family", 10)),
+        initial_candidates_per_family=(
+            int(raw["initial_candidates_per_family"])
+            if raw.get("initial_candidates_per_family") is not None
+            else None
+        ),
         total_candidate_budget=int(raw.get("total_candidate_budget", 60)),
         max_full_wfo=int(raw.get("max_full_wfo", raw.get("max_full_wfo_evaluations", 18))),
         adaptive_reallocation=bool(raw.get("adaptive_reallocation", True)),
