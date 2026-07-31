@@ -182,19 +182,28 @@ class TestIncompleteEvolutionGuards:
             discovery_run_id="test_evo_ready",
         )
         result = campaign.run()
-        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING
+        assert result.pipeline_level == "MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST"
         assert result.post_wfo_pipeline_complete is False
         assert result.discovery_results[0].finalists == []
         assert result.discovery_results[0].promoted == []
-        assert result.discovery_results[0].clusters == []
-        assert result.research_shortlist == []
+        assert result.vault_candidates == []
+        assert result.paper_candidates == []
+        assert result.vault_pipeline_complete is False
+        assert result.paper_pipeline_complete is False
+        assert result.live_pipeline_complete is False
         assert result.generation_records
         assert result.discovery_results[0].generations == len(result.generation_records)
         assert result.stress_pipeline_complete is True
         assert result.robustness_pipeline_complete is True
+        assert result.statistics_pipeline_complete is True
+        assert result.clustering_pipeline_complete is True
+        assert result.research_shortlist_pipeline_complete is True
         assert STRESS_NOT_RUN not in result.post_wfo_blocked_reasons
         assert ROBUSTNESS_NOT_RUN not in result.post_wfo_blocked_reasons
-
+        assert CLUSTERING_NOT_RUN not in result.post_wfo_blocked_reasons
+        assert "VAULT_NOT_RUN" in result.post_wfo_blocked_reasons
+        assert "PAPER_NOT_RUN" in result.post_wfo_blocked_reasons
+        assert "LIVE_NOT_RUN" in result.post_wfo_blocked_reasons
     def test_cross_family_crossover_fails_fast(self, tmp_path: Path) -> None:
         registry = ExperimentRegistry(tmp_path / "reg_xover")
         campaign = MultiFamilyCampaign(

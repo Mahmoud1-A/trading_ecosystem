@@ -706,7 +706,8 @@ async function renderAlpha() {
       <table>
         <thead><tr>
           <th>Family</th><th>Alloc gen</th><th>Alloc WFO</th><th>Generated</th><th>Evaluated</th>
-          <th>Full WFO</th><th>Score qual</th><th>Stress</th><th>Best fitness</th>
+          <th>Full WFO</th><th>Score qual</th><th>Stress</th><th>Robust</th><th>Stats</th><th>Shortlist</th>
+          <th>Best fitness</th>
           <th>Med OOS Exp</th><th>Med PF</th>
         </tr></thead>
         <tbody>${report.family_funnel.map(f => `<tr>
@@ -718,6 +719,9 @@ async function renderAlpha() {
           <td>${fmtVal(f.full_wfo)}</td>
           <td>${fmtVal(f.score_qualified)}</td>
           <td>${fmtVal(f.stress_passed)}</td>
+          <td>${fmtVal(f.robustness_passed)}</td>
+          <td>${fmtVal(f.statistically_passed)}</td>
+          <td>${fmtVal(f.research_shortlisted)}</td>
           <td>${fmtMetric(f.best_fitness, 4)}</td>
           <td>${fmtMetric(f.median_oos_expectancy, 6)}</td>
           <td>${fmtMetric(f.median_pf, 4)}</td>
@@ -735,6 +739,92 @@ async function renderAlpha() {
       </div>`).join("")}
       <h4>Best candidates per family</h4>
       <pre class="mono">${JSON.stringify(report.best_candidates_per_family || {}, null, 2)}</pre>
+    </div>` : ""}
+    ${Array.isArray(report.clusters) && report.clusters.length ? `
+    <div class="panel">
+      <h3>Behavioral clusters (count=${report.clusters.length})</h3>
+      <table>
+        <thead><tr><th>Cluster</th><th>Members</th><th>Representative</th></tr></thead>
+        <tbody>${report.clusters.map(c => `<tr>
+          <td class="mono">${c.cluster_id}</td>
+          <td class="mono">${(c.member_ids || []).join(", ")}</td>
+          <td class="mono">${c.representative_id || ""}</td>
+        </tr>`).join("")}</tbody>
+      </table>
+      ${report.clustering_accounting ? `<pre class="mono">${JSON.stringify(report.clustering_accounting, null, 2)}</pre>` : ""}
+    </div>` : ""}
+    ${Array.isArray(report.research_shortlist) && report.research_shortlist.length ? `
+    <div class="panel">
+      <h3>Research shortlist (count=${report.research_shortlist.length})</h3>
+      <p class="sub">Vault / Paper / Live remain blocked. Shortlist ≠ Finalist.</p>
+      <table>
+        <thead><tr>
+          <th>ID</th><th>Family</th><th>Cluster</th><th>Fitness</th><th>DSR</th><th>PBO</th><th>Gates</th>
+        </tr></thead>
+        <tbody>${report.research_shortlist.map(e => `<tr>
+          <td class="mono">${e.candidate_id}</td>
+          <td>${e.family_id || ""}</td>
+          <td class="mono">${e.cluster_id || ""}</td>
+          <td>${fmtVal(e.fitness)}</td>
+          <td>${fmtVal(e.dsr_value)}</td>
+          <td>${fmtVal(e.pbo_value)}</td>
+          <td class="mono">${(e.gates_passed || []).join(" → ")}</td>
+        </tr>`).join("")}</tbody>
+      </table>
+    </div>` : ""}
+    ${(report.candidate_statistics_summaries && report.candidate_statistics_summaries.length) || report.statistics_accounting || report.population_stats ? `
+    <div class="panel">
+      <h3>Statistical artifacts (DSR / PBO)</h3>
+      ${report.statistics_accounting ? `<pre class="mono">${JSON.stringify(report.statistics_accounting, null, 2)}</pre>` : ""}
+      ${report.population_stats ? `<pre class="mono">${JSON.stringify(report.population_stats, null, 2)}</pre>` : ""}
+      ${Array.isArray(report.candidate_statistics_summaries) && report.candidate_statistics_summaries.length ? `
+      <table>
+        <thead><tr>
+          <th>ID</th><th>Family</th><th>Obs Sharpe</th><th>N obs</th>
+          <th>DSR</th><th>DSR status</th><th>PBO</th><th>PBO status</th><th>Decision</th><th>Reason</th>
+        </tr></thead>
+        <tbody>${report.candidate_statistics_summaries.map(s => `<tr>
+          <td class="mono">${s.candidate_id}</td>
+          <td>${s.family_id || ""}</td>
+          <td>${fmtVal(s.observed_sharpe)}</td>
+          <td>${fmtVal(s.n_observations)}</td>
+          <td>${fmtVal(s.dsr_value)}</td>
+          <td>${fmtVal(s.dsr_status)}</td>
+          <td>${fmtVal(s.pbo_value)}</td>
+          <td>${fmtVal(s.pbo_status)}</td>
+          <td>${fmtVal(s.final_decision)}</td>
+          <td class="mono">${fmtVal(s.final_reason || s.dsr_reason || s.pbo_reason)}</td>
+        </tr>`).join("")}</tbody>
+      </table>` : ""}
+      ${Array.isArray(report.shortlist_rejects) && report.shortlist_rejects.length ? `
+      <h4>Shortlist rejects</h4>
+      <table>
+        <thead><tr><th>ID</th><th>Cluster</th><th>Reason</th><th>Missing gates</th></tr></thead>
+        <tbody>${report.shortlist_rejects.map(r => `<tr>
+          <td class="mono">${r.candidate_id}</td>
+          <td class="mono">${r.cluster_id || ""}</td>
+          <td class="mono">${fmtVal(r.reason)}</td>
+          <td class="mono">${(r.missing_gates || []).join(", ")}</td>
+        </tr>`).join("")}</tbody>
+      </table>` : ""}
+    </div>` : ""}
+    ${Array.isArray(report.candidate_status_history) && report.candidate_status_history.length ? `
+    <div class="panel">
+      <h3>Candidate status history (seq=${report.candidate_status_history.length})</h3>
+      <table>
+        <thead><tr>
+          <th>Seq</th><th>ID</th><th>Family</th><th>Gen</th><th>Prior</th><th>New</th><th>Reason</th>
+        </tr></thead>
+        <tbody>${report.candidate_status_history.slice(-80).map(e => `<tr>
+          <td>${e.sequence}</td>
+          <td class="mono">${e.candidate_id}</td>
+          <td>${e.family_id || ""}</td>
+          <td>${fmtVal(e.generation)}</td>
+          <td class="mono">${fmtVal(e.prior_status)}</td>
+          <td class="mono">${fmtVal(e.new_status)}</td>
+          <td class="mono">${fmtVal(e.reason)}</td>
+        </tr>`).join("")}</tbody>
+      </table>
     </div>` : ""}
     ${(report.evaluation_backend === "synthetic_oos_probe") ? `<div class="warn-box">Synthetic OOS probe — not a real-data institutional evaluation.</div>` : ""}
     ${report.silver_resolution ? `<div class="panel"><h3>Silver artifacts</h3><pre class="mono">${JSON.stringify(report.silver_resolution, null, 2)}</pre></div>` : ""}
@@ -754,8 +844,8 @@ async function renderAlpha() {
         return lim == null ? "—" : `${(Number(lim)*100).toFixed(1)}%`;
       })()}</div></div>
       <div class="stat"><div class="label">Stress passed</div><div class="value">${Number(report.stress_passed ?? 0)}</div></div>
-      <div class="stat"><div class="label">Clusters</div><div class="value">${Number(report.behavioral_clusters ?? 0)}</div></div>
-      <div class="stat"><div class="label">Shortlisted</div><div class="value">${Number(report.shortlisted ?? 0)}</div></div>
+      <div class="stat"><div class="label">Clusters</div><div class="value">${Number(report.behavioral_clusters ?? (report.clusters || []).length ?? 0)}</div></div>
+      <div class="stat"><div class="label">Shortlisted</div><div class="value">${Number(report.shortlisted ?? (report.research_shortlist || []).length ?? 0)}</div></div>
       <div class="stat"><div class="label">Finalists</div><div class="value">${Number(report.finalist_count ?? (typeof report.finalists === "number" ? report.finalists : 0) ?? run.finalist_count ?? 0)}</div></div>
       <div class="stat"><div class="label">Duplicates</div><div class="value">${Number(report.duplicate_candidates ?? report.duplicates ?? 0)}</div></div>
       <div class="stat"><div class="label">Elapsed s</div><div class="value">${Number(report.elapsed_time ?? run.elapsed_seconds ?? 0).toFixed(2)}</div></div>

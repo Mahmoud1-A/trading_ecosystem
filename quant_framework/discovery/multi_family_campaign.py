@@ -47,6 +47,43 @@ from discovery.parameter_robustness import (
     ROBUSTNESS_WFO_INCOMPLETE,
     SYNTHETIC_ROBUSTNESS_FORBIDDEN,
 )
+from discovery.research_shortlist_pipeline import (
+    BEHAVIORALLY_CLUSTERED,
+    CLUSTERING_NOT_ENTERED,
+    CampaignClusteringAccounting,
+    CampaignStatisticsAccounting,
+    CandidateStatisticsSummary,
+    DSR_FAILED,
+    DSR_INSUFFICIENT_DATA,
+    DSR_PASSED,
+    NO_BEHAVIORAL_SIGNATURE,
+    NO_ROBUSTNESS_PASSED_FOR_STATISTICS,
+    PBO_FAILED,
+    PBO_INSUFFICIENT_DATA,
+    PBO_PASSED,
+    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST,
+    RESEARCH_SHORTLISTED,
+    RESEARCH_SHORTLISTED_DOES_NOT_MEAN,
+    ResearchShortlistConfig,
+    ResearchShortlistEntry,
+    ResearchShortlistPhaseResult,
+    SHORTLIST_NOT_ENTERED,
+    SHORTLIST_REJECTED,
+    STATISTICS_NOT_ENTERED,
+    STATISTICS_REQUIRES_FULL_WFO,
+    STATISTICS_REQUIRES_ROBUSTNESS_PASSED,
+    STATISTICS_REQUIRES_STRESS_PASSED,
+    STATISTICS_TESTED,
+    STATISTICALLY_PASSED,
+    STATISTICALLY_REJECTED,
+    ShortlistRejectRecord,
+    align_performance_matrix,
+    build_behavioral_signature,
+    build_full_wfo_trial_population,
+    evaluate_candidate_dsr_pbo,
+    select_best_per_cluster,
+    BehavioralDeduper,
+)
 from discovery.stress import StressResult, StressTester, attach_stress
 from discovery.stress_backend import (
     STRESS_BACKEND_KIND,
@@ -545,6 +582,14 @@ POST_ROBUSTNESS_BLOCKED_REASONS: tuple[str, ...] = (
     LIVE_NOT_RUN,
 )
 
+# After Phase 3C Research Shortlist: statistics/clustering/shortlist ran; Vault/Paper/Live blocked.
+POST_SHORTLIST_BLOCKED_REASONS: tuple[str, ...] = (
+    POST_WFO_PIPELINE_NOT_RUN,
+    VAULT_NOT_RUN,
+    PAPER_NOT_RUN,
+    LIVE_NOT_RUN,
+)
+
 EMPTY_COLLECTIONS_REASONS: dict[str, list[str]] = {
     "finalists": [
         POST_WFO_PIPELINE_NOT_RUN,
@@ -587,6 +632,15 @@ EMPTY_COLLECTIONS_REASONS_AFTER_ROBUSTNESS: dict[str, list[str]] = {
     "paper_candidates": [POST_WFO_PIPELINE_NOT_RUN, NOT_RESEARCH_SHORTLISTED, PAPER_NOT_RUN],
 }
 
+EMPTY_COLLECTIONS_REASONS_AFTER_SHORTLIST: dict[str, list[str]] = {
+    "finalists": [POST_WFO_PIPELINE_NOT_RUN, VAULT_NOT_RUN],
+    "promoted": [POST_WFO_PIPELINE_NOT_RUN, VAULT_NOT_RUN],
+    "clusters": [],
+    "research_shortlist": [],
+    "vault_candidates": [NOT_RESEARCH_SHORTLISTED, VAULT_NOT_RUN],
+    "paper_candidates": [NOT_RESEARCH_SHORTLISTED, PAPER_NOT_RUN],
+}
+
 
 @dataclass
 class FamilyCampaignConfig:
@@ -621,6 +675,12 @@ class FamilyCampaignConfig:
     max_points_per_parameter: int = 5
     allow_one_sided_neighborhood: bool = False
     min_valid_neighborhood_points: int = 3
+    # Phase 3C: DSR/PBO → Behavioral Clustering → Research Shortlist.
+    min_dsr: float = 0.95
+    max_pbo: float = 0.50
+    pbo_n_splits: int = 4
+    behavioral_similarity_threshold: float = 0.85
+    min_oos_observations_for_dsr: int = 20
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -655,6 +715,11 @@ class FamilyCampaignConfig:
             "max_points_per_parameter": self.max_points_per_parameter,
             "allow_one_sided_neighborhood": self.allow_one_sided_neighborhood,
             "min_valid_neighborhood_points": self.min_valid_neighborhood_points,
+            "min_dsr": self.min_dsr,
+            "max_pbo": self.max_pbo,
+            "pbo_n_splits": self.pbo_n_splits,
+            "behavioral_similarity_threshold": self.behavioral_similarity_threshold,
+            "min_oos_observations_for_dsr": self.min_oos_observations_for_dsr,
         }
 
 
@@ -671,6 +736,9 @@ class FamilyStats:
     full_wfo: int = 0
     score_qualified: int = 0
     stress_passed: int = 0
+    robustness_passed: int = 0
+    statistically_passed: int = 0
+    research_shortlisted: int = 0
     best_fitness: float | None = None
     median_oos_expectancy: float | None = None
     median_pf: float | None = None
@@ -693,6 +761,9 @@ class FamilyStats:
             "full_wfo": self.full_wfo,
             "score_qualified": self.score_qualified,
             "stress_passed": self.stress_passed,
+            "robustness_passed": self.robustness_passed,
+            "statistically_passed": self.statistically_passed,
+            "research_shortlisted": self.research_shortlisted,
             "best_fitness": self.best_fitness,
             "median_oos_expectancy": self.median_oos_expectancy,
             "median_pf": self.median_pf,
@@ -1036,8 +1107,28 @@ class MultiFamilyCampaignResult:
         default_factory=list
     )
     robustness_accounting: CampaignRobustnessAccounting | None = None
+    candidate_statistics_summaries: list[CandidateStatisticsSummary] = field(
+        default_factory=list
+    )
+    statistics_accounting: CampaignStatisticsAccounting | None = None
+    clusters: list[dict[str, Any]] = field(default_factory=list)
+    behavioral_signatures: list[dict[str, Any]] = field(default_factory=list)
+    clustering_accounting: CampaignClusteringAccounting | None = None
+    shortlist_rejects: list[ShortlistRejectRecord] = field(default_factory=list)
+    population_stats: dict[str, Any] = field(default_factory=dict)
+    research_shortlisted_does_not_mean: tuple[str, ...] = RESEARCH_SHORTLISTED_DOES_NOT_MEAN
 
     def as_dict(self) -> dict[str, Any]:
+        empty_shortlist_reasons = list(
+            self.empty_collections_reasons.get("research_shortlist") or []
+        )
+        if self.research_shortlist_pipeline_complete and not self.research_shortlist:
+            if not empty_shortlist_reasons:
+                empty_shortlist_reasons = [NOT_RESEARCH_SHORTLISTED]
+        clusters_out = list(self.clusters)
+        shortlist_out = [
+            e.as_dict() if hasattr(e, "as_dict") else e for e in self.research_shortlist
+        ]
         return {
             "campaign_id": self.campaign_id,
             "families": [f.as_dict() for f in self.families],
@@ -1064,11 +1155,12 @@ class MultiFamilyCampaignResult:
             "score_qualified_does_not_mean": list(self.score_qualified_does_not_mean),
             "stress_passed_does_not_mean": list(self.stress_passed_does_not_mean),
             "robustness_passed_does_not_mean": list(self.robustness_passed_does_not_mean),
+            "research_shortlisted_does_not_mean": list(self.research_shortlisted_does_not_mean),
             "post_wfo_blocked_reasons": list(self.post_wfo_blocked_reasons),
             "empty_collections_reasons": {
                 k: list(v) for k, v in self.empty_collections_reasons.items()
             },
-            "research_shortlist": list(self.research_shortlist),
+            "research_shortlist": shortlist_out,
             "vault_candidates": list(self.vault_candidates),
             "paper_candidates": list(self.paper_candidates),
             "generation_records": [g.as_dict() for g in self.generation_records],
@@ -1085,10 +1177,29 @@ class MultiFamilyCampaignResult:
                 if self.robustness_accounting is not None
                 else None
             ),
-            # Explicit empty post-WFO surfaces — never silent.
+            "candidate_statistics_summaries": [
+                s.as_dict() for s in self.candidate_statistics_summaries
+            ],
+            "statistics_accounting": (
+                self.statistics_accounting.as_dict()
+                if self.statistics_accounting is not None
+                else None
+            ),
+            "behavioral_signatures": list(self.behavioral_signatures),
+            "clustering_accounting": (
+                self.clustering_accounting.as_dict()
+                if self.clustering_accounting is not None
+                else None
+            ),
+            "shortlist_rejects": [
+                r.as_dict() if hasattr(r, "as_dict") else r for r in self.shortlist_rejects
+            ],
+            "population_stats": dict(self.population_stats),
+            # Explicit post-WFO surfaces — Vault/Paper/Live never silent.
             "finalists": [],
             "promoted": [],
-            "clusters": [],
+            "clusters": clusters_out,
+            "research_shortlist_empty_reasons": empty_shortlist_reasons,
         }
 
 
@@ -1304,6 +1415,14 @@ class MultiFamilyCampaign:
         self.stress_accounting: CampaignStressAccounting | None = None
         self.candidate_robustness_summaries: list[CandidateRobustnessSummary] = []
         self.robustness_accounting: CampaignRobustnessAccounting | None = None
+        self.candidate_statistics_summaries: list[CandidateStatisticsSummary] = []
+        self.statistics_accounting: CampaignStatisticsAccounting | None = None
+        self.clusters: list[dict[str, Any]] = []
+        self.behavioral_signatures: list[dict[str, Any]] = []
+        self.clustering_accounting: CampaignClusteringAccounting | None = None
+        self.shortlist_rejects: list[ShortlistRejectRecord] = []
+        self.research_shortlist_entries: list[ResearchShortlistEntry] = []
+        self.population_stats: dict[str, Any] = {}
 
     def _emit(self, name: str, payload: dict[str, Any] | None = None) -> None:
         if self.progress_hook is not None:
@@ -2525,6 +2644,446 @@ class MultiFamilyCampaign:
         self._emit("MULTI_FAMILY_ROBUSTNESS_COMPLETED", accounting.as_dict())
         return accounting
 
+    def _run_statistics_clustering_shortlist_phase(
+        self,
+        *,
+        families: list[FamilySpec],
+        records_by_family: dict[str, list[EvaluationRecord]],
+        cand_by_id: dict[str, StrategyCandidate],
+        robustness_pipeline_complete: bool,
+    ) -> ResearchShortlistPhaseResult:
+        """Phase 3C: DSR/PBO → behavioral clustering → research shortlist."""
+        cfg = self.config
+        rs_cfg = ResearchShortlistConfig(
+            min_dsr=float(cfg.min_dsr),
+            max_pbo=float(cfg.max_pbo),
+            pbo_n_splits=int(cfg.pbo_n_splits),
+            behavioral_similarity_threshold=float(cfg.behavioral_similarity_threshold),
+            min_oos_observations_for_dsr=int(cfg.min_oos_observations_for_dsr),
+        )
+        stats_acct = CampaignStatisticsAccounting()
+        cluster_acct = CampaignClusteringAccounting()
+        summaries: list[CandidateStatisticsSummary] = []
+        shortlist: list[ResearchShortlistEntry] = []
+        rejects: list[ShortlistRejectRecord] = []
+        clusters_out: list[dict[str, Any]] = []
+        signatures_out: list[dict[str, Any]] = []
+
+        all_records: list[EvaluationRecord] = []
+        for spec in families:
+            all_records.extend(records_by_family.get(spec.family_id, []))
+
+        robustness_passed_ids = {
+            s.candidate_id
+            for s in self.candidate_robustness_summaries
+            if s.final_decision == ROBUSTNESS_PASSED
+        }
+        stress_passed_ids = {
+            s.candidate_id
+            for s in self.candidate_stress_summaries
+            if s.final_decision == STRESS_PASSED
+        }
+        score_qualified_ids: set[str] = set()
+        for rec in all_records:
+            _status, is_sq, _reason = self.classify_parent_eligibility(rec)
+            if is_sq:
+                score_qualified_ids.add(rec.candidate_id)
+
+        stats_acct.candidates_robustness_passed = len(robustness_passed_ids)
+        population, pop_ids, series_list = build_full_wfo_trial_population(all_records)
+        stats_acct.population_total_trials = population.total_trials
+        stats_acct.population_scored_trials = population.scored_trials
+        matrix = align_performance_matrix(series_list)
+        if matrix is not None:
+            stats_acct.pbo_matrix_shape = (int(matrix.shape[0]), int(matrix.shape[1]))
+        col_index = {cid: i for i, cid in enumerate(pop_ids)}
+
+        self._emit(
+            "MULTI_FAMILY_STATISTICS_STARTED",
+            {
+                "robustness_passed": len(robustness_passed_ids),
+                "population_total_trials": population.total_trials,
+                "pbo_matrix_shape": stats_acct.pbo_matrix_shape,
+            },
+        )
+
+        ordered: list[tuple[str, EvaluationRecord, StrategyCandidate]] = []
+        for spec in sorted(families, key=lambda s: s.family_id):
+            for rec in records_by_family.get(spec.family_id, []):
+                cand = cand_by_id.get(rec.candidate_id)
+                if cand is None:
+                    continue
+                ordered.append((spec.family_id, rec, cand))
+        ordered.sort(key=lambda t: (t[0], t[1].candidate_id))
+
+        if not robustness_pipeline_complete:
+            stats_acct.stop_reason = STATISTICS_REQUIRES_ROBUSTNESS_PASSED
+            stats_acct.candidates_statistics_not_entered = len(ordered)
+            for family_id, rec, cand in ordered:
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=int(cand.generation),
+                    prior_status=ROBUSTNESS_NOT_ENTERED,
+                    new_status=STATISTICS_NOT_ENTERED,
+                    reason=f"{STATISTICS_NOT_ENTERED}:{STATISTICS_REQUIRES_ROBUSTNESS_PASSED}",
+                    artifact_refs={},
+                )
+            phase = ResearchShortlistPhaseResult(
+                statistics_summaries=summaries,
+                statistics_accounting=stats_acct,
+                clusters=clusters_out,
+                signatures=signatures_out,
+                clustering_accounting=cluster_acct,
+                research_shortlist=shortlist,
+                shortlist_rejects=rejects,
+                population_stats=population.as_dict(),
+                reproducible_fingerprint_payload={"statistics": "skipped"},
+            )
+            self.statistics_accounting = stats_acct
+            self.clustering_accounting = cluster_acct
+            return phase
+
+        if not robustness_passed_ids:
+            stats_acct.stop_reason = NO_ROBUSTNESS_PASSED_FOR_STATISTICS
+
+        for family_id, rec, cand in ordered:
+            gen = int(cand.generation)
+            in_rob = cand.candidate_id in robustness_passed_ids
+            in_stress = cand.candidate_id in stress_passed_ids
+            prior = (
+                ROBUSTNESS_PASSED
+                if in_rob
+                else (
+                    ROBUSTNESS_FAILED
+                    if any(
+                        s.candidate_id == cand.candidate_id
+                        and s.final_decision == ROBUSTNESS_FAILED
+                        for s in self.candidate_robustness_summaries
+                    )
+                    else ROBUSTNESS_NOT_ENTERED
+                )
+            )
+            if not in_rob:
+                stats_acct.candidates_statistics_not_entered += 1
+                reason = (
+                    STATISTICS_REQUIRES_ROBUSTNESS_PASSED
+                    if robustness_pipeline_complete
+                    else STATISTICS_REQUIRES_ROBUSTNESS_PASSED
+                )
+                if not in_stress:
+                    reason = STATISTICS_REQUIRES_STRESS_PASSED
+                proof = self.full_wfo_proof(rec)
+                if not proof.get("full_wfo_ok"):
+                    reason = STATISTICS_REQUIRES_FULL_WFO
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=gen,
+                    prior_status=prior,
+                    new_status=STATISTICS_NOT_ENTERED,
+                    reason=f"{STATISTICS_NOT_ENTERED}:{reason}",
+                    artifact_refs={"full_wfo_proof": proof},
+                )
+                continue
+
+            stats_acct.candidates_statistics_entered += 1
+            self._append_status(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                prior_status=ROBUSTNESS_PASSED,
+                new_status=STATISTICS_TESTED,
+                reason="dsr_pbo_evaluation_started",
+                artifact_refs={
+                    "population_total_trials": population.total_trials,
+                    "artifact_source": "completed_full_wfo",
+                },
+            )
+            dsr, pbo, meta = evaluate_candidate_dsr_pbo(
+                rec=rec,
+                population=population,
+                performance_matrix=matrix,
+                trial_column_index=col_index.get(cand.candidate_id),
+                config=rs_cfg,
+            )
+            dsr_decision, dsr_reason = (
+                (DSR_PASSED, "dsr_above_minimum")
+                if (
+                    dsr.status.value == "OK"
+                    and dsr.deflated_sharpe is not None
+                    and float(dsr.deflated_sharpe) >= float(rs_cfg.min_dsr)
+                )
+                else (
+                    (DSR_INSUFFICIENT_DATA, dsr.reason or DSR_INSUFFICIENT_DATA)
+                    if dsr.status.value == "INSUFFICIENT_DATA"
+                    else (
+                        DSR_FAILED,
+                        dsr.reason
+                        or (
+                            f"DSR_BELOW_MINIMUM:dsr={dsr.deflated_sharpe}"
+                            if dsr.deflated_sharpe is not None
+                            else dsr.status.value
+                        ),
+                    )
+                )
+            )
+            if pbo is None:
+                pbo_decision, pbo_reason = PBO_INSUFFICIENT_DATA, "PBO_MATRIX_INSUFFICIENT"
+                pbo_payload: dict[str, Any] = {}
+            elif pbo.status.value == "INSUFFICIENT_DATA":
+                pbo_decision, pbo_reason = PBO_INSUFFICIENT_DATA, pbo.reason or PBO_INSUFFICIENT_DATA
+                pbo_payload = pbo.as_dict()
+            elif (
+                pbo.status.value == "OK"
+                and pbo.pbo is not None
+                and float(pbo.pbo) <= float(rs_cfg.max_pbo)
+            ):
+                pbo_decision, pbo_reason = PBO_PASSED, "pbo_below_maximum"
+                pbo_payload = pbo.as_dict()
+            else:
+                pbo_decision, pbo_reason = (
+                    PBO_FAILED,
+                    pbo.reason
+                    or (
+                        f"PBO_ABOVE_MAXIMUM:pbo={pbo.pbo}"
+                        if pbo.pbo is not None
+                        else pbo.status.value
+                    ),
+                )
+                pbo_payload = pbo.as_dict()
+
+            if dsr_decision == DSR_PASSED and pbo_decision == PBO_PASSED:
+                final_decision = STATISTICALLY_PASSED
+                final_reason = "dsr_and_pbo_passed"
+                stats_acct.candidates_statistics_passed += 1
+            elif dsr_decision == DSR_INSUFFICIENT_DATA or pbo_decision == PBO_INSUFFICIENT_DATA:
+                final_decision = STATISTICALLY_REJECTED
+                final_reason = (
+                    dsr_reason
+                    if dsr_decision == DSR_INSUFFICIENT_DATA
+                    else pbo_reason
+                )
+                stats_acct.candidates_statistics_insufficient += 1
+            else:
+                final_decision = STATISTICALLY_REJECTED
+                final_reason = dsr_reason if dsr_decision != DSR_PASSED else pbo_reason
+                stats_acct.candidates_statistics_failed += 1
+
+            summary = CandidateStatisticsSummary(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                observed_sharpe=dsr.observed_sharpe,
+                n_observations=int(dsr.n_observations),
+                dsr_status=dsr_decision,
+                dsr_value=dsr.deflated_sharpe,
+                dsr_reason=dsr_reason,
+                pbo_status=pbo_decision,
+                pbo_value=None if pbo is None else pbo.pbo,
+                pbo_reason=pbo_reason,
+                final_decision=final_decision,
+                final_reason=final_reason,
+                artifact_refs=dict(meta),
+                dsr_payload=dsr.as_dict(),
+                pbo_payload=pbo_payload,
+                trial_population_refs=population.as_dict(),
+            )
+            summaries.append(summary)
+            if isinstance(rec.meta, dict):
+                rec.meta["statistics_summary"] = summary.as_dict()
+
+            self._append_status(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                prior_status=STATISTICS_TESTED,
+                new_status=dsr_decision,
+                reason=dsr_reason,
+                artifact_refs={"dsr": dsr.as_dict()},
+            )
+            self._append_status(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                prior_status=dsr_decision,
+                new_status=pbo_decision,
+                reason=pbo_reason,
+                artifact_refs={"pbo": pbo_payload},
+            )
+            self._append_status(
+                candidate_id=cand.candidate_id,
+                family_id=family_id,
+                generation=gen,
+                prior_status=pbo_decision,
+                new_status=final_decision,
+                reason=final_reason,
+                artifact_refs={"summary": summary.as_dict()},
+            )
+
+        # Behavioral clustering on robustness-passed candidates with Full WFO artifacts.
+        self._emit("MULTI_FAMILY_CLUSTERING_STARTED", {"pool": len(robustness_passed_ids)})
+        sigs = []
+        sig_rec: dict[str, EvaluationRecord] = {}
+        sig_cand: dict[str, StrategyCandidate] = {}
+        for family_id, rec, cand in ordered:
+            if cand.candidate_id not in robustness_passed_ids:
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=int(cand.generation),
+                    prior_status=STATISTICS_NOT_ENTERED,
+                    new_status=CLUSTERING_NOT_ENTERED,
+                    reason=f"{CLUSTERING_NOT_ENTERED}:{STATISTICS_REQUIRES_ROBUSTNESS_PASSED}",
+                    artifact_refs={},
+                )
+                continue
+            sig = build_behavioral_signature(
+                cand, rec, n_bins=rs_cfg.min_signature_bins
+            )
+            if sig is None:
+                self._append_status(
+                    candidate_id=cand.candidate_id,
+                    family_id=family_id,
+                    generation=int(cand.generation),
+                    prior_status=STATISTICALLY_REJECTED,
+                    new_status=CLUSTERING_NOT_ENTERED,
+                    reason=f"{CLUSTERING_NOT_ENTERED}:{NO_BEHAVIORAL_SIGNATURE}",
+                    artifact_refs={},
+                )
+                continue
+            sigs.append(sig)
+            sig_rec[cand.candidate_id] = rec
+            sig_cand[cand.candidate_id] = cand
+            signatures_out.append(sig.as_dict())
+            rec.behavioral_cluster = None  # set after clustering
+
+        deduper = BehavioralDeduper(
+            similarity_threshold=float(rs_cfg.behavioral_similarity_threshold)
+        )
+        clusters = deduper.cluster(sigs) if sigs else []
+        cluster_acct.candidates_clustered = len(sigs)
+        cluster_acct.cluster_count = len(clusters)
+        clusters_out = [c.as_dict() for c in clusters]
+        cluster_by_member: dict[str, str] = {}
+        for cl in clusters:
+            for mid in cl.member_ids:
+                cluster_by_member[mid] = cl.cluster_id
+                if mid in sig_rec:
+                    sig_rec[mid].behavioral_cluster = cl.cluster_id
+                self._append_status(
+                    candidate_id=mid,
+                    family_id=next(
+                        (
+                            fid
+                            for fid, r, c in ordered
+                            if c.candidate_id == mid
+                        ),
+                        "",
+                    ),
+                    generation=int(sig_cand[mid].generation) if mid in sig_cand else 0,
+                    prior_status=STATISTICALLY_PASSED
+                    if any(
+                        s.candidate_id == mid and s.final_decision == STATISTICALLY_PASSED
+                        for s in summaries
+                    )
+                    else STATISTICALLY_REJECTED,
+                    new_status=BEHAVIORALLY_CLUSTERED,
+                    reason=f"cluster={cl.cluster_id}",
+                    artifact_refs={
+                        "cluster_id": cl.cluster_id,
+                        "representative_id": cl.representative_id,
+                        "member_ids": list(cl.member_ids),
+                    },
+                )
+
+        stats_by_id = {s.candidate_id: s for s in summaries}
+        shortlist, rejects = select_best_per_cluster(
+            clusters=clusters,
+            candidates=sig_cand,
+            records=sig_rec,
+            stats_by_id=stats_by_id,
+            score_qualified_ids=score_qualified_ids,
+            stress_passed_ids=stress_passed_ids,
+            robustness_passed_ids=robustness_passed_ids,
+        )
+        cluster_acct.shortlist_count = len(shortlist)
+        cluster_acct.reject_count = len(rejects)
+
+        shortlist_ids = {e.candidate_id for e in shortlist}
+        for entry in shortlist:
+            self._append_status(
+                candidate_id=entry.candidate_id,
+                family_id=entry.family_id,
+                generation=entry.generation,
+                prior_status=BEHAVIORALLY_CLUSTERED,
+                new_status=RESEARCH_SHORTLISTED,
+                reason="cluster_best_passed_hard_gates",
+                artifact_refs=entry.as_dict(),
+            )
+        for rej in rejects:
+            if rej.candidate_id in shortlist_ids:
+                continue
+            if rej.reason == "CLUSTER_NO_GATE_PASSER":
+                continue
+            fam = rej.family_id or next(
+                (fid for fid, r, c in ordered if c.candidate_id == rej.candidate_id),
+                "",
+            )
+            gen = int(sig_cand[rej.candidate_id].generation) if rej.candidate_id in sig_cand else 0
+            self._append_status(
+                candidate_id=rej.candidate_id,
+                family_id=fam,
+                generation=gen,
+                prior_status=BEHAVIORALLY_CLUSTERED
+                if rej.candidate_id in cluster_by_member
+                else STATISTICS_NOT_ENTERED,
+                new_status=SHORTLIST_REJECTED,
+                reason=rej.reason,
+                artifact_refs=rej.as_dict(),
+            )
+
+        self._emit(
+            "MULTI_FAMILY_RESEARCH_SHORTLIST_COMPLETED",
+            {
+                "clusters": len(clusters_out),
+                "shortlist": len(shortlist),
+                "rejects": len(rejects),
+            },
+        )
+
+        pop_stats = {
+            "trial_population": population.as_dict(),
+            "pbo_matrix_shape": stats_acct.pbo_matrix_shape,
+            "min_dsr": rs_cfg.min_dsr,
+            "max_pbo": rs_cfg.max_pbo,
+        }
+        phase = ResearchShortlistPhaseResult(
+            statistics_summaries=summaries,
+            statistics_accounting=stats_acct,
+            clusters=clusters_out,
+            signatures=signatures_out,
+            clustering_accounting=cluster_acct,
+            research_shortlist=shortlist,
+            shortlist_rejects=rejects,
+            population_stats=pop_stats,
+            reproducible_fingerprint_payload={
+                "statistics_summaries": [s.as_dict() for s in summaries],
+                "clusters": clusters_out,
+                "research_shortlist": [e.as_dict() for e in shortlist],
+                "shortlist_rejects": [r.as_dict() for r in rejects],
+            },
+        )
+        self.candidate_statistics_summaries = summaries
+        self.statistics_accounting = stats_acct
+        self.clusters = clusters_out
+        self.behavioral_signatures = signatures_out
+        self.clustering_accounting = cluster_acct
+        self.shortlist_rejects = rejects
+        self.research_shortlist_entries = shortlist
+        self.population_stats = pop_stats
+        return phase
+
     @staticmethod
     def candidate_within_family_grammar(cand: StrategyCandidate, grammar: Grammar) -> bool:
         allowed_features = {leaf.feature_id for leaf in grammar.feature_leaves}
@@ -3160,12 +3719,30 @@ class MultiFamilyCampaign:
             t0=t0,
             stress_pipeline_complete=True,
         )
+        # Phase 3C: DSR/PBO → Behavioral Clustering → Research Shortlist.
+        shortlist_phase = self._run_statistics_clustering_shortlist_phase(
+            families=families,
+            records_by_family=records_by_family,
+            cand_by_id=cand_by_id,
+            robustness_pipeline_complete=True,
+        )
         stress_passed_ids = {
             s.candidate_id
             for s in self.candidate_stress_summaries
             if s.final_decision == STRESS_PASSED
         }
-        pipeline = PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING
+        robustness_passed_ids = {
+            s.candidate_id
+            for s in self.candidate_robustness_summaries
+            if s.final_decision == ROBUSTNESS_PASSED
+        }
+        statistically_passed_ids = {
+            s.candidate_id
+            for s in shortlist_phase.statistics_summaries
+            if s.final_decision == STATISTICALLY_PASSED
+        }
+        shortlist_ids = {e.candidate_id for e in shortlist_phase.research_shortlist}
+        pipeline = PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST
 
         family_stats = []
         for spec in families:
@@ -3179,11 +3756,13 @@ class MultiFamilyCampaign:
             )
             for reason, count in descendant_reject_counts.get(spec.family_id, {}).items():
                 st.rejection_reasons[reason] = st.rejection_reasons.get(reason, 0) + int(count)
-            st.stress_passed = sum(
-                1
-                for cid in stress_passed_ids
-                if cid in {r.candidate_id for r in records_by_family[spec.family_id]}
+            fam_cids = {r.candidate_id for r in records_by_family[spec.family_id]}
+            st.stress_passed = sum(1 for cid in stress_passed_ids if cid in fam_cids)
+            st.robustness_passed = sum(1 for cid in robustness_passed_ids if cid in fam_cids)
+            st.statistically_passed = sum(
+                1 for cid in statistically_passed_ids if cid in fam_cids
             )
+            st.research_shortlisted = sum(1 for cid in shortlist_ids if cid in fam_cids)
             family_stats.append(st)
 
         # Budget invariant assertions (soft: encode into stop / payload).
@@ -3206,8 +3785,19 @@ class MultiFamilyCampaign:
                     }
                 )
         empty_reasons = {
-            k: list(v) for k, v in EMPTY_COLLECTIONS_REASONS_AFTER_ROBUSTNESS.items()
+            k: list(v) for k, v in EMPTY_COLLECTIONS_REASONS_AFTER_SHORTLIST.items()
         }
+        if shortlist_phase.research_shortlist:
+            empty_reasons["research_shortlist"] = []
+            empty_reasons["vault_candidates"] = [VAULT_NOT_RUN]
+            empty_reasons["paper_candidates"] = [PAPER_NOT_RUN]
+        else:
+            empty_reasons["research_shortlist"] = [NOT_RESEARCH_SHORTLISTED]
+        if not shortlist_phase.clusters:
+            empty_reasons["clusters"] = [CLUSTERING_NOT_RUN]
+        else:
+            empty_reasons["clusters"] = []
+        shortlist_payload = [e.as_dict() for e in shortlist_phase.research_shortlist]
         discovery = DiscoveryRunResult(
             discovery_run_id=self.discovery_run_id,
             budget_id="budget_multi_family",
@@ -3219,13 +3809,13 @@ class MultiFamilyCampaign:
             finalists=[],
             promoted=[],
             portfolio_pool={"members": [], "size": 0},
-            clusters=[],
+            clusters=list(shortlist_phase.clusters),
             reproducible_fingerprint="",
             pipeline_level=pipeline,
             post_wfo_pipeline_complete=False,
             score_qualified_meaning=SCORE_QUALIFIED_MEANING,
             empty_collections_reasons=empty_reasons,
-            research_shortlist=[],
+            research_shortlist=shortlist_payload,
             vault_candidates=[],
             paper_candidates=[],
         )
@@ -3245,12 +3835,20 @@ class MultiFamilyCampaign:
             "post_wfo_pipeline_complete": False,
             "stress_pipeline_complete": True,
             "robustness_pipeline_complete": True,
+            "statistics_pipeline_complete": True,
+            "clustering_pipeline_complete": True,
+            "research_shortlist_pipeline_complete": True,
+            "vault_pipeline_complete": False,
+            "paper_pipeline_complete": False,
+            "live_pipeline_complete": False,
             "completed_generations": completed_generation_count,
             "campaign_generated": campaign_generated,
             "campaign_evaluated": campaign_evaluated,
             "campaign_full_wfo": campaign_full_wfo,
             "stress_accounting": stress_accounting.as_dict(),
             "robustness_accounting": robustness_accounting.as_dict(),
+            "statistics_accounting": shortlist_phase.statistics_accounting.as_dict(),
+            "clustering_accounting": shortlist_phase.clustering_accounting.as_dict(),
         }
         fingerprint = sha256_json(
             {
@@ -3265,6 +3863,7 @@ class MultiFamilyCampaign:
                 "candidate_robustness_summaries": [
                     s.as_dict() for s in self.candidate_robustness_summaries
                 ],
+                "research_shortlist_phase": shortlist_phase.reproducible_fingerprint_payload,
             }
         )
         discovery.reproducible_fingerprint = fingerprint
@@ -3280,9 +3879,9 @@ class MultiFamilyCampaign:
             post_wfo_pipeline_complete=False,
             stress_pipeline_complete=True,
             robustness_pipeline_complete=True,
-            statistics_pipeline_complete=False,
-            clustering_pipeline_complete=False,
-            research_shortlist_pipeline_complete=False,
+            statistics_pipeline_complete=True,
+            clustering_pipeline_complete=True,
+            research_shortlist_pipeline_complete=True,
             vault_pipeline_complete=False,
             paper_pipeline_complete=False,
             live_pipeline_complete=False,
@@ -3290,9 +3889,10 @@ class MultiFamilyCampaign:
             score_qualified_does_not_mean=SCORE_QUALIFIED_DOES_NOT_MEAN,
             stress_passed_does_not_mean=STRESS_PASSED_DOES_NOT_MEAN,
             robustness_passed_does_not_mean=ROBUSTNESS_PASSED_DOES_NOT_MEAN,
-            post_wfo_blocked_reasons=list(POST_ROBUSTNESS_BLOCKED_REASONS),
+            research_shortlisted_does_not_mean=RESEARCH_SHORTLISTED_DOES_NOT_MEAN,
+            post_wfo_blocked_reasons=list(POST_SHORTLIST_BLOCKED_REASONS),
             empty_collections_reasons=empty_reasons,
-            research_shortlist=[],
+            research_shortlist=shortlist_payload,
             vault_candidates=[],
             paper_candidates=[],
             generation_records=generation_records,
@@ -3301,6 +3901,13 @@ class MultiFamilyCampaign:
             stress_accounting=stress_accounting,
             candidate_robustness_summaries=list(self.candidate_robustness_summaries),
             robustness_accounting=robustness_accounting,
+            candidate_statistics_summaries=list(shortlist_phase.statistics_summaries),
+            statistics_accounting=shortlist_phase.statistics_accounting,
+            clusters=list(shortlist_phase.clusters),
+            behavioral_signatures=list(shortlist_phase.signatures),
+            clustering_accounting=shortlist_phase.clustering_accounting,
+            shortlist_rejects=list(shortlist_phase.shortlist_rejects),
+            population_stats=dict(shortlist_phase.population_stats),
         )
 
     def run(self) -> MultiFamilyCampaignResult:
@@ -3625,4 +4232,17 @@ def family_campaign_from_config(raw: dict[str, Any] | None) -> FamilyCampaignCon
         fail_closed_unsupported_stress=bool(
             raw.get("fail_closed_unsupported_stress", True)
         ),
+        max_robustness_candidates=int(raw.get("max_robustness_candidates", 2)),
+        max_robustness_evaluations=int(raw.get("max_robustness_evaluations", 30)),
+        max_parameters_per_candidate=int(raw.get("max_parameters_per_candidate", 2)),
+        max_points_per_parameter=int(raw.get("max_points_per_parameter", 5)),
+        allow_one_sided_neighborhood=bool(raw.get("allow_one_sided_neighborhood", False)),
+        min_valid_neighborhood_points=int(raw.get("min_valid_neighborhood_points", 3)),
+        min_dsr=float(raw.get("min_dsr", 0.95)),
+        max_pbo=float(raw.get("max_pbo", 0.50)),
+        pbo_n_splits=int(raw.get("pbo_n_splits", 4)),
+        behavioral_similarity_threshold=float(
+            raw.get("behavioral_similarity_threshold", 0.85)
+        ),
+        min_oos_observations_for_dsr=int(raw.get("min_oos_observations_for_dsr", 20)),
     )

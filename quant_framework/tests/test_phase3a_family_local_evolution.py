@@ -15,7 +15,7 @@ from discovery.multi_family_campaign import (
     CROSS_FAMILY_CROSSOVER_UNSUPPORTED,
     FAMILY_STAGNATION,
     NOT_PARENT_ELIGIBLE,
-    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING,
+    PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST,
     SCORE_QUALIFIED,
     STRUCTURAL_PARENT_ELIGIBLE,
     FamilyCampaignConfig,
@@ -239,10 +239,16 @@ class TestPhase3AFamilyLocalEvolution:
 
     def test_structural_parent_does_not_imply_score_qualified(self, tmp_path: Path) -> None:
         result, _ = _run(tmp_path)
-        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING
+        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST
         assert result.post_wfo_pipeline_complete is False
         assert result.stress_pipeline_complete is True
         assert result.robustness_pipeline_complete is True
+        assert result.statistics_pipeline_complete is True
+        assert result.clustering_pipeline_complete is True
+        assert result.research_shortlist_pipeline_complete is True
+        assert result.vault_pipeline_complete is False
+        assert result.paper_pipeline_complete is False
+        assert result.live_pipeline_complete is False
         structural = 0
         score_q = 0
         for g in result.generation_records:
@@ -265,4 +271,5 @@ class TestPhase3AFamilyLocalEvolution:
             assert STRUCTURAL_PARENT_ELIGIBLE in st.parent_status_counts
         assert result.as_dict()["finalists"] == []
         assert result.as_dict()["promoted"] == []
-        assert result.as_dict()["clusters"] == []
+        assert result.as_dict()["vault_candidates"] == []
+        assert result.as_dict()["paper_candidates"] == []

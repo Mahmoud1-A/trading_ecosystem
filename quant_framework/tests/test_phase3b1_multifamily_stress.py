@@ -446,13 +446,17 @@ class TestStatusHistoryAndGates:
         )
         assert result.as_dict()["finalists"] == []
         assert result.as_dict()["promoted"] == []
-        assert result.as_dict()["clusters"] == []
         assert result.research_shortlist == []
         assert result.vault_candidates == []
         assert result.paper_candidates == []
         assert result.robustness_pipeline_complete is True
-        assert result.statistics_pipeline_complete is False
-        assert result.clustering_pipeline_complete is False
+        # Statistics/clustering may run but enter zero robustness-passed candidates.
+        assert result.statistics_pipeline_complete is True
+        assert result.clustering_pipeline_complete is True
+        assert all(
+            s.final_decision != "STATISTICALLY_PASSED"
+            for s in result.candidate_statistics_summaries
+        )
 
     def test_stress_passed_does_not_populate_downstream(self, tmp_path: Path) -> None:
         result, _ = _run(
@@ -464,20 +468,17 @@ class TestStatusHistoryAndGates:
         payload = result.as_dict()
         assert payload["finalists"] == []
         assert payload["promoted"] == []
-        assert payload["clusters"] == []
-        assert payload["research_shortlist"] == []
         assert payload["vault_candidates"] == []
         assert payload["paper_candidates"] == []
         assert result.pipeline_level == (
-            "MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING"
+            "MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST"
         )
         assert result.stress_pipeline_complete is True
         assert result.robustness_pipeline_complete is True
+        assert result.statistics_pipeline_complete is True
         assert result.post_wfo_pipeline_complete is False
-        for reason in (
-            STATISTICS_NOT_RUN,
-        ):
-            assert reason in result.post_wfo_blocked_reasons
+        assert "VAULT_NOT_RUN" in result.post_wfo_blocked_reasons
+        assert "STATISTICS_NOT_RUN" not in result.post_wfo_blocked_reasons
         assert "ROBUSTNESS_NOT_RUN" not in result.post_wfo_blocked_reasons
         for claim in (
             "finalist",
@@ -487,7 +488,7 @@ class TestStatusHistoryAndGates:
             "paper eligible",
         ):
             assert claim in payload["stress_passed_does_not_mean"]
-        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING
+        assert result.pipeline_level == "MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST"
 
 
 class TestStressBudget:

@@ -705,24 +705,36 @@ class TestStatusAndCapability:
             run_id="no_downstream",
         )
         payload = result.as_dict()
-        assert result.pipeline_level == PIPELINE_LEVEL_MULTI_FAMILY_EVOLUTIONARY_ROBUSTNESS_SCREENING
+        # Phase 3C now runs after robustness; Vault/Paper/Live stay blocked.
+        assert result.pipeline_level == (
+            "MULTI_FAMILY_EVOLUTIONARY_RESEARCH_SHORTLIST"
+        )
         assert result.stress_pipeline_complete is True
         assert result.robustness_pipeline_complete is True
+        assert result.statistics_pipeline_complete is True
+        assert result.clustering_pipeline_complete is True
+        assert result.research_shortlist_pipeline_complete is True
         assert result.post_wfo_pipeline_complete is False
-        assert result.statistics_pipeline_complete is False
-        assert result.clustering_pipeline_complete is False
-        assert result.research_shortlist_pipeline_complete is False
         assert result.vault_pipeline_complete is False
         assert result.paper_pipeline_complete is False
         assert result.live_pipeline_complete is False
         assert payload["finalists"] == []
         assert payload["promoted"] == []
-        assert payload["clusters"] == []
-        assert payload["research_shortlist"] == []
         assert payload["vault_candidates"] == []
         assert payload["paper_candidates"] == []
-        assert STATISTICS_NOT_RUN in result.post_wfo_blocked_reasons
+        assert "VAULT_NOT_RUN" in result.post_wfo_blocked_reasons
+        assert "PAPER_NOT_RUN" in result.post_wfo_blocked_reasons
+        assert "LIVE_NOT_RUN" in result.post_wfo_blocked_reasons
+        assert "STATISTICS_NOT_RUN" not in result.post_wfo_blocked_reasons
         assert "ROBUSTNESS_NOT_RUN" not in result.post_wfo_blocked_reasons
+        for claim in (
+            "finalist",
+            "promoted",
+            "vault eligible",
+            "paper eligible",
+            "live eligible",
+        ):
+            assert claim in payload["research_shortlisted_does_not_mean"]
         for claim in (
             "finalist",
             "promoted",

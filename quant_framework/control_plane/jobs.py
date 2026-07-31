@@ -581,10 +581,19 @@ def run_alpha_miner_job(
             rankings: list[dict[str, Any]] = []
             finalists: list[str] = []
             clusters: list[dict[str, Any]] = []
+            research_shortlist: list[Any] = []
             for dr in campaign_result.discovery_results:
                 rankings.extend(dr.rankings)
                 finalists.extend(dr.finalists)
                 clusters.extend(dr.clusters)
+                research_shortlist.extend(dr.research_shortlist)
+            if campaign_result.clusters and not clusters:
+                clusters = list(campaign_result.clusters)
+            if campaign_result.research_shortlist and not research_shortlist:
+                research_shortlist = [
+                    e.as_dict() if hasattr(e, "as_dict") else e
+                    for e in campaign_result.research_shortlist
+                ]
             for st in campaign_result.family_stats:
                 ctrl_counters.generated += int(st.generated)
                 ctrl_counters.unique_generated += int(st.generated)
@@ -610,6 +619,11 @@ def run_alpha_miner_job(
                 portfolio_pool={"members": [], "size": 0},
                 clusters=clusters,
                 reproducible_fingerprint=campaign_result.reproducible_fingerprint,
+                pipeline_level=campaign_result.pipeline_level,
+                post_wfo_pipeline_complete=False,
+                research_shortlist=research_shortlist,
+                vault_candidates=[],
+                paper_candidates=[],
             )
             # Reconstruct evaluation records from registry enrichment path — empty ok.
             aggregated_records = all_records
@@ -695,6 +709,57 @@ def run_alpha_miner_job(
         report["best_candidates_per_family"] = campaign_result.as_dict()[
             "best_candidates_per_family"
         ]
+        report["clusters"] = list(campaign_result.clusters)
+        report["behavioral_clusters"] = len(campaign_result.clusters)
+        report["research_shortlist"] = [
+            e.as_dict() if hasattr(e, "as_dict") else e
+            for e in campaign_result.research_shortlist
+        ]
+        report["shortlisted"] = len(campaign_result.research_shortlist)
+        report["candidate_statistics_summaries"] = [
+            s.as_dict() for s in campaign_result.candidate_statistics_summaries
+        ]
+        report["statistics_accounting"] = (
+            campaign_result.statistics_accounting.as_dict()
+            if campaign_result.statistics_accounting is not None
+            else None
+        )
+        report["clustering_accounting"] = (
+            campaign_result.clustering_accounting.as_dict()
+            if campaign_result.clustering_accounting is not None
+            else None
+        )
+        report["shortlist_rejects"] = [
+            r.as_dict() if hasattr(r, "as_dict") else r
+            for r in campaign_result.shortlist_rejects
+        ]
+        report["population_stats"] = dict(campaign_result.population_stats)
+        report["candidate_status_history"] = [
+            e.as_dict() for e in campaign_result.candidate_status_history
+        ]
+        report["pipeline_level"] = campaign_result.pipeline_level
+        report["statistics_pipeline_complete"] = (
+            campaign_result.statistics_pipeline_complete
+        )
+        report["clustering_pipeline_complete"] = (
+            campaign_result.clustering_pipeline_complete
+        )
+        report["research_shortlist_pipeline_complete"] = (
+            campaign_result.research_shortlist_pipeline_complete
+        )
+        report["vault_pipeline_complete"] = campaign_result.vault_pipeline_complete
+        report["paper_pipeline_complete"] = campaign_result.paper_pipeline_complete
+        report["live_pipeline_complete"] = campaign_result.live_pipeline_complete
+        report["post_wfo_blocked_reasons"] = list(
+            campaign_result.post_wfo_blocked_reasons
+        )
+        if campaign_result.population_stats:
+            report["statistical_result"] = (
+                "PASSED"
+                if campaign_result.statistics_accounting
+                and campaign_result.statistics_accounting.candidates_statistics_passed > 0
+                else "INSUFFICIENT_DATA"
+            )
         (art / "multi_family_campaign.json").write_text(
             json.dumps(campaign_result.as_dict(), indent=2, default=str), encoding="utf-8"
         )
