@@ -584,6 +584,7 @@ def _write_legacy_runtime_exhausted_artifacts(art: Path) -> dict[str, Any]:
     for i, cand in enumerate(cands[:2]):
         ranking = 1.25 if i == 0 else -0.4
         rejected = None if i == 0 else "NEGATIVE_EXPECTANCY"
+        payload = cand.as_dict()
         trials.append(
             {
                 "trial_id": f"trial_{i}",
@@ -593,6 +594,13 @@ def _write_legacy_runtime_exhausted_artifacts(art: Path) -> dict[str, Any]:
                 "parameters": dict(cand.parameters),
                 "config_snapshot": {
                     "expression_tree": cand.entry_tree.as_dict(),
+                    "entry_tree": cand.entry_tree.as_dict(),
+                    "exit_tree": cand.exit_tree.as_dict() if cand.exit_tree else None,
+                    "stop": cand.stop.as_dict() if cand.stop else None,
+                    "target": cand.target.as_dict() if cand.target else None,
+                    "sizing": cand.sizing.as_dict() if cand.sizing else None,
+                    "regime_gates": [g.as_dict() for g in cand.regime_gates],
+                    "candidate": payload,
                     "generation": 0,
                     "parent_ids": [],
                     "creation_method": cand.creation_method.value,
@@ -620,7 +628,11 @@ def _write_legacy_runtime_exhausted_artifacts(art: Path) -> dict[str, Any]:
                     "is_full_event_wfo": True,
                     "wfo_completed_folds": 3,
                 },
-                "net_metrics": {},
+                "net_metrics": {
+                    "median_oos_expectancy": 0.08 if i == 0 else -0.05,
+                    "fold_trade_counts": [10, 10, 10],
+                    "train_diagnostic": {"sharpe": -1.0},
+                },
                 "ranking_score": ranking,
                 "rejection_reason": rejected,
                 "trade_log_path": None,
@@ -877,3 +889,518 @@ def test_resume_without_checkpoint_or_source_raises(tmp_path: Path) -> None:
             resumed_from_run_id=None,
             artifacts_root=tmp_path / "artifacts",
         )
+
+
+def _write_legacy_list_param_ledger(
+    art: Path,
+    *,
+    n_score_qualified: int = 42,
+    include_ambiguous_pending: bool = False,
+) -> dict[str, Any]:
+    """Realistic legacy ledger: list-valued params + full candidate payloads."""
+    import json
+
+    from discovery.family_generator import StrategyFamilyGenerator
+    from discovery.generator import CandidateGenerator
+
+    art.mkdir(parents=True, exist_ok=True)
+    (art / "registry").mkdir(parents=True, exist_ok=True)
+    specs = StrategyFamilyGenerator(seed=11).generate(
+        count=1, family_ids=["mean_reversion"]
+    )
+    gen = CandidateGenerator.from_family_spec(specs[0])
+    cands = []
+    seen: set[str] = set()
+    seed_i = 0
+    need = n_score_qualified + 8
+    while len(cands) < need and seed_i < 400:
+        seed_i += 1
+        try:
+            c = gen.generate(seed=seed_i)
+        except Exception:  # noqa: BLE001
+            continue
+        if c.candidate_id in seen:
+            continue
+        seen.add(c.candidate_id)
+        cands.append(c)
+    assert len(cands) >= n_score_qualified + 2
+
+    sq_cands = cands[:n_score_qualified]
+    rejected_cands = cands[n_score_qualified : n_score_qualified + 5]
+    if include_ambiguous_pending:
+        ambiguous = cands[n_score_qualified + 5]
+    else:
+        ambiguous = None
+
+    list_param_name = next(iter(sq_cands[0].parameters))
+    list_param_scalar = float(sq_cands[0].parameters[list_param_name])
+    original_ids = [c.candidate_id for c in sq_cands]
+    original_hashes = list(original_ids)
+
+    trials: list[dict[str, Any]] = []
+    status_history: list[dict[str, Any]] = []
+    seq = 0
+
+    def _trial_for(
+        cand: Any,
+        *,
+        ranking: float | None,
+        rejected: str | None,
+        listify_param: bool = False,
+        drop_candidate_payload: bool = False,
+        corrupt_list_no_dsl: bool = False,
+    ) -> dict[str, Any]:
+        params = dict(cand.parameters)
+        if listify_param and list_param_name in params:
+            params[list_param_name] = [0.1, list_param_scalar, 9.9]
+        if corrupt_list_no_dsl:
+            params["ghost_grid_param"] = [1.0, 2.0, 3.0]
+        payload = cand.as_dict()
+        snap: dict[str, Any] = {
+            "expression_tree": cand.entry_tree.as_dict(),
+            "entry_tree": cand.entry_tree.as_dict(),
+            "generation": 0,
+            "parent_ids": list(cand.parent_ids),
+            "creation_method": cand.creation_method.value,
+            "is_full_event_wfo": True,
+            "signal_source": "candidate_dsl_trees",
+            "backend_kind": "event_driven_wfo",
+            "wfo_completed_folds": 3,
+            "family_provenance": {
+                "family_id": "mean_reversion",
+                "initial_or_descendant": "initial",
+            },
+            "grammar_version": cand.grammar_version,
+            "feature_set_version": cand.feature_set_version,
+            "complexity": cand.complexity_score,
+        }
+        if drop_candidate_payload:
+            # Entry-only legacy snapshot (malformed / history-only).
+            pass
+        else:
+            snap.update(
+                {
+                    "exit_tree": cand.exit_tree.as_dict() if cand.exit_tree else None,
+                    "stop": cand.stop.as_dict() if cand.stop else None,
+                    "target": cand.target.as_dict() if cand.target else None,
+                    "sizing": cand.sizing.as_dict() if cand.sizing else None,
+                    "regime_gates": [g.as_dict() for g in cand.regime_gates],
+                    "candidate": payload,
+                }
+            )
+        return {
+            "trial_id": f"trial_{cand.candidate_id}",
+            "candidate_id": cand.candidate_id,
+            "lineage_id": cand.lineage_id,
+            "strategy_family": cand.strategy_family,
+            "parameters": params,
+            "config_snapshot": snap,
+            "system_version": "test",
+            "git_commit_hash": "local",
+            "data_hash": "ds_test",
+            "random_seed": cand.random_seed,
+            "gross_metrics": {
+                "signal_source": "candidate_dsl_trees",
+                "is_full_event_wfo": True,
+                "wfo_completed_folds": 3,
+            },
+            "net_metrics": {
+                "median_oos_expectancy": 0.08 if rejected is None else -0.05,
+                "fold_trade_counts": [12, 11, 10],
+                "train_diagnostic": {"sharpe": -2.0},
+                "violations": ["legacy"],
+            },
+            "ranking_score": ranking,
+            "rejection_reason": rejected,
+            "cost_model_version": "cost_v1",
+            "code_hash": "code_test",
+            "trial_status": "COMPLETED",
+            "fold_records": [
+                {
+                    "fold_id": j,
+                    "expectancy": 0.08 if rejected is None else -0.05,
+                    "sharpe": 1.2,
+                    "profit_factor": 1.4 if rejected is None else 0.7,
+                    "calmar": 0.5,
+                    "max_drawdown": -0.04,
+                    "n_trades": 12,
+                }
+                for j in range(3)
+            ],
+            "ranking_source": "validation_oos",
+        }
+
+    for i, cand in enumerate(sq_cands):
+        trials.append(
+            _trial_for(
+                cand,
+                ranking=1.0 + i * 0.01,
+                rejected=None,
+                listify_param=(i == 0),
+            )
+        )
+        seq += 1
+        status_history.append(
+            {
+                "sequence": seq,
+                "candidate_id": cand.candidate_id,
+                "family_id": "mean_reversion",
+                "generation": 0,
+                "prior_status": "FULL_WFO_COMPLETED",
+                "new_status": "SCORE_QUALIFIED",
+                "reason": "SCORE_QUALIFIED",
+                "artifact_refs": {},
+            }
+        )
+
+    for cand in rejected_cands:
+        # Malformed rejected history: list param + entry-only snapshot.
+        trials.append(
+            _trial_for(
+                cand,
+                ranking=-0.5,
+                rejected="NEGATIVE_EXPECTANCY",
+                listify_param=True,
+                drop_candidate_payload=True,
+            )
+        )
+
+    if ambiguous is not None:
+        trials.append(
+            _trial_for(
+                ambiguous,
+                ranking=2.5,
+                rejected=None,
+                corrupt_list_no_dsl=True,
+            )
+        )
+        seq += 1
+        status_history.append(
+            {
+                "sequence": seq,
+                "candidate_id": ambiguous.candidate_id,
+                "family_id": "mean_reversion",
+                "generation": 0,
+                "prior_status": "FULL_WFO_COMPLETED",
+                "new_status": "SCORE_QUALIFIED",
+                "reason": "SCORE_QUALIFIED",
+                "artifact_refs": {},
+            }
+        )
+
+    (art / "registry" / "trial_ledger.jsonl").write_text(
+        "\n".join(json.dumps(t) for t in trials) + "\n", encoding="utf-8"
+    )
+    n_eval = len(trials)
+    campaign = {
+        "campaign_id": "run_legacy_list_params",
+        "families": [s.as_dict() for s in specs],
+        "family_stats": [
+            {
+                "family_id": "mean_reversion",
+                "hypothesis": specs[0].hypothesis,
+                "canonical_hash": specs[0].canonical_hash(),
+                "grammar_fingerprint": specs[0].effective_grammar_fingerprint(),
+                "allocation_generated": n_eval + 10,
+                "allocation_wfo": n_eval + 10,
+                "generated": n_eval + 10,
+                "evaluated": n_eval,
+                "full_wfo": n_eval,
+                "score_qualified": n_score_qualified + (1 if ambiguous else 0),
+                "generation_0_generated": n_eval + 10,
+                "descendants_generated": 0,
+                "highest_generation_reached": 0,
+                "structural_parents_found": n_score_qualified,
+                "family_stop_reason": "max_runtime_seconds",
+            }
+        ],
+        "budget_allocation": {
+            "campaign_generated": n_eval + 10,
+            "campaign_evaluated": n_eval,
+            "campaign_full_wfo": n_eval,
+            "total_candidate_budget": n_eval + 20,
+            "max_full_wfo": n_eval + 20,
+            "family_local_evolution": True,
+        },
+        "aggregated_stop_reason": "max_runtime_seconds",
+        "candidate_status_history": status_history,
+        "generation_records": [
+            {
+                "family_id": "mean_reversion",
+                "generation": 0,
+                "evaluated_candidate_ids": [t["candidate_id"] for t in trials],
+                "score_qualified_candidate_ids": [
+                    c.candidate_id for c in sq_cands
+                ]
+                + ([ambiguous.candidate_id] if ambiguous else []),
+                "completed_full_wfo_candidate_ids": [t["candidate_id"] for t in trials],
+                "generated_count": n_eval + 10,
+                "evaluated_count": n_eval,
+                "completed_full_wfo_count": n_eval,
+                "stop_reason": "max_runtime_seconds",
+            }
+        ],
+        "candidate_stress_summaries": [],
+        "candidate_robustness_summaries": [],
+        "candidate_statistics_summaries": [],
+        "clusters": [],
+        "research_shortlist": [],
+        "population_stats": {"n_trials": n_eval},
+    }
+    (art / "multi_family_campaign.json").write_text(
+        json.dumps(campaign, indent=2), encoding="utf-8"
+    )
+    return {
+        "score_qualified_ids": original_ids,
+        "canonical_hashes": original_hashes,
+        "list_param_name": list_param_name,
+        "list_param_scalar": list_param_scalar,
+        "rejected_ids": [c.candidate_id for c in rejected_cands],
+        "ambiguous_id": ambiguous.candidate_id if ambiguous else None,
+        "n_evaluated": n_eval,
+        "generated": n_eval + 10,
+        "full_wfo": n_eval,
+        "family_specs": [s.as_dict() for s in specs],
+    }
+
+
+def test_normalize_legacy_candidate_parameters_recovers_list_from_dsl() -> None:
+    from control_plane.search_bootstrap import (
+        LEGACY_PARAMETER_VALUE_AMBIGUOUS,
+        LegacyBootstrapError,
+        normalize_legacy_candidate_parameters,
+    )
+    from discovery.expression_tree import parameter_node
+    from discovery.legacy_parameters import LegacyParameterError
+    from discovery.types import ValueType
+
+    tree = parameter_node("lookback", 17.5, ValueType.SCALAR)
+    params, recovered = normalize_legacy_candidate_parameters(
+        tree,
+        {"lookback": [10.0, 17.5, 20.0], "z_entry": "-1.5"},
+        candidate_id="cand_x",
+    )
+    assert params["lookback"] == 17.5
+    assert params["z_entry"] == -1.5
+    assert recovered and recovered[0]["recovered_from_dsl"] == 17.5
+
+    with pytest.raises(LegacyParameterError, match=LEGACY_PARAMETER_VALUE_AMBIGUOUS):
+        normalize_legacy_candidate_parameters(
+            tree,
+            {"ghost": [1.0, 2.0]},
+            candidate_id="cand_x",
+        )
+
+
+def test_legacy_list_param_bootstrap_recovers_and_enters_stress(tmp_path: Path) -> None:
+    from control_plane.search_bootstrap import prepare_search_program_session
+    from discovery.evaluation_cache import EvaluationCacheEntry
+    from discovery.search_program import PipelinePhase, SearchMode, SearchProgramStore, now_iso
+    from discovery.search_resume import choose_resume_phase, rebuild_candidates
+
+    artifacts_root = tmp_path / "artifacts"
+    legacy_id = "run_legacy_list_params"
+    meta = _write_legacy_list_param_ledger(
+        artifacts_root / legacy_id, n_score_qualified=42
+    )
+    store = SearchProgramStore(tmp_path / "search_programs")
+    fp = "fp_list_param"
+    prepared = prepare_search_program_session(
+        search_mode=SearchMode.EXTEND_BUDGET.value,
+        program_id=None,
+        program_store=store,
+        compatibility_fingerprint=fp,
+        seed=11,
+        family_ids=["mean_reversion"],
+        run_id="run_continue_list",
+        source_run_id=legacy_id,
+        resumed_from_run_id=legacy_id,
+        artifacts_root=artifacts_root,
+        fingerprint_components=_fp_components(),
+    )
+    assert prepared.bootstrapped_from_source is True
+    ckpt = prepared.resume_checkpoint
+    assert ckpt is not None
+    assert len(ckpt.pending_stress_ids) == 42
+    assert set(meta["score_qualified_ids"]) == set(ckpt.pending_stress_ids)
+    assert choose_resume_phase(ckpt) is PipelinePhase.STRESS
+    assert ckpt.campaign_full_wfo == meta["full_wfo"]
+    assert ckpt.campaign_evaluated == meta["n_evaluated"]
+    assert ckpt.campaign_generated == meta["generated"]
+
+    restored = rebuild_candidates(ckpt)
+    assert set(meta["score_qualified_ids"]).issubset(set(restored))
+    for cid in meta["score_qualified_ids"]:
+        assert restored[cid].candidate_id == cid
+        assert restored[cid].exit_tree is not None
+        assert restored[cid].stop is not None
+        assert restored[cid].target is not None
+
+    list_cid = meta["score_qualified_ids"][0]
+    assert restored[list_cid].parameters[meta["list_param_name"]] == pytest.approx(
+        meta["list_param_scalar"]
+    )
+    # Rejected malformed history remains in the multiple-testing population.
+    for rid in meta["rejected_ids"]:
+        assert rid in ckpt.trial_population_candidate_ids
+        assert rid in ckpt.evaluation_records
+        assert rid not in ckpt.candidates
+
+    report = prepared.bootstrap_report
+    assert report is not None
+    assert report.trials_scanned == meta["n_evaluated"]
+    assert report.values_recovered_from_dsl
+    report_path = prepared.checkpoint_path.parent / "legacy_bootstrap_report.json"
+    assert report_path.is_file()
+
+    # Resume campaign: Stress first, no Generation 0 regeneration, no WFO replay.
+    events: list[str] = []
+
+    def _hook(name: str, payload: dict) -> None:
+        events.append(name)
+
+    CountingBackend.evaluate_calls = 0
+    fp_comp = _fp_components()
+    for cid, raw in ckpt.evaluation_records.items():
+        key = build_evaluation_cache_key(
+            candidate_canonical_hash=cid,
+            dataset_hash=fp_comp["dataset_hash"],
+            timeframe=fp_comp["timeframe"],
+            wfo_config_hash=fp_comp["wfo_config_hash"],
+            cost_model_version=fp_comp["cost_model_version"],
+            risk_model_version=fp_comp["risk_model_version"],
+            execution_engine_code_hash=fp_comp["execution_engine_code_hash"],
+        )
+        prepared.evaluation_cache.put(
+            EvaluationCacheEntry(
+                cache_key=key,
+                candidate_id=cid,
+                candidate_canonical_hash=cid,
+                evaluation_record=raw,
+                created_at=now_iso(),
+                fingerprint_components=fp_comp,
+            )
+        )
+
+    cfg = _tiny_cfg(
+        total_candidate_budget=meta["generated"] + 4,
+        max_full_wfo=meta["full_wfo"] + 4,
+        max_evaluated_candidates=meta["n_evaluated"] + 4,
+        max_runtime_seconds=45.0,
+        evolution_generations=1,
+        max_stress_evaluations=50,
+    )
+    campaign = MultiFamilyCampaign(
+        config=cfg,
+        registry=ExperimentRegistry(tmp_path / "reg_list"),
+        backend=CountingBackend(),
+        discovery_run_id="run_continue_list",
+        research_eligible=False,
+        synthetic_stress_forbidden=False,
+        progress_hook=_hook,
+        search_program_id=prepared.search_program_id,
+        search_mode=SearchMode.EXTEND_BUDGET.value,
+        compatibility_fingerprint=fp,
+        fingerprint_components=fp_comp,
+        checkpoint_path=prepared.checkpoint_path,
+        evaluation_cache=prepared.evaluation_cache,
+        resume_checkpoint=ckpt,
+        source_run_id=legacy_id,
+        resumed_from_run_id=legacy_id,
+    )
+    result = campaign.run()
+    assert "SEARCH_RESUME_STARTED" in events
+    stress_idxs = [i for i, e in enumerate(events) if e == "MULTI_FAMILY_STRESS_STARTED"]
+    evo_idxs = [i for i, e in enumerate(events) if e == "MULTI_FAMILY_EVOLUTION_STARTED"]
+    assert stress_idxs, "42 SCORE_QUALIFIED must enter Stress first"
+    if evo_idxs:
+        assert stress_idxs[0] < evo_idxs[0]
+    # Completed WFO must not be repeated for the restored population.
+    assert CountingBackend.evaluate_calls < 8
+    assert result.budget_allocation["cumulative_totals"]["full_wfo"] >= meta["full_wfo"]
+    assert result.budget_allocation["cumulative_totals"]["evaluated"] >= meta["n_evaluated"]
+
+
+def test_legacy_ambiguous_pending_fails_closed_atomically(tmp_path: Path) -> None:
+    from control_plane.search_bootstrap import (
+        LEGACY_PARAMETER_VALUE_AMBIGUOUS,
+        LegacyBootstrapError,
+        prepare_search_program_session,
+    )
+    from discovery.search_program import SearchMode, SearchProgramStore
+
+    artifacts_root = tmp_path / "artifacts"
+    legacy_id = "run_legacy_ambiguous"
+    meta = _write_legacy_list_param_ledger(
+        artifacts_root / legacy_id,
+        n_score_qualified=3,
+        include_ambiguous_pending=True,
+    )
+    store = SearchProgramStore(tmp_path / "search_programs")
+    with pytest.raises(LegacyBootstrapError, match=LEGACY_PARAMETER_VALUE_AMBIGUOUS) as excinfo:
+        prepare_search_program_session(
+            search_mode=SearchMode.EXTEND_BUDGET.value,
+            program_id="sp_should_not_publish",
+            program_store=store,
+            compatibility_fingerprint="fp_amb",
+            seed=11,
+            family_ids=["mean_reversion"],
+            run_id="run_amb",
+            source_run_id=legacy_id,
+            resumed_from_run_id=legacy_id,
+            artifacts_root=artifacts_root,
+            fingerprint_components=_fp_components(),
+        )
+    assert excinfo.value.candidate_id == meta["ambiguous_id"]
+    assert store.get("sp_should_not_publish") is None
+    assert not (tmp_path / "search_programs" / "sp_should_not_publish").exists()
+
+
+def test_legacy_incomplete_score_qualified_fails_closed(tmp_path: Path) -> None:
+    import json
+
+    from control_plane.search_bootstrap import (
+        LEGACY_CANDIDATE_SPEC_INCOMPLETE,
+        LegacyBootstrapError,
+        prepare_search_program_session,
+    )
+    from discovery.search_program import SearchMode, SearchProgramStore
+
+    artifacts_root = tmp_path / "artifacts"
+    legacy_id = "run_legacy_incomplete"
+    art = artifacts_root / legacy_id
+    meta = _write_legacy_runtime_exhausted_artifacts(art)
+    # Strip authoritative trees so SCORE_QUALIFIED cannot be reconstructed.
+    ledger = art / "registry" / "trial_ledger.jsonl"
+    rows = []
+    for line in ledger.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        trial = json.loads(line)
+        snap = trial["config_snapshot"]
+        snap.pop("candidate", None)
+        snap.pop("exit_tree", None)
+        snap.pop("stop", None)
+        snap.pop("target", None)
+        snap.pop("sizing", None)
+        snap.pop("regime_gates", None)
+        rows.append(trial)
+    ledger.write_text("\n".join(json.dumps(t) for t in rows) + "\n", encoding="utf-8")
+
+    store = SearchProgramStore(tmp_path / "search_programs")
+    with pytest.raises(LegacyBootstrapError, match=LEGACY_CANDIDATE_SPEC_INCOMPLETE):
+        prepare_search_program_session(
+            search_mode=SearchMode.EXTEND_BUDGET.value,
+            program_id=None,
+            program_store=store,
+            compatibility_fingerprint="fp_incomplete",
+            seed=7,
+            family_ids=["mean_reversion"],
+            run_id="run_incomplete",
+            source_run_id=legacy_id,
+            resumed_from_run_id=legacy_id,
+            artifacts_root=artifacts_root,
+            fingerprint_components=_fp_components(),
+        )
+    assert list(store.root.glob("sp_*")) == []
+    assert meta["score_qualified_id"]

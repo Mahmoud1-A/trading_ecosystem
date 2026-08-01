@@ -280,6 +280,14 @@ class SearchProgramStore:
         self.save(rec)
         return rec
 
+    def delete(self, search_program_id: str) -> None:
+        """Remove a program directory (used to roll back failed atomic bootstrap)."""
+        import shutil
+
+        d = self.program_dir(search_program_id)
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
 
 def assert_fingerprint_compatible(
     stored: str,

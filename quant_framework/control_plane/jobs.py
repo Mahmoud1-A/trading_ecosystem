@@ -666,6 +666,11 @@ def run_alpha_miner_job(
                 artifacts_root=Path(run.artifact_dir).resolve().parent,
                 fingerprint_components=fp_components,
             )
+            if prepared.bootstrap_report is not None:
+                (art / "legacy_bootstrap_report.json").write_text(
+                    json.dumps(prepared.bootstrap_report.as_dict(), indent=2, default=str),
+                    encoding="utf-8",
+                )
             program_id = prepared.search_program_id
             resume_ckpt = prepared.resume_checkpoint
             ckpt_path = prepared.checkpoint_path
@@ -1484,16 +1489,29 @@ def execute_run(
         }
         art = Path(run.artifact_dir)
         art.mkdir(parents=True, exist_ok=True)
+        tb_text = traceback.format_exc()
+        (art / "failure_traceback.txt").write_text(tb_text, encoding="utf-8")
         (art / "run_summary.json").write_text(
             json.dumps(summary, indent=2, default=str), encoding="utf-8"
         )
         run.summary = summary
+        fail_payload: dict[str, Any] = {"traceback": tb_text, **summary}
+        try:
+            from control_plane.search_bootstrap import LegacyBootstrapError
+
+            if isinstance(exc, LegacyBootstrapError):
+                fail_payload["bootstrap_phase"] = exc.phase
+                fail_payload["candidate_id"] = exc.candidate_id
+                fail_payload["legacy_error_code"] = exc.code
+                fail_payload["legacy_error_details"] = exc.details
+        except Exception:  # noqa: BLE001
+            pass
         _emit(
             sink,
             run,
             EventType.RUN_FAILED,
             msg,
             severity=EventSeverity.ERROR,
-            payload={"traceback": traceback.format_exc(), **summary},
+            payload=fail_payload,
         )
         return run

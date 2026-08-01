@@ -69,6 +69,27 @@ class StrategyCandidate:
         }
 
     @staticmethod
+    def _normalize_parameters(
+        raw_parameters: dict[str, Any] | None,
+        *,
+        entry: ExprNode,
+        exit_tree: ExprNode | None,
+        stop: ExprNode | None,
+        target: ExprNode | None,
+        sizing: ExprNode | None,
+        regime_gates: tuple[ExprNode, ...],
+        candidate_id: str = "",
+    ) -> dict[str, float]:
+        from discovery.legacy_parameters import normalize_legacy_candidate_parameters
+
+        params, _recovered = normalize_legacy_candidate_parameters(
+            (entry, exit_tree, stop, target, sizing, *regime_gates),
+            raw_parameters,
+            candidate_id=candidate_id,
+        )
+        return params
+
+    @staticmethod
     def from_dict(payload: dict[str, Any]) -> StrategyCandidate:
         """Rehydrate a candidate from :meth:`as_dict` (checkpoint / registry)."""
         from discovery.expression_tree import ExprNode
@@ -80,6 +101,13 @@ class StrategyCandidate:
 
         entry = _tree(payload["entry_tree"])
         assert entry is not None
+        exit_tree = _tree(payload.get("exit_tree"))
+        stop = _tree(payload.get("stop"))
+        target = _tree(payload.get("target"))
+        sizing = _tree(payload.get("sizing"))
+        regime_gates = tuple(
+            ExprNode.from_dict(g) for g in (payload.get("regime_gates") or [])
+        )
         creation = payload.get("creation_method", CreationMethod.RANDOM.value)
         if isinstance(creation, CreationMethod):
             method = creation
@@ -94,15 +122,22 @@ class StrategyCandidate:
             strategy_family=str(payload.get("strategy_family") or "dsl_generated"),
             expression_tree=_tree(payload.get("expression_tree")) or entry,
             entry_tree=entry,
-            exit_tree=_tree(payload.get("exit_tree")),
-            stop=_tree(payload.get("stop")),
-            target=_tree(payload.get("target")),
-            sizing=_tree(payload.get("sizing")),
-            regime_gates=tuple(
-                ExprNode.from_dict(g) for g in (payload.get("regime_gates") or [])
-            ),
+            exit_tree=exit_tree,
+            stop=stop,
+            target=target,
+            sizing=sizing,
+            regime_gates=regime_gates,
             feature_ids=tuple(str(f) for f in (payload.get("feature_ids") or ())),
-            parameters={str(k): float(v) for k, v in (payload.get("parameters") or {}).items()},
+            parameters=StrategyCandidate._normalize_parameters(
+                payload.get("parameters"),
+                entry=entry,
+                exit_tree=exit_tree,
+                stop=stop,
+                target=target,
+                sizing=sizing,
+                regime_gates=regime_gates,
+                candidate_id=str(payload.get("candidate_id") or ""),
+            ),
             complexity_score=float(payload.get("complexity_score") or 0.0),
             grammar_version=str(payload.get("grammar_version") or ""),
             feature_set_version=str(payload.get("feature_set_version") or ""),

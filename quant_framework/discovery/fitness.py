@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -83,11 +84,44 @@ class FitnessResult:
         }
 
     @staticmethod
+    def _coerce_components(raw: Mapping[str, Any] | None) -> dict[str, float]:
+        """Accept finite scalars only; expand fold_trade_counts lists; never float(list)."""
+        components: dict[str, float] = {}
+        for key, value in dict(raw or {}).items():
+            name = str(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                out = float(value)
+                if math.isfinite(out):
+                    components[name] = out
+                continue
+            if isinstance(value, str):
+                try:
+                    out = float(value.strip())
+                except ValueError:
+                    continue
+                if math.isfinite(out):
+                    components[name] = out
+                continue
+            if name == "fold_trade_counts" and isinstance(value, (list, tuple)):
+                for i, item in enumerate(value):
+                    if isinstance(item, bool):
+                        continue
+                    try:
+                        components[f"fold_{i}_oos_trades"] = float(int(item))
+                    except (TypeError, ValueError):
+                        continue
+                continue
+            # list / tuple / dict metadata — skip; never call float() directly.
+        return components
+
+    @staticmethod
     def from_dict(raw: dict[str, Any]) -> FitnessResult:
         return FitnessResult(
             fitness=float(raw.get("fitness", 0.0)),
             ranking_source=str(raw.get("ranking_source") or "validation_oos"),
-            components={str(k): float(v) for k, v in (raw.get("components") or {}).items()},
+            components=FitnessResult._coerce_components(raw.get("components")),
             fold_scores=tuple(float(x) for x in (raw.get("fold_scores") or ())),
             rejected=bool(raw.get("rejected", False)),
             rejection_reason=raw.get("rejection_reason"),

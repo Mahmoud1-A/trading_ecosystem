@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import shutil
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from discovery.candidate import StrategyCandidate
+from discovery.candidate import StrategyCandidate, collect_parameters
 from discovery.evaluation_cache import EvaluationCache
 from discovery.expression_tree import ExprNode
+from discovery.legacy_parameters import (
+    LEGACY_PARAMETER_VALUE_AMBIGUOUS,
+    LegacyParameterError,
+    finite_float,
+    normalize_legacy_candidate_parameters,
+    sanitize_fitness_components,
+    value_shape,
+)
 from discovery.search_checkpoint import (
     CHECKPOINT_VERSION,
     FamilyCheckpointState,
@@ -26,8 +36,67 @@ from discovery.search_program import (
     new_search_program_id,
     now_iso,
 )
-from discovery.search_resume import mark_score_qualified_pending
+from discovery.search_resume import (
+    mark_score_qualified_pending,
+    rebuild_candidates,
+    rebuild_evaluation_records,
+)
 from discovery.types import CreationMethod
+
+LEGACY_CANDIDATE_SPEC_INCOMPLETE = "LEGACY_CANDIDATE_SPEC_INCOMPLETE"
+
+
+class LegacyBootstrapError(RuntimeError):
+    """Fail-closed migration error during legacy search bootstrap."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        candidate_id: str | None = None,
+        parameter: str | None = None,
+        phase: str = "legacy_bootstrap",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.candidate_id = candidate_id
+        self.parameter = parameter
+        self.phase = phase
+        self.details = dict(details or {})
+
+
+@dataclass
+class LegacyBootstrapReport:
+    source_run_id: str | None = None
+    search_program_id: str | None = None
+    trials_scanned: int = 0
+    candidates_reconstructed: int = 0
+    rejected_history_only_preserved: int = 0
+    list_valued_parameter_fields: list[dict[str, Any]] = field(default_factory=list)
+    values_recovered_from_dsl: list[dict[str, Any]] = field(default_factory=list)
+    ambiguous_candidate_ids: list[str] = field(default_factory=list)
+    incomplete_candidate_ids: list[str] = field(default_factory=list)
+    migration_records: list[dict[str, Any]] = field(default_factory=list)
+    pending_score_qualified_restored: list[str] = field(default_factory=list)
+    reconstruction_unavailable_ids: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source_run_id": self.source_run_id,
+            "search_program_id": self.search_program_id,
+            "trials_scanned": self.trials_scanned,
+            "candidates_reconstructed": self.candidates_reconstructed,
+            "rejected_history_only_preserved": self.rejected_history_only_preserved,
+            "list_valued_parameter_fields": list(self.list_valued_parameter_fields),
+            "values_recovered_from_dsl": list(self.values_recovered_from_dsl),
+            "ambiguous_candidate_ids": list(self.ambiguous_candidate_ids),
+            "incomplete_candidate_ids": list(self.incomplete_candidate_ids),
+            "migration_records": list(self.migration_records),
+            "pending_score_qualified_restored": list(self.pending_score_qualified_restored),
+            "reconstruction_unavailable_ids": list(self.reconstruction_unavailable_ids),
+        }
 
 
 @dataclass
@@ -38,177 +107,327 @@ class PreparedSearchSession:
     evaluation_cache: EvaluationCache
     created_new_program: bool
     bootstrapped_from_source: bool
+    bootstrap_report: LegacyBootstrapReport | None = None
 
 
-def prepare_search_program_session(
-    *,
-    search_mode: str,
-    program_id: str | None,
-    program_store: SearchProgramStore,
-    compatibility_fingerprint: str,
-    seed: int,
-    family_ids: list[str] | None,
-    run_id: str,
-    source_run_id: str | None,
-    resumed_from_run_id: str | None,
-    artifacts_root: Path,
-    fingerprint_components: dict[str, str] | None = None,
-) -> PreparedSearchSession:
-    """Create or resume a search program, bootstrapping legacy runs when needed.
-
-    NEW_SEARCH always creates a fresh program with no checkpoint.
-    RESUME / EXTEND / REEVALUATE never proceed with a null checkpoint: when the
-    program has no checkpoint yet and ``source_run_id`` points at prior artifacts,
-    ``bootstrap_checkpoint_from_run`` is used and the result is persisted.
-    """
-    mode = SearchMode(str(search_mode or SearchMode.NEW_SEARCH.value).upper())
-    created_new = False
-    bootstrapped = False
-    resume_ckpt: SearchCheckpoint | None = None
-
-    if mode is SearchMode.NEW_SEARCH:
-        pid = program_id or new_search_program_id()
-        if program_store.get(pid) is None:
-            program_store.create(
-                compatibility_fingerprint=compatibility_fingerprint,
-                seed=int(seed),
-                family_ids=list(family_ids) if family_ids else None,
-                search_program_id=pid,
-                metadata={"created_by_run_id": run_id},
-            )
-            created_new = True
-        ckpt_path = program_store.checkpoint_path(pid)
-        cache = EvaluationCache(program_store.evaluation_cache_dir(pid))
-        return PreparedSearchSession(
-            search_program_id=pid,
-            resume_checkpoint=None,
-            checkpoint_path=ckpt_path,
-            evaluation_cache=cache,
-            created_new_program=created_new,
-            bootstrapped_from_source=False,
-        )
-
-    # RESUME_SEARCH / EXTEND_BUDGET / REEVALUATE_FROZEN_CANDIDATES
-    if not program_id:
-        # Legacy RUNTIME_EXHAUSTED run: assign a program id and create the record.
-        pid = new_search_program_id()
-        program_store.create(
-            compatibility_fingerprint=compatibility_fingerprint,
-            seed=int(seed),
-            family_ids=list(family_ids) if family_ids else None,
-            search_program_id=pid,
-            metadata={
-                "created_by_run_id": run_id,
-                "legacy_bootstrap": True,
-                "source_run_id": source_run_id,
-            },
-        )
-        created_new = True
-    else:
-        pid = str(program_id)
-        existing = program_store.get(pid)
-        if existing is None:
-            # Program id was assigned by Continue Search but record not written yet.
-            program_store.create(
-                compatibility_fingerprint=compatibility_fingerprint,
-                seed=int(seed),
-                family_ids=list(family_ids) if family_ids else None,
-                search_program_id=pid,
-                metadata={
-                    "created_by_run_id": run_id,
-                    "legacy_bootstrap": True,
-                    "source_run_id": source_run_id,
-                },
-            )
-            created_new = True
-        else:
-            assert_fingerprint_compatible(
-                existing.compatibility_fingerprint,
-                compatibility_fingerprint,
-                mode=mode,
-            )
-
-    ckpt_path = program_store.checkpoint_path(pid)
-    cache = EvaluationCache(program_store.evaluation_cache_dir(pid))
-    resume_ckpt = load_checkpoint(ckpt_path)
-
-    if resume_ckpt is None and source_run_id:
-        src = Path(artifacts_root) / str(source_run_id)
-        resume_ckpt = bootstrap_checkpoint_from_run(
-            src,
-            search_program_id=pid,
-            compatibility_fingerprint=compatibility_fingerprint,
-            session_run_id=run_id,
-            search_mode=mode.value,
-            fingerprint_components=fingerprint_components,
-            source_run_id=str(source_run_id),
-            resumed_from_run_id=str(resumed_from_run_id or source_run_id),
-        )
-        if resume_ckpt is not None:
-            save_checkpoint(ckpt_path, resume_ckpt)
-            bootstrapped = True
-            program_store.update_cumulative(
-                pid,
-                generated=resume_ckpt.campaign_generated,
-                evaluated=resume_ckpt.campaign_evaluated,
-                full_wfo=resume_ckpt.campaign_full_wfo,
-                checkpoint_path=str(ckpt_path),
-            )
-
-    if resume_ckpt is None:
-        raise RuntimeError(
-            f"{MISSING_CHECKPOINT}: program={pid!r} mode={mode.value} "
-            f"source_run_id={source_run_id!r}"
-        )
-
-    return PreparedSearchSession(
-        search_program_id=pid,
-        resume_checkpoint=resume_ckpt,
-        checkpoint_path=ckpt_path,
-        evaluation_cache=cache,
-        created_new_program=created_new,
-        bootstrapped_from_source=bootstrapped,
-    )
+def _tree_from_raw(raw: Any) -> ExprNode | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"tree payload must be dict, got {type(raw).__name__}")
+    return ExprNode.from_dict(raw)
 
 
-def _candidate_from_trial(trial: dict[str, Any]) -> StrategyCandidate | None:
+def _authoritative_candidate_payload(trial: dict[str, Any]) -> dict[str, Any] | None:
+    """Prefer a full persisted candidate payload over entry-only legacy snapshots."""
     snap = dict(trial.get("config_snapshot") or {})
-    entry_raw = snap.get("expression_tree") or snap.get("entry_tree")
+    for key in ("candidate", "strategy_candidate", "candidate_payload"):
+        raw = snap.get(key)
+        if isinstance(raw, dict) and (raw.get("entry_tree") or raw.get("expression_tree")):
+            payload = dict(raw)
+            payload.setdefault("candidate_id", trial.get("candidate_id"))
+            payload.setdefault("lineage_id", trial.get("lineage_id") or trial.get("candidate_id"))
+            if "parameters" not in payload and trial.get("parameters") is not None:
+                payload["parameters"] = dict(trial.get("parameters") or {})
+            return payload
+
+    entry_raw = snap.get("entry_tree") or snap.get("expression_tree")
     if not isinstance(entry_raw, dict):
         return None
-    try:
-        entry = ExprNode.from_dict(entry_raw)
-    except Exception:  # noqa: BLE001
-        return None
-    creation = snap.get("creation_method") or CreationMethod.RANDOM.value
-    try:
-        method = CreationMethod(str(creation))
-    except ValueError:
-        method = CreationMethod.RANDOM
-    return StrategyCandidate(
-        candidate_id=str(trial["candidate_id"]),
-        lineage_id=str(trial.get("lineage_id") or trial["candidate_id"]),
-        generation=int(snap.get("generation") or 0),
-        parent_ids=tuple(str(p) for p in (snap.get("parent_ids") or ())),
-        creation_method=method,
-        strategy_family=str(trial.get("strategy_family") or "dsl_generated"),
-        expression_tree=entry,
-        entry_tree=entry,
-        exit_tree=None,
-        stop=None,
-        target=None,
-        sizing=None,
-        regime_gates=(),
-        feature_ids=tuple(str(f) for f in (snap.get("feature_ids") or ())),
-        parameters={str(k): float(v) for k, v in (trial.get("parameters") or {}).items()},
-        complexity_score=float(snap.get("complexity") or 0.0),
-        grammar_version=str(snap.get("grammar_version") or ""),
-        feature_set_version=str(snap.get("feature_set_version") or ""),
-        cost_model_version=str(trial.get("cost_model_version") or "cost_v1"),
-        asset_universe=("ES",),
-        random_seed=int(trial.get("random_seed") or 0),
-        family_provenance=dict(snap.get("family_provenance") or {}),
+
+    explicit_trees = any(
+        k in snap for k in ("exit_tree", "stop", "target", "sizing", "regime_gates")
     )
+    if not explicit_trees:
+        return None
+
+    creation = snap.get("creation_method") or CreationMethod.RANDOM.value
+    return {
+        "candidate_id": str(trial["candidate_id"]),
+        "lineage_id": str(trial.get("lineage_id") or trial["candidate_id"]),
+        "generation": int(snap.get("generation") or 0),
+        "parent_ids": list(snap.get("parent_ids") or ()),
+        "creation_method": creation,
+        "strategy_family": str(trial.get("strategy_family") or "dsl_generated"),
+        "expression_tree": snap.get("expression_tree") or entry_raw,
+        "entry_tree": entry_raw,
+        "exit_tree": snap.get("exit_tree"),
+        "stop": snap.get("stop"),
+        "target": snap.get("target"),
+        "sizing": snap.get("sizing"),
+        "regime_gates": list(snap.get("regime_gates") or []),
+        "feature_ids": list(snap.get("feature_ids") or []),
+        "parameters": dict(trial.get("parameters") or {}),
+        "complexity_score": float(snap.get("complexity") or snap.get("complexity_score") or 0.0),
+        "grammar_version": str(snap.get("grammar_version") or ""),
+        "feature_set_version": str(snap.get("feature_set_version") or ""),
+        "cost_model_version": str(trial.get("cost_model_version") or "cost_v1"),
+        "asset_universe": list(snap.get("asset_universe") or ("ES",)),
+        "random_seed": int(trial.get("random_seed") or snap.get("random_seed") or 0),
+        "creation_timestamp": str(snap.get("creation_timestamp") or ""),
+        "family_provenance": dict(snap.get("family_provenance") or {}),
+    }
+
+
+def _candidate_complete_for_stress(cand: StrategyCandidate) -> bool:
+    """Executable Stress requires the same tree set that produced ``parameters``."""
+    tree_params = collect_parameters(
+        cand.entry_tree,
+        cand.exit_tree,
+        cand.stop,
+        cand.target,
+        cand.sizing,
+        *cand.regime_gates,
+    )
+    orphan = sorted(set(cand.parameters) - set(tree_params))
+    return not orphan
+
+
+def _candidate_from_trial(
+    trial: dict[str, Any],
+    *,
+    report: LegacyBootstrapReport,
+    require_complete: bool,
+) -> StrategyCandidate | None:
+    """Rebuild a candidate from a legacy trial.
+
+    Returns ``None`` when reconstruction is unavailable (caller may preserve the
+    trial in the multiple-testing population without an executable spec).
+    """
+    cid = str(trial.get("candidate_id") or "")
+    snap = dict(trial.get("config_snapshot") or {})
+    payload = _authoritative_candidate_payload(trial)
+
+    try:
+        if payload is not None:
+            entry = _tree_from_raw(payload.get("entry_tree") or payload.get("expression_tree"))
+            if entry is None:
+                raise ValueError("missing entry_tree")
+            exit_tree = _tree_from_raw(payload.get("exit_tree"))
+            stop = _tree_from_raw(payload.get("stop"))
+            target = _tree_from_raw(payload.get("target"))
+            sizing = _tree_from_raw(payload.get("sizing"))
+            regime_gates = tuple(
+                ExprNode.from_dict(g) for g in (payload.get("regime_gates") or [])
+            )
+            creation = payload.get("creation_method") or CreationMethod.RANDOM.value
+            try:
+                method = (
+                    creation
+                    if isinstance(creation, CreationMethod)
+                    else CreationMethod(str(creation))
+                )
+            except ValueError:
+                method = CreationMethod.RANDOM
+            params, recovered = normalize_legacy_candidate_parameters(
+                (entry, exit_tree, stop, target, sizing, *regime_gates),
+                dict(trial.get("parameters") or payload.get("parameters") or {}),
+                candidate_id=cid,
+            )
+            for item in recovered:
+                report.list_valued_parameter_fields.append(item)
+                if item.get("recovered_from_dsl") is not None:
+                    report.values_recovered_from_dsl.append(item)
+            feature_ids = tuple(str(f) for f in (payload.get("feature_ids") or ()))
+            if not feature_ids:
+                from discovery.candidate import collect_features
+
+                feature_ids = collect_features(
+                    entry, exit_tree, stop, target, sizing, *regime_gates
+                )
+            cand = StrategyCandidate(
+                candidate_id=str(payload.get("candidate_id") or cid),
+                lineage_id=str(payload.get("lineage_id") or cid),
+                generation=int(payload.get("generation") or 0),
+                parent_ids=tuple(str(p) for p in (payload.get("parent_ids") or ())),
+                creation_method=method,
+                strategy_family=str(
+                    payload.get("strategy_family")
+                    or trial.get("strategy_family")
+                    or "dsl_generated"
+                ),
+                expression_tree=_tree_from_raw(payload.get("expression_tree")) or entry,
+                entry_tree=entry,
+                exit_tree=exit_tree,
+                stop=stop,
+                target=target,
+                sizing=sizing,
+                regime_gates=regime_gates,
+                feature_ids=feature_ids,
+                parameters=params,
+                complexity_score=float(payload.get("complexity_score") or 0.0),
+                grammar_version=str(payload.get("grammar_version") or ""),
+                feature_set_version=str(payload.get("feature_set_version") or ""),
+                cost_model_version=str(
+                    payload.get("cost_model_version")
+                    or trial.get("cost_model_version")
+                    or "cost_v1"
+                ),
+                asset_universe=tuple(
+                    str(a) for a in (payload.get("asset_universe") or ("ES",))
+                ),
+                random_seed=int(payload.get("random_seed") or trial.get("random_seed") or 0),
+                creation_timestamp=str(payload.get("creation_timestamp") or ""),
+                family_provenance=dict(payload.get("family_provenance") or {}),
+            )
+        else:
+            entry_raw = snap.get("expression_tree") or snap.get("entry_tree")
+            if not isinstance(entry_raw, dict):
+                report.migration_records.append(
+                    {
+                        "candidate_id": cid,
+                        "status": "reconstruction_unavailable",
+                        "reason": "missing_entry_tree",
+                    }
+                )
+                return None
+            entry = ExprNode.from_dict(entry_raw)
+            creation = snap.get("creation_method") or CreationMethod.RANDOM.value
+            try:
+                method = CreationMethod(str(creation))
+            except ValueError:
+                method = CreationMethod.RANDOM
+            params, recovered = normalize_legacy_candidate_parameters(
+                entry,
+                trial.get("parameters"),
+                candidate_id=cid,
+            )
+            for item in recovered:
+                report.list_valued_parameter_fields.append(item)
+                if item.get("recovered_from_dsl") is not None:
+                    report.values_recovered_from_dsl.append(item)
+            # Entry-only legacy snapshot — do not invent exit/stop/target.
+            cand = StrategyCandidate(
+                candidate_id=cid,
+                lineage_id=str(trial.get("lineage_id") or cid),
+                generation=int(snap.get("generation") or 0),
+                parent_ids=tuple(str(p) for p in (snap.get("parent_ids") or ())),
+                creation_method=method,
+                strategy_family=str(trial.get("strategy_family") or "dsl_generated"),
+                expression_tree=entry,
+                entry_tree=entry,
+                exit_tree=None,
+                stop=None,
+                target=None,
+                sizing=None,
+                regime_gates=(),
+                feature_ids=tuple(str(f) for f in (snap.get("feature_ids") or entry.feature_ids())),
+                parameters=params,
+                complexity_score=float(snap.get("complexity") or 0.0),
+                grammar_version=str(snap.get("grammar_version") or ""),
+                feature_set_version=str(snap.get("feature_set_version") or ""),
+                cost_model_version=str(trial.get("cost_model_version") or "cost_v1"),
+                asset_universe=("ES",),
+                random_seed=int(trial.get("random_seed") or 0),
+                family_provenance=dict(snap.get("family_provenance") or {}),
+            )
+    except LegacyParameterError as exc:
+        wrapped = LegacyBootstrapError(
+            exc.code,
+            str(exc).split(": ", 1)[-1],
+            candidate_id=exc.candidate_id or cid or None,
+            parameter=exc.parameter,
+            phase="normalize_legacy_candidate_parameters",
+            details=exc.details,
+        )
+        if require_complete:
+            report.ambiguous_candidate_ids.append(cid)
+            raise wrapped from exc
+        report.ambiguous_candidate_ids.append(cid)
+        report.reconstruction_unavailable_ids.append(cid)
+        report.migration_records.append(
+            {
+                "candidate_id": cid,
+                "status": "reconstruction_unavailable",
+                "reason": wrapped.code,
+                "parameter": wrapped.parameter,
+                "details": wrapped.details,
+            }
+        )
+        return None
+    except LegacyBootstrapError as exc:
+        if require_complete:
+            if exc.code == LEGACY_PARAMETER_VALUE_AMBIGUOUS:
+                report.ambiguous_candidate_ids.append(cid)
+            else:
+                report.incomplete_candidate_ids.append(cid)
+            raise
+        report.ambiguous_candidate_ids.append(cid)
+        report.reconstruction_unavailable_ids.append(cid)
+        report.migration_records.append(
+            {
+                "candidate_id": cid,
+                "status": "reconstruction_unavailable",
+                "reason": exc.code,
+                "parameter": exc.parameter,
+                "details": exc.details,
+            }
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        if require_complete:
+            raise LegacyBootstrapError(
+                LEGACY_CANDIDATE_SPEC_INCOMPLETE,
+                f"failed to reconstruct candidate: {exc}",
+                candidate_id=cid or None,
+                phase="candidate_from_trial",
+                details={"error": str(exc), "error_type": type(exc).__name__},
+            ) from exc
+        report.reconstruction_unavailable_ids.append(cid)
+        report.migration_records.append(
+            {
+                "candidate_id": cid,
+                "status": "reconstruction_unavailable",
+                "reason": type(exc).__name__,
+                "error": str(exc),
+            }
+        )
+        return None
+
+    if require_complete and not _candidate_complete_for_stress(cand):
+        report.incomplete_candidate_ids.append(cid)
+        raise LegacyBootstrapError(
+            LEGACY_CANDIDATE_SPEC_INCOMPLETE,
+            (
+                "SCORE_QUALIFIED candidate missing authoritative executable trees; "
+                "refusing to run Stress on a modified strategy"
+            ),
+            candidate_id=cid or None,
+            phase="candidate_from_trial",
+            details={
+                "has_exit_tree": cand.exit_tree is not None,
+                "has_stop": cand.stop is not None,
+                "has_target": cand.target is not None,
+                "parameter_keys": sorted(cand.parameters),
+                "tree_parameter_keys": sorted(
+                    collect_parameters(
+                        cand.entry_tree,
+                        cand.exit_tree,
+                        cand.stop,
+                        cand.target,
+                        cand.sizing,
+                        *cand.regime_gates,
+                    )
+                ),
+            },
+        )
+
+    if not require_complete and not _candidate_complete_for_stress(cand):
+        # History-only: keep eval record / population membership without executable spec.
+        report.reconstruction_unavailable_ids.append(cid)
+        report.migration_records.append(
+            {
+                "candidate_id": cid,
+                "status": "reconstruction_unavailable",
+                "reason": "entry_only_or_incomplete_spec",
+                "has_exit_tree": cand.exit_tree is not None,
+                "has_stop": cand.stop is not None,
+                "has_target": cand.target is not None,
+            }
+        )
+        return None
+
+    return cand
 
 
 def _eval_record_from_trial(trial: dict[str, Any]) -> dict[str, Any]:
@@ -220,10 +439,11 @@ def _eval_record_from_trial(trial: dict[str, Any]) -> dict[str, Any]:
         outcome = "EVAL_FAILED"
     fitness = None
     if ranking is not None:
+        net = dict(trial.get("net_metrics") or {})
         fitness = {
             "fitness": float(ranking),
             "ranking_source": trial.get("ranking_source") or "validation_oos",
-            "components": dict(trial.get("net_metrics") or {}),
+            "components": sanitize_fitness_components(net),
             "fold_scores": [],
             "rejected": bool(rejected),
             "rejection_reason": rejected,
@@ -277,8 +497,51 @@ def _eval_record_from_trial(trial: dict[str, Any]) -> dict[str, Any]:
                 "backend_kind": str(snap.get("backend_kind") or "event_driven_wfo"),
             },
             "bootstrap_from_trial_ledger": True,
+            "net_metrics_non_scalar": {
+                str(k): value_shape(v)
+                for k, v in (trial.get("net_metrics") or {}).items()
+                if finite_float(v) is None
+            },
         },
     }
+
+
+def _score_qualified_ids_from_campaign(campaign: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for ev in campaign.get("candidate_status_history") or []:
+        if str(ev.get("new_status") or "") == "SCORE_QUALIFIED":
+            cid = str(ev.get("candidate_id") or "")
+            if cid:
+                ids.add(cid)
+    for gen in campaign.get("generation_records") or []:
+        for cid in gen.get("score_qualified_candidate_ids") or []:
+            ids.add(str(cid))
+    return ids
+
+
+def _pending_score_qualified_ids(
+    campaign: dict[str, Any],
+    trials: Iterable[dict[str, Any]],
+) -> set[str]:
+    """IDs that must be executable for Stress after legacy bootstrap."""
+    sq = _score_qualified_ids_from_campaign(campaign)
+    stressed = {
+        str(s.get("candidate_id") or "")
+        for s in (campaign.get("candidate_stress_summaries") or [])
+        if s.get("final_decision") in {"STRESS_PASSED", "STRESS_FAILED"}
+    }
+    pending = {cid for cid in sq if cid and cid not in stressed}
+    if pending:
+        return pending
+    # Legacy runs may lack SCORE_QUALIFIED status events; infer from unrejeced ranks.
+    inferred: set[str] = set()
+    for trial in trials:
+        if trial.get("rejection_reason"):
+            continue
+        if trial.get("ranking_score") is None:
+            continue
+        inferred.add(str(trial["candidate_id"]))
+    return inferred
 
 
 def bootstrap_checkpoint_from_run(
@@ -291,38 +554,75 @@ def bootstrap_checkpoint_from_run(
     fingerprint_components: dict[str, str] | None = None,
     source_run_id: str | None = None,
     resumed_from_run_id: str | None = None,
-) -> SearchCheckpoint | None:
+) -> tuple[SearchCheckpoint | None, LegacyBootstrapReport]:
     """Build a resume checkpoint from ``multi_family_campaign.json`` + trial ledger.
 
     Used when a RUNTIME_EXHAUSTED run predates durable checkpoints but still has
     SCORE_QUALIFIED candidates awaiting Stress.
     """
     art = Path(artifact_dir)
+    report = LegacyBootstrapReport(
+        source_run_id=source_run_id or art.name,
+        search_program_id=search_program_id,
+    )
     campaign_path = art / "multi_family_campaign.json"
     ledger_path = art / "registry" / "trial_ledger.jsonl"
     if not campaign_path.is_file():
-        return None
+        return None, report
     campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
     trials: list[dict[str, Any]] = []
     if ledger_path.is_file():
         for line in ledger_path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 trials.append(json.loads(line))
+    report.trials_scanned = len(trials)
 
+    pending_sq = _pending_score_qualified_ids(campaign, trials)
     candidates: dict[str, dict[str, Any]] = {}
     evaluation_records: dict[str, dict[str, Any]] = {}
+    trial_population_ids: list[str] = []
+
     for trial in trials:
-        cand = _candidate_from_trial(trial)
+        cid = str(trial.get("candidate_id") or "")
+        if not cid:
+            continue
+        trial_population_ids.append(cid)
+        require_complete = cid in pending_sq
+        cand = _candidate_from_trial(
+            trial, report=report, require_complete=require_complete
+        )
+        evaluation_records[cid] = _eval_record_from_trial(trial)
         if cand is None:
+            if trial.get("rejection_reason") or cid not in pending_sq:
+                report.rejected_history_only_preserved += 1
             continue
         candidates[cand.candidate_id] = cand.as_dict()
-        evaluation_records[cand.candidate_id] = _eval_record_from_trial(trial)
+        report.candidates_reconstructed += 1
 
     family_states: dict[str, FamilyCheckpointState] = {}
     for st in campaign.get("family_stats") or []:
         fid = str(st.get("family_id") or "")
         if not fid:
             continue
+        evaluated_ids: list[str] = []
+        for trial in trials:
+            tcid = str(trial.get("candidate_id") or "")
+            if not tcid or tcid not in evaluation_records:
+                continue
+            cand_raw = candidates.get(tcid) or {}
+            prov = dict(
+                cand_raw.get("family_provenance")
+                or (trial.get("config_snapshot") or {}).get("family_provenance")
+                or {}
+            )
+            fam = str(
+                prov.get("family_id")
+                or cand_raw.get("strategy_family")
+                or trial.get("strategy_family")
+                or ""
+            )
+            if fam == fid:
+                evaluated_ids.append(tcid)
         family_states[fid] = FamilyCheckpointState(
             family_id=fid,
             generated_count=int(st.get("generated") or 0),
@@ -338,13 +638,7 @@ def bootstrap_checkpoint_from_run(
             family_gen_cap=int(st.get("allocation_generated") or st.get("generated") or 0),
             family_wfo_cap=int(st.get("allocation_wfo") or st.get("full_wfo") or 0),
             generation_0_complete=True,
-            evaluated_ids=[
-                cid
-                for cid, rec in evaluation_records.items()
-                if (candidates.get(cid) or {}).get("strategy_family") == fid
-                or ((candidates.get(cid) or {}).get("family_provenance") or {}).get("family_id")
-                == fid
-            ],
+            evaluated_ids=sorted(set(evaluated_ids)),
         )
 
     gates: dict[str, str] = {}
@@ -379,7 +673,7 @@ def bootstrap_checkpoint_from_run(
         generation_records=list(campaign.get("generation_records") or []),
         status_history=list(campaign.get("candidate_status_history") or []),
         campaign_generated=int(
-            alloc.get("campaign_generated") or generated_sum or len(candidates)
+            alloc.get("campaign_generated") or generated_sum or len(evaluation_records)
         ),
         campaign_evaluated=int(
             alloc.get("campaign_evaluated") or evaluated_sum or len(evaluation_records)
@@ -394,7 +688,7 @@ def bootstrap_checkpoint_from_run(
         shortlist_rejects=list(campaign.get("shortlist_rejects") or []),
         research_shortlist=list(campaign.get("research_shortlist") or []),
         population_stats=dict(campaign.get("population_stats") or {}),
-        trial_population_candidate_ids=sorted(evaluation_records.keys()),
+        trial_population_candidate_ids=sorted(set(trial_population_ids)),
         fingerprint_components=dict(fingerprint_components or {}),
         budget_caps={
             "total_candidate_budget": alloc.get("total_candidate_budget"),
@@ -402,7 +696,229 @@ def bootstrap_checkpoint_from_run(
         },
     )
     mark_score_qualified_pending(ckpt)
-    # If score-qualified awaiting stress, stay in STRESS phase (resume priority).
+    # Ensure every pending SCORE_QUALIFIED has an executable reconstructed candidate.
+    missing_pending = [cid for cid in ckpt.pending_stress_ids if cid not in ckpt.candidates]
+    if missing_pending:
+        report.incomplete_candidate_ids.extend(missing_pending)
+        raise LegacyBootstrapError(
+            LEGACY_CANDIDATE_SPEC_INCOMPLETE,
+            (
+                "pending SCORE_QUALIFIED candidates lack executable specs: "
+                + ", ".join(missing_pending[:8])
+            ),
+            candidate_id=missing_pending[0],
+            phase="validate_pending_score_qualified",
+            details={"missing_pending_ids": missing_pending},
+        )
+    report.pending_score_qualified_restored = list(ckpt.pending_stress_ids)
     if ckpt.pending_stress_ids:
         ckpt.pipeline_phase = PipelinePhase.STRESS.value
-    return ckpt
+
+    # Validate checkpoint can be rehydrated before publish.
+    rebuild_candidates(ckpt)
+    rebuild_evaluation_records(ckpt)
+    return ckpt, report
+
+
+def prepare_search_program_session(
+    *,
+    search_mode: str,
+    program_id: str | None,
+    program_store: SearchProgramStore,
+    compatibility_fingerprint: str,
+    seed: int,
+    family_ids: list[str] | None,
+    run_id: str,
+    source_run_id: str | None,
+    resumed_from_run_id: str | None,
+    artifacts_root: Path,
+    fingerprint_components: dict[str, str] | None = None,
+) -> PreparedSearchSession:
+    """Create or resume a search program, bootstrapping legacy runs when needed.
+
+    NEW_SEARCH always creates a fresh program with no checkpoint.
+    RESUME / EXTEND / REEVALUATE never proceed with a null checkpoint: when the
+    program has no checkpoint yet and ``source_run_id`` points at prior artifacts,
+    ``bootstrap_checkpoint_from_run`` is used and the result is persisted atomically.
+    """
+    mode = SearchMode(str(search_mode or SearchMode.NEW_SEARCH.value).upper())
+    created_new = False
+    bootstrapped = False
+    resume_ckpt: SearchCheckpoint | None = None
+    bootstrap_report: LegacyBootstrapReport | None = None
+
+    if mode is SearchMode.NEW_SEARCH:
+        pid = program_id or new_search_program_id()
+        if program_store.get(pid) is None:
+            program_store.create(
+                compatibility_fingerprint=compatibility_fingerprint,
+                seed=int(seed),
+                family_ids=list(family_ids) if family_ids else None,
+                search_program_id=pid,
+                metadata={"created_by_run_id": run_id},
+            )
+            created_new = True
+        ckpt_path = program_store.checkpoint_path(pid)
+        cache = EvaluationCache(program_store.evaluation_cache_dir(pid))
+        return PreparedSearchSession(
+            search_program_id=pid,
+            resume_checkpoint=None,
+            checkpoint_path=ckpt_path,
+            evaluation_cache=cache,
+            created_new_program=created_new,
+            bootstrapped_from_source=False,
+            bootstrap_report=None,
+        )
+
+    # RESUME_SEARCH / EXTEND_BUDGET / REEVALUATE_FROZEN_CANDIDATES
+    deferred_create = False
+    if not program_id:
+        pid = new_search_program_id()
+        deferred_create = True
+    else:
+        pid = str(program_id)
+        existing = program_store.get(pid)
+        if existing is None:
+            deferred_create = True
+        else:
+            assert_fingerprint_compatible(
+                existing.compatibility_fingerprint,
+                compatibility_fingerprint,
+                mode=mode,
+            )
+
+    ckpt_path = program_store.checkpoint_path(pid)
+    # Do not mkdir the program dir until bootstrap publishes (atomic rollback).
+    cache: EvaluationCache | None = None
+    resume_ckpt = None if deferred_create else load_checkpoint(ckpt_path)
+    if resume_ckpt is not None:
+        cache = EvaluationCache(program_store.evaluation_cache_dir(pid))
+
+    if resume_ckpt is not None:
+        try:
+            for cid in list(resume_ckpt.pending_stress_ids):
+                raw = resume_ckpt.candidates.get(cid)
+                if raw is None:
+                    raise LegacyBootstrapError(
+                        LEGACY_CANDIDATE_SPEC_INCOMPLETE,
+                        "pending SCORE_QUALIFIED missing from checkpoint candidates",
+                        candidate_id=cid,
+                        phase="validate_existing_checkpoint",
+                    )
+                cand = StrategyCandidate.from_dict(raw)
+                if not _candidate_complete_for_stress(cand):
+                    raise LegacyBootstrapError(
+                        LEGACY_CANDIDATE_SPEC_INCOMPLETE,
+                        (
+                            "pending SCORE_QUALIFIED checkpoint candidate is incomplete; "
+                            "refusing Stress on a modified strategy"
+                        ),
+                        candidate_id=cid,
+                        phase="validate_existing_checkpoint",
+                    )
+            rebuild_evaluation_records(resume_ckpt)
+        except LegacyBootstrapError:
+            if not source_run_id:
+                raise
+            # Retry path: drop the broken checkpoint and rebuild from source artifacts.
+            resume_ckpt = None
+            if ckpt_path.is_file():
+                ckpt_path.unlink()
+
+    if resume_ckpt is None and source_run_id:
+        src = Path(artifacts_root) / str(source_run_id)
+        tmp_root = Path(tempfile.mkdtemp(prefix=f"legacy_bootstrap_{pid}_"))
+        published = False
+        try:
+            tmp_ckpt_path = tmp_root / "checkpoint.json"
+            resume_ckpt, bootstrap_report = bootstrap_checkpoint_from_run(
+                src,
+                search_program_id=pid,
+                compatibility_fingerprint=compatibility_fingerprint,
+                session_run_id=run_id,
+                search_mode=mode.value,
+                fingerprint_components=fingerprint_components,
+                source_run_id=str(source_run_id),
+                resumed_from_run_id=str(resumed_from_run_id or source_run_id),
+            )
+            if resume_ckpt is None:
+                raise RuntimeError(
+                    f"{MISSING_CHECKPOINT}: program={pid!r} mode={mode.value} "
+                    f"source_run_id={source_run_id!r}"
+                )
+            save_checkpoint(tmp_ckpt_path, resume_ckpt)
+            # Re-load + validate from the temporary location before publish.
+            validated = load_checkpoint(tmp_ckpt_path)
+            assert validated is not None
+            rebuild_candidates(validated)
+            rebuild_evaluation_records(validated)
+
+            if deferred_create:
+                program_store.create(
+                    compatibility_fingerprint=compatibility_fingerprint,
+                    seed=int(seed),
+                    family_ids=list(family_ids) if family_ids else None,
+                    search_program_id=pid,
+                    metadata={
+                        "created_by_run_id": run_id,
+                        "legacy_bootstrap": True,
+                        "source_run_id": source_run_id,
+                    },
+                )
+                created_new = True
+
+            program_store.evaluation_cache_dir(pid).mkdir(parents=True, exist_ok=True)
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(tmp_ckpt_path, ckpt_path)
+            report_path = program_store.program_dir(pid) / "legacy_bootstrap_report.json"
+            if bootstrap_report is not None:
+                bootstrap_report.search_program_id = pid
+                report_path.write_text(
+                    json.dumps(bootstrap_report.as_dict(), indent=2, default=str),
+                    encoding="utf-8",
+                )
+                try:
+                    (src / "legacy_bootstrap_report.json").write_text(
+                        json.dumps(bootstrap_report.as_dict(), indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+            program_store.update_cumulative(
+                pid,
+                generated=resume_ckpt.campaign_generated,
+                evaluated=resume_ckpt.campaign_evaluated,
+                full_wfo=resume_ckpt.campaign_full_wfo,
+                checkpoint_path=str(ckpt_path),
+            )
+            bootstrapped = True
+            published = True
+            resume_ckpt = validated
+            cache = EvaluationCache(program_store.evaluation_cache_dir(pid))
+        except Exception:
+            if deferred_create and not published:
+                program_store.delete(pid)
+            raise
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+    if resume_ckpt is None:
+        if deferred_create:
+            program_store.delete(pid)
+        raise RuntimeError(
+            f"{MISSING_CHECKPOINT}: program={pid!r} mode={mode.value} "
+            f"source_run_id={source_run_id!r}"
+        )
+
+    if cache is None:
+        cache = EvaluationCache(program_store.evaluation_cache_dir(pid))
+
+    return PreparedSearchSession(
+        search_program_id=pid,
+        resume_checkpoint=resume_ckpt,
+        checkpoint_path=ckpt_path,
+        evaluation_cache=cache,
+        created_new_program=created_new,
+        bootstrapped_from_source=bootstrapped,
+        bootstrap_report=bootstrap_report,
+    )
