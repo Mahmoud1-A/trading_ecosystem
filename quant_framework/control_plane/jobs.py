@@ -541,22 +541,19 @@ def run_alpha_miner_job(
 
     try:
         if multi_cfg is not None:
-            from discovery.evaluation_cache import EvaluationCache
-            from discovery.search_checkpoint import load_checkpoint
             from discovery.search_program import (
                 INCOMPATIBLE_FINGERPRINT,
                 SearchMode,
                 SearchProgramStore,
                 SearchSessionRecord,
-                assert_fingerprint_compatible,
                 compute_compatibility_fingerprint,
                 hash_multi_family_config,
                 hash_wfo_config,
-                new_search_program_id,
                 now_iso,
             )
             from discovery.search_resume import apply_budget_extension
             from registry.hashing import sha256_json
+            from control_plane.search_bootstrap import prepare_search_program_session
 
             search_mode = str(
                 run.config_snapshot.get("search_mode")
@@ -654,49 +651,25 @@ def run_alpha_miner_job(
 
             program_root = Path(run.artifact_dir).resolve().parents[1] / "search_programs"
             program_store = SearchProgramStore(program_root)
-            resume_ckpt = None
-            if search_mode == SearchMode.NEW_SEARCH.value or not program_id:
-                program_id = program_id or new_search_program_id()
-                program_store.create(
-                    compatibility_fingerprint=compatibility_fp,
-                    seed=int(multi_cfg.seed),
-                    family_ids=list(multi_cfg.family_ids) if multi_cfg.family_ids else None,
-                    search_program_id=program_id,
-                    metadata={"created_by_run_id": run.run_id},
-                )
-            else:
-                existing = program_store.get(str(program_id))
-                if existing is None:
-                    raise RuntimeError(f"unknown search_program_id={program_id!r}")
-                assert_fingerprint_compatible(
-                    existing.compatibility_fingerprint,
-                    compatibility_fp,
-                    mode=SearchMode(search_mode),
-                )
-                resume_ckpt = load_checkpoint(program_store.checkpoint_path(str(program_id)))
-                if resume_ckpt is None and source_run_id:
-                    # Bootstrap from prior run artifacts when checkpoint missing.
-                    from control_plane.search_bootstrap import (
-                        bootstrap_checkpoint_from_run,
-                    )
-
-                    art_root = Path(run.artifact_dir).resolve().parent
-                    src = art_root / str(source_run_id)
-                    resume_ckpt = bootstrap_checkpoint_from_run(
-                        src,
-                        search_program_id=str(program_id),
-                        compatibility_fingerprint=compatibility_fp,
-                        session_run_id=run.run_id,
-                        search_mode=search_mode,
-                        fingerprint_components=fp_components,
-                        source_run_id=str(source_run_id),
-                        resumed_from_run_id=str(resumed_from_run_id or source_run_id),
-                    )
-                if resume_ckpt is None and search_mode != SearchMode.NEW_SEARCH.value:
-                    raise RuntimeError(
-                        f"MISSING_SEARCH_CHECKPOINT: program={program_id!r} "
-                        f"mode={search_mode}"
-                    )
+            prepared = prepare_search_program_session(
+                search_mode=search_mode,
+                program_id=str(program_id) if program_id else None,
+                program_store=program_store,
+                compatibility_fingerprint=compatibility_fp,
+                seed=int(multi_cfg.seed),
+                family_ids=list(multi_cfg.family_ids) if multi_cfg.family_ids else None,
+                run_id=run.run_id,
+                source_run_id=str(source_run_id) if source_run_id else None,
+                resumed_from_run_id=(
+                    str(resumed_from_run_id) if resumed_from_run_id else None
+                ),
+                artifacts_root=Path(run.artifact_dir).resolve().parent,
+                fingerprint_components=fp_components,
+            )
+            program_id = prepared.search_program_id
+            resume_ckpt = prepared.resume_checkpoint
+            ckpt_path = prepared.checkpoint_path
+            eval_cache = prepared.evaluation_cache
 
             program_store.append_session(
                 str(program_id),
@@ -728,9 +701,6 @@ def run_alpha_miner_job(
             run.config_hash = "cfg_" + sha256_json(run.config_snapshot)[:24]
             if on_update is not None:
                 on_update(run)
-
-            eval_cache = EvaluationCache(program_store.evaluation_cache_dir(str(program_id)))
-            ckpt_path = program_store.checkpoint_path(str(program_id))
 
             campaign = MultiFamilyCampaign(
                 config=multi_cfg,

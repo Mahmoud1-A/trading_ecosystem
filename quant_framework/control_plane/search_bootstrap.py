@@ -3,19 +3,172 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from discovery.candidate import StrategyCandidate
+from discovery.evaluation_cache import EvaluationCache
 from discovery.expression_tree import ExprNode
 from discovery.search_checkpoint import (
     CHECKPOINT_VERSION,
     FamilyCheckpointState,
     SearchCheckpoint,
+    load_checkpoint,
+    save_checkpoint,
 )
-from discovery.search_program import PipelinePhase, now_iso
+from discovery.search_program import (
+    MISSING_CHECKPOINT,
+    PipelinePhase,
+    SearchMode,
+    SearchProgramStore,
+    assert_fingerprint_compatible,
+    new_search_program_id,
+    now_iso,
+)
 from discovery.search_resume import mark_score_qualified_pending
 from discovery.types import CreationMethod
+
+
+@dataclass
+class PreparedSearchSession:
+    search_program_id: str
+    resume_checkpoint: SearchCheckpoint | None
+    checkpoint_path: Path
+    evaluation_cache: EvaluationCache
+    created_new_program: bool
+    bootstrapped_from_source: bool
+
+
+def prepare_search_program_session(
+    *,
+    search_mode: str,
+    program_id: str | None,
+    program_store: SearchProgramStore,
+    compatibility_fingerprint: str,
+    seed: int,
+    family_ids: list[str] | None,
+    run_id: str,
+    source_run_id: str | None,
+    resumed_from_run_id: str | None,
+    artifacts_root: Path,
+    fingerprint_components: dict[str, str] | None = None,
+) -> PreparedSearchSession:
+    """Create or resume a search program, bootstrapping legacy runs when needed.
+
+    NEW_SEARCH always creates a fresh program with no checkpoint.
+    RESUME / EXTEND / REEVALUATE never proceed with a null checkpoint: when the
+    program has no checkpoint yet and ``source_run_id`` points at prior artifacts,
+    ``bootstrap_checkpoint_from_run`` is used and the result is persisted.
+    """
+    mode = SearchMode(str(search_mode or SearchMode.NEW_SEARCH.value).upper())
+    created_new = False
+    bootstrapped = False
+    resume_ckpt: SearchCheckpoint | None = None
+
+    if mode is SearchMode.NEW_SEARCH:
+        pid = program_id or new_search_program_id()
+        if program_store.get(pid) is None:
+            program_store.create(
+                compatibility_fingerprint=compatibility_fingerprint,
+                seed=int(seed),
+                family_ids=list(family_ids) if family_ids else None,
+                search_program_id=pid,
+                metadata={"created_by_run_id": run_id},
+            )
+            created_new = True
+        ckpt_path = program_store.checkpoint_path(pid)
+        cache = EvaluationCache(program_store.evaluation_cache_dir(pid))
+        return PreparedSearchSession(
+            search_program_id=pid,
+            resume_checkpoint=None,
+            checkpoint_path=ckpt_path,
+            evaluation_cache=cache,
+            created_new_program=created_new,
+            bootstrapped_from_source=False,
+        )
+
+    # RESUME_SEARCH / EXTEND_BUDGET / REEVALUATE_FROZEN_CANDIDATES
+    if not program_id:
+        # Legacy RUNTIME_EXHAUSTED run: assign a program id and create the record.
+        pid = new_search_program_id()
+        program_store.create(
+            compatibility_fingerprint=compatibility_fingerprint,
+            seed=int(seed),
+            family_ids=list(family_ids) if family_ids else None,
+            search_program_id=pid,
+            metadata={
+                "created_by_run_id": run_id,
+                "legacy_bootstrap": True,
+                "source_run_id": source_run_id,
+            },
+        )
+        created_new = True
+    else:
+        pid = str(program_id)
+        existing = program_store.get(pid)
+        if existing is None:
+            # Program id was assigned by Continue Search but record not written yet.
+            program_store.create(
+                compatibility_fingerprint=compatibility_fingerprint,
+                seed=int(seed),
+                family_ids=list(family_ids) if family_ids else None,
+                search_program_id=pid,
+                metadata={
+                    "created_by_run_id": run_id,
+                    "legacy_bootstrap": True,
+                    "source_run_id": source_run_id,
+                },
+            )
+            created_new = True
+        else:
+            assert_fingerprint_compatible(
+                existing.compatibility_fingerprint,
+                compatibility_fingerprint,
+                mode=mode,
+            )
+
+    ckpt_path = program_store.checkpoint_path(pid)
+    cache = EvaluationCache(program_store.evaluation_cache_dir(pid))
+    resume_ckpt = load_checkpoint(ckpt_path)
+
+    if resume_ckpt is None and source_run_id:
+        src = Path(artifacts_root) / str(source_run_id)
+        resume_ckpt = bootstrap_checkpoint_from_run(
+            src,
+            search_program_id=pid,
+            compatibility_fingerprint=compatibility_fingerprint,
+            session_run_id=run_id,
+            search_mode=mode.value,
+            fingerprint_components=fingerprint_components,
+            source_run_id=str(source_run_id),
+            resumed_from_run_id=str(resumed_from_run_id or source_run_id),
+        )
+        if resume_ckpt is not None:
+            save_checkpoint(ckpt_path, resume_ckpt)
+            bootstrapped = True
+            program_store.update_cumulative(
+                pid,
+                generated=resume_ckpt.campaign_generated,
+                evaluated=resume_ckpt.campaign_evaluated,
+                full_wfo=resume_ckpt.campaign_full_wfo,
+                checkpoint_path=str(ckpt_path),
+            )
+
+    if resume_ckpt is None:
+        raise RuntimeError(
+            f"{MISSING_CHECKPOINT}: program={pid!r} mode={mode.value} "
+            f"source_run_id={source_run_id!r}"
+        )
+
+    return PreparedSearchSession(
+        search_program_id=pid,
+        resume_checkpoint=resume_ckpt,
+        checkpoint_path=ckpt_path,
+        evaluation_cache=cache,
+        created_new_program=created_new,
+        bootstrapped_from_source=bootstrapped,
+    )
 
 
 def _candidate_from_trial(trial: dict[str, Any]) -> StrategyCandidate | None:
@@ -61,6 +214,7 @@ def _candidate_from_trial(trial: dict[str, Any]) -> StrategyCandidate | None:
 def _eval_record_from_trial(trial: dict[str, Any]) -> dict[str, Any]:
     rejected = trial.get("rejection_reason")
     ranking = trial.get("ranking_score")
+    snap = dict(trial.get("config_snapshot") or {})
     outcome = "REJECTED" if rejected else "REGISTERED"
     if trial.get("trial_status") == "FAILED":
         outcome = "EVAL_FAILED"
@@ -89,6 +243,17 @@ def _eval_record_from_trial(trial: dict[str, Any]) -> dict[str, Any]:
                 "n_trades": int(fr.get("n_trades") or 0),
             }
         )
+    is_full = bool(snap.get("is_full_event_wfo"))
+    signal_source = str(snap.get("signal_source") or "")
+    if is_full and not signal_source:
+        signal_source = "candidate_dsl_trees"
+    train_metrics = dict(trial.get("gross_metrics") or {})
+    train_metrics.setdefault("signal_source", signal_source or train_metrics.get("signal_source"))
+    train_metrics.setdefault("is_full_event_wfo", is_full)
+    train_metrics.setdefault(
+        "wfo_completed_folds",
+        int(snap.get("wfo_completed_folds") or len(folds) or (3 if is_full else 0)),
+    )
     return {
         "outcome": outcome,
         "candidate_id": str(trial["candidate_id"]),
@@ -97,16 +262,20 @@ def _eval_record_from_trial(trial: dict[str, Any]) -> dict[str, Any]:
         "fitness": fitness,
         "rejection_reason": rejected,
         "oos_folds": folds,
-        "train_metrics": dict(trial.get("gross_metrics") or {}),
+        "train_metrics": train_metrics,
         "runtime_seconds": 0.0,
         "memory_mb": 0.0,
         "stress_results": {},
         "robustness_results": {},
         "behavioral_cluster": None,
         "meta": {
-            "is_full_event_wfo": bool(
-                (trial.get("config_snapshot") or {}).get("is_full_event_wfo")
-            ),
+            "is_full_event_wfo": is_full,
+            "baseline_wfo_artifacts": {
+                "signal_source": signal_source or "candidate_dsl_trees",
+                "is_full_event_wfo": is_full,
+                "wfo_completed_folds": int(train_metrics.get("wfo_completed_folds") or 0),
+                "backend_kind": str(snap.get("backend_kind") or "event_driven_wfo"),
+            },
             "bootstrap_from_trial_ledger": True,
         },
     }
@@ -186,6 +355,10 @@ def bootstrap_checkpoint_from_run(
             gates[cid] = new_status
 
     alloc = dict(campaign.get("budget_allocation") or {})
+    family_stats = list(campaign.get("family_stats") or [])
+    generated_sum = sum(int(st.get("generated") or 0) for st in family_stats)
+    evaluated_sum = sum(int(st.get("evaluated") or 0) for st in family_stats)
+    full_wfo_sum = sum(int(st.get("full_wfo") or 0) for st in family_stats)
     ckpt = SearchCheckpoint(
         version=CHECKPOINT_VERSION,
         search_program_id=search_program_id,
@@ -205,9 +378,13 @@ def bootstrap_checkpoint_from_run(
         family_states=family_states,
         generation_records=list(campaign.get("generation_records") or []),
         status_history=list(campaign.get("candidate_status_history") or []),
-        campaign_generated=int(alloc.get("campaign_generated") or len(candidates)),
-        campaign_evaluated=int(alloc.get("campaign_evaluated") or len(evaluation_records)),
-        campaign_full_wfo=int(alloc.get("campaign_full_wfo") or 0),
+        campaign_generated=int(
+            alloc.get("campaign_generated") or generated_sum or len(candidates)
+        ),
+        campaign_evaluated=int(
+            alloc.get("campaign_evaluated") or evaluated_sum or len(evaluation_records)
+        ),
+        campaign_full_wfo=int(alloc.get("campaign_full_wfo") or full_wfo_sum or 0),
         stop_reason=campaign.get("aggregated_stop_reason"),
         stress_summaries=list(campaign.get("candidate_stress_summaries") or []),
         robustness_summaries=list(campaign.get("candidate_robustness_summaries") or []),

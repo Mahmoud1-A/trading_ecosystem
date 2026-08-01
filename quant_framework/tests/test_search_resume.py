@@ -548,3 +548,332 @@ def test_resumed_plus_interrupted_equals_uninterrupted(tmp_path: Path) -> None:
         ) or True
     assert final.budget_allocation["search_program_id"] == program_id
     assert ckpt_final.campaign_evaluated >= ckpt.campaign_evaluated
+
+
+def _write_legacy_runtime_exhausted_artifacts(art: Path) -> dict[str, Any]:
+    """Pre-resume RUNTIME_EXHAUSTED artifacts with no search_program_id."""
+    import json
+
+    from discovery.family_generator import StrategyFamilyGenerator
+    from discovery.generator import CandidateGenerator
+
+    art.mkdir(parents=True, exist_ok=True)
+    (art / "registry").mkdir(parents=True, exist_ok=True)
+    specs = StrategyFamilyGenerator(seed=7).generate(
+        count=1, family_ids=["mean_reversion"]
+    )
+    gen = CandidateGenerator.from_family_spec(specs[0])
+    cands = []
+    seen: set[str] = set()
+    seed_i = 0
+    while len(cands) < 3 and seed_i < 40:
+        seed_i += 1
+        try:
+            c = gen.generate(seed=seed_i)
+        except Exception:  # noqa: BLE001
+            continue
+        if c.candidate_id in seen:
+            continue
+        seen.add(c.candidate_id)
+        cands.append(c)
+    assert len(cands) >= 2
+    sq = cands[0]
+    other = cands[1]
+
+    trials = []
+    for i, cand in enumerate(cands[:2]):
+        ranking = 1.25 if i == 0 else -0.4
+        rejected = None if i == 0 else "NEGATIVE_EXPECTANCY"
+        trials.append(
+            {
+                "trial_id": f"trial_{i}",
+                "candidate_id": cand.candidate_id,
+                "lineage_id": cand.lineage_id,
+                "strategy_family": cand.strategy_family,
+                "parameters": dict(cand.parameters),
+                "config_snapshot": {
+                    "expression_tree": cand.entry_tree.as_dict(),
+                    "generation": 0,
+                    "parent_ids": [],
+                    "creation_method": cand.creation_method.value,
+                    "is_full_event_wfo": True,
+                    "signal_source": "candidate_dsl_trees",
+                    "backend_kind": "event_driven_wfo",
+                    "wfo_completed_folds": 3,
+                    "family_provenance": {
+                        "family_id": "mean_reversion",
+                        "initial_or_descendant": "initial",
+                    },
+                    "grammar_version": cand.grammar_version,
+                    "feature_set_version": cand.feature_set_version,
+                    "complexity": cand.complexity_score,
+                },
+                "system_version": "test",
+                "git_commit_hash": "local",
+                "data_hash": "ds_test",
+                "random_seed": cand.random_seed,
+                "train_window": None,
+                "validation_window": None,
+                "vault_version": None,
+                "gross_metrics": {
+                    "signal_source": "candidate_dsl_trees",
+                    "is_full_event_wfo": True,
+                    "wfo_completed_folds": 3,
+                },
+                "net_metrics": {},
+                "ranking_score": ranking,
+                "rejection_reason": rejected,
+                "trade_log_path": None,
+                "equity_curve_path": None,
+                "execution_assumptions": {},
+                "cost_model_version": "cost_v1",
+                "code_hash": "code_test",
+                "trial_status": "COMPLETED",
+                "fold_records": [
+                    {
+                        "fold_id": j,
+                        "expectancy": 0.08 if i == 0 else -0.05,
+                        "sharpe": 1.2,
+                        "profit_factor": 1.4 if i == 0 else 0.7,
+                        "calmar": 0.5,
+                        "max_drawdown": -0.04,
+                        "n_trades": 10,
+                    }
+                    for j in range(3)
+                ],
+                "ranking_source": "validation_oos",
+            }
+        )
+    ledger = art / "registry" / "trial_ledger.jsonl"
+    ledger.write_text(
+        "\n".join(json.dumps(t) for t in trials) + "\n", encoding="utf-8"
+    )
+    campaign = {
+        "campaign_id": "run_legacy_exhausted",
+        "families": [s.as_dict() for s in specs],
+        "family_stats": [
+            {
+                "family_id": "mean_reversion",
+                "hypothesis": specs[0].hypothesis,
+                "canonical_hash": specs[0].canonical_hash(),
+                "grammar_fingerprint": specs[0].effective_grammar_fingerprint(),
+                "allocation_generated": 4,
+                "allocation_wfo": 4,
+                "generated": 3,
+                "evaluated": 2,
+                "full_wfo": 2,
+                "score_qualified": 1,
+                "generation_0_generated": 3,
+                "descendants_generated": 0,
+                "highest_generation_reached": 0,
+                "structural_parents_found": 1,
+                "family_stop_reason": "max_runtime_seconds",
+            }
+        ],
+        "budget_allocation": {
+            "campaign_generated": 3,
+            "campaign_evaluated": 2,
+            "campaign_full_wfo": 2,
+            "total_candidate_budget": 4,
+            "max_full_wfo": 4,
+            "family_local_evolution": True,
+        },
+        "aggregated_stop_reason": "max_runtime_seconds",
+        "candidate_status_history": [
+            {
+                "sequence": 1,
+                "candidate_id": sq.candidate_id,
+                "family_id": "mean_reversion",
+                "generation": 0,
+                "prior_status": "FULL_WFO_COMPLETED",
+                "new_status": "SCORE_QUALIFIED",
+                "reason": "SCORE_QUALIFIED",
+                "artifact_refs": {},
+            }
+        ],
+        "generation_records": [
+            {
+                "family_id": "mean_reversion",
+                "generation": 0,
+                "evaluated_candidate_ids": [sq.candidate_id, other.candidate_id],
+                "score_qualified_candidate_ids": [sq.candidate_id],
+                "completed_full_wfo_candidate_ids": [sq.candidate_id, other.candidate_id],
+                "generated_count": 3,
+                "evaluated_count": 2,
+                "completed_full_wfo_count": 2,
+                "stop_reason": "max_runtime_seconds",
+            }
+        ],
+        "candidate_stress_summaries": [],
+        "candidate_robustness_summaries": [],
+        "candidate_statistics_summaries": [],
+        "clusters": [],
+        "research_shortlist": [],
+    }
+    (art / "multi_family_campaign.json").write_text(
+        json.dumps(campaign, indent=2), encoding="utf-8"
+    )
+    return {
+        "score_qualified_id": sq.candidate_id,
+        "evaluated_ids": [sq.candidate_id, other.candidate_id],
+        "generated": 3,
+        "evaluated": 2,
+        "full_wfo": 2,
+        "family_specs": [s.as_dict() for s in specs],
+        "candidates": cands[:2],
+    }
+
+
+def test_legacy_runtime_exhausted_continue_search_bootstraps(tmp_path: Path) -> None:
+    """Legacy RUNTIME_EXHAUSTED run (no search_program_id) must bootstrap on Continue."""
+    from control_plane.search_bootstrap import prepare_search_program_session
+    from discovery.evaluation_cache import EvaluationCacheEntry
+    from discovery.search_program import PipelinePhase, SearchMode, SearchProgramStore, now_iso
+    from discovery.search_resume import choose_resume_phase
+
+    artifacts_root = tmp_path / "artifacts"
+    legacy_id = "run_legacy_exhausted"
+    legacy_art = artifacts_root / legacy_id
+    meta = _write_legacy_runtime_exhausted_artifacts(legacy_art)
+
+    program_root = tmp_path / "search_programs"
+    store = SearchProgramStore(program_root)
+    fp = "fp_legacy_test"
+    prepared = prepare_search_program_session(
+        search_mode=SearchMode.EXTEND_BUDGET.value,
+        program_id=None,  # legacy: absent
+        program_store=store,
+        compatibility_fingerprint=fp,
+        seed=7,
+        family_ids=["mean_reversion"],
+        run_id="run_continue_1",
+        source_run_id=legacy_id,
+        resumed_from_run_id=legacy_id,
+        artifacts_root=artifacts_root,
+        fingerprint_components=_fp_components(),
+    )
+    assert prepared.search_program_id.startswith("sp_")
+    assert prepared.resume_checkpoint is not None
+    assert prepared.bootstrapped_from_source is True
+    assert prepared.checkpoint_path.is_file()
+    ckpt = prepared.resume_checkpoint
+    assert ckpt.campaign_generated == 3
+    assert ckpt.campaign_evaluated == 2
+    assert ckpt.campaign_full_wfo == 2
+    assert meta["score_qualified_id"] in ckpt.pending_stress_ids
+    assert choose_resume_phase(ckpt) is PipelinePhase.STRESS
+    assert all(fst.generation_0_complete for fst in ckpt.family_states.values())
+
+    events: list[str] = []
+
+    def _hook(name: str, payload: dict) -> None:
+        events.append(name)
+
+    CountingBackend.evaluate_calls = 0
+    fp_comp = _fp_components()
+    for cid, raw in ckpt.evaluation_records.items():
+        key = build_evaluation_cache_key(
+            candidate_canonical_hash=cid,
+            dataset_hash=fp_comp["dataset_hash"],
+            timeframe=fp_comp["timeframe"],
+            wfo_config_hash=fp_comp["wfo_config_hash"],
+            cost_model_version=fp_comp["cost_model_version"],
+            risk_model_version=fp_comp["risk_model_version"],
+            execution_engine_code_hash=fp_comp["execution_engine_code_hash"],
+        )
+        prepared.evaluation_cache.put(
+            EvaluationCacheEntry(
+                cache_key=key,
+                candidate_id=cid,
+                candidate_canonical_hash=cid,
+                evaluation_record=raw,
+                created_at=now_iso(),
+                fingerprint_components=fp_comp,
+            )
+        )
+
+    cfg = _tiny_cfg(
+        total_candidate_budget=6,
+        max_full_wfo=6,
+        max_evaluated_candidates=6,
+        max_runtime_seconds=30.0,
+        evolution_generations=1,
+    )
+    campaign = MultiFamilyCampaign(
+        config=cfg,
+        registry=ExperimentRegistry(tmp_path / "reg_legacy"),
+        backend=CountingBackend(),
+        discovery_run_id="run_continue_1",
+        research_eligible=False,
+        synthetic_stress_forbidden=False,
+        progress_hook=_hook,
+        search_program_id=prepared.search_program_id,
+        search_mode=SearchMode.EXTEND_BUDGET.value,
+        compatibility_fingerprint=fp,
+        fingerprint_components=fp_comp,
+        checkpoint_path=prepared.checkpoint_path,
+        evaluation_cache=prepared.evaluation_cache,
+        resume_checkpoint=ckpt,
+        source_run_id=legacy_id,
+        resumed_from_run_id=legacy_id,
+    )
+    result = campaign.run()
+    assert "SEARCH_RESUME_STARTED" in events
+    resume_idx = events.index("SEARCH_RESUME_STARTED")
+    stress_idxs = [i for i, e in enumerate(events) if e == "MULTI_FAMILY_STRESS_STARTED"]
+    evo_idxs = [i for i, e in enumerate(events) if e == "MULTI_FAMILY_EVOLUTION_STARTED"]
+    assert stress_idxs, "Stress must run on resume"
+    assert stress_idxs[0] > resume_idx
+    if evo_idxs:
+        assert stress_idxs[0] < evo_idxs[0], "Stress must precede evolution/generation"
+    assert meta["score_qualified_id"] in ckpt.candidates
+    restored_ids = set(meta["evaluated_ids"])
+    assert restored_ids.issubset(set(ckpt.evaluation_records))
+    assert result.budget_allocation["search_program_id"] == prepared.search_program_id
+    assert result.budget_allocation["cumulative_totals"]["generated"] >= 3
+    assert result.budget_allocation["cumulative_totals"]["evaluated"] >= 2
+    assert result.budget_allocation["cumulative_totals"]["full_wfo"] >= 2
+    # Restored Full-WFO candidates must not force a full re-evaluation wave.
+    assert CountingBackend.evaluate_calls < len(ckpt.candidates) + 5
+
+
+def test_prepare_new_search_skips_bootstrap(tmp_path: Path) -> None:
+    from control_plane.search_bootstrap import prepare_search_program_session
+    from discovery.search_program import SearchMode, SearchProgramStore
+
+    store = SearchProgramStore(tmp_path / "sp")
+    prepared = prepare_search_program_session(
+        search_mode=SearchMode.NEW_SEARCH.value,
+        program_id=None,
+        program_store=store,
+        compatibility_fingerprint="fp",
+        seed=1,
+        family_ids=["mean_reversion"],
+        run_id="run_new",
+        source_run_id="run_legacy",
+        resumed_from_run_id=None,
+        artifacts_root=tmp_path / "artifacts",
+    )
+    assert prepared.resume_checkpoint is None
+    assert prepared.bootstrapped_from_source is False
+    assert prepared.created_new_program is True
+
+
+def test_resume_without_checkpoint_or_source_raises(tmp_path: Path) -> None:
+    from control_plane.search_bootstrap import prepare_search_program_session
+    from discovery.search_program import MISSING_CHECKPOINT, SearchMode, SearchProgramStore
+
+    store = SearchProgramStore(tmp_path / "sp")
+    with pytest.raises(RuntimeError, match=MISSING_CHECKPOINT):
+        prepare_search_program_session(
+            search_mode=SearchMode.RESUME_SEARCH.value,
+            program_id=None,
+            program_store=store,
+            compatibility_fingerprint="fp",
+            seed=1,
+            family_ids=None,
+            run_id="run_x",
+            source_run_id=None,
+            resumed_from_run_id=None,
+            artifacts_root=tmp_path / "artifacts",
+        )
