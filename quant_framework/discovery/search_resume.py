@@ -214,10 +214,14 @@ def apply_budget_extension(
     additional_generated_budget: int = 0,
     additional_full_wfo_budget: int = 0,
 ) -> Any:
-    """EXTEND_BUDGET: raise caps without changing structural search identity."""
-    config.max_runtime_seconds = float(config.max_runtime_seconds) + float(
-        additional_runtime_seconds
-    )
+    """EXTEND_BUDGET: raise generated/WFO caps; session runtime is replaced.
+
+    ``additional_runtime_seconds`` is the runtime limit for the new session
+    (not ``original_runtime_cap + additional_runtime_seconds``).
+    """
+    add_rt = float(additional_runtime_seconds or 0.0)
+    if add_rt > 0:
+        config.max_runtime_seconds = add_rt
     config.total_candidate_budget = int(config.total_candidate_budget) + int(
         additional_generated_budget
     )

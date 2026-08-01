@@ -38,7 +38,76 @@ const state = {
   alphaRefreshTimer: null,
   alphaRefreshInFlight: false,
   alphaRunActive: false,
+  continueSearchDrafts: {},
 };
+
+const CS_DRAFT_DEFAULTS = { runtime: 10800, generated: 0, full_wfo: 0 };
+const CS_DRAFT_STORAGE_KEY = "cp_continue_search_drafts";
+
+function _loadContinueSearchDraftsFromStorage() {
+  try {
+    const raw = sessionStorage.getItem(CS_DRAFT_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function _persistContinueSearchDrafts() {
+  try {
+    sessionStorage.setItem(CS_DRAFT_STORAGE_KEY, JSON.stringify(state.continueSearchDrafts || {}));
+  } catch {}
+}
+state.continueSearchDrafts = _loadContinueSearchDraftsFromStorage();
+
+function getContinueSearchDraft(runId) {
+  if (!runId) {
+    return { ...CS_DRAFT_DEFAULTS };
+  }
+  const existing = (state.continueSearchDrafts || {})[runId];
+  if (existing && typeof existing === "object") {
+    return {
+      runtime: Number.isFinite(Number(existing.runtime)) ? Number(existing.runtime) : CS_DRAFT_DEFAULTS.runtime,
+      generated: Number.isFinite(Number(existing.generated)) ? Number(existing.generated) : CS_DRAFT_DEFAULTS.generated,
+      full_wfo: Number.isFinite(Number(existing.full_wfo)) ? Number(existing.full_wfo) : CS_DRAFT_DEFAULTS.full_wfo,
+    };
+  }
+  return { ...CS_DRAFT_DEFAULTS };
+}
+function saveContinueSearchDraft(runId, patch) {
+  if (!runId) return getContinueSearchDraft(runId);
+  const cur = getContinueSearchDraft(runId);
+  const next = {
+    runtime: patch.runtime != null ? Number(patch.runtime) : cur.runtime,
+    generated: patch.generated != null ? Number(patch.generated) : cur.generated,
+    full_wfo: patch.full_wfo != null ? Number(patch.full_wfo) : cur.full_wfo,
+  };
+  if (!Number.isFinite(next.runtime) || next.runtime < 0) next.runtime = cur.runtime;
+  if (!Number.isFinite(next.generated) || next.generated < 0) next.generated = cur.generated;
+  if (!Number.isFinite(next.full_wfo) || next.full_wfo < 0) next.full_wfo = cur.full_wfo;
+  state.continueSearchDrafts = { ...(state.continueSearchDrafts || {}), [runId]: next };
+  _persistContinueSearchDrafts();
+  return next;
+}
+function wireContinueSearchDraftInputs(runId) {
+  const runtime = $("#cs_runtime");
+  const gen = $("#cs_gen");
+  const wfo = $("#cs_wfo");
+  if (!runtime && !gen && !wfo) return;
+  const saveFromInputs = () => {
+    saveContinueSearchDraft(runId, {
+      runtime: runtime ? runtime.value : undefined,
+      generated: gen ? gen.value : undefined,
+      full_wfo: wfo ? wfo.value : undefined,
+    });
+  };
+  for (const el of [runtime, gen, wfo]) {
+    if (!el) continue;
+    el.addEventListener("input", saveFromInputs);
+    el.addEventListener("change", saveFromInputs);
+  }
+}
 
 function $(sel, el = document) { return el.querySelector(sel); }
 function statusText(v, fallback = "NOT_EVALUATED") {
@@ -804,6 +873,8 @@ async function renderAlpha() {
   const softwareErr = statusText(report.terminal_reason || run.terminal_reason || report.error, "SOFTWARE_FAILURE");
   const budget = report.search_budget_consumed || {};
   const dist = report.rejection_reason_distribution || {};
+  state.alphaRunActive = ACTIVE.has(run.state);
+  const csDraft = getContinueSearchDraft(id);
 
   return `
     <h1>Alpha Miner</h1>
@@ -815,11 +886,11 @@ async function renderAlpha() {
     ${(run.terminal_reason === "RUNTIME_EXHAUSTED" || report.terminal_reason === "RUNTIME_EXHAUSTED") ? `
     <div class="panel" id="continue_search_panel">
       <h3>Continue Search</h3>
-      <p class="sub">Resume the persistent search program without regenerating Generation 0 or repeating completed evaluations.</p>
+      <p class="sub">Resume the persistent search program without regenerating Generation 0 or repeating completed evaluations. Session runtime is the value below (not added to the prior cap).</p>
       <div class="grid" style="grid-template-columns:repeat(3,minmax(0,1fr));gap:0.5rem">
-        <label>Additional runtime (sec)<input id="cs_runtime" type="number" min="0" value="3600"/></label>
-        <label>Additional generated budget<input id="cs_gen" type="number" min="0" value="0"/></label>
-        <label>Additional Full-WFO budget<input id="cs_wfo" type="number" min="0" value="0"/></label>
+        <label>Session runtime (sec)<input id="cs_runtime" type="number" min="0" value="${csDraft.runtime}"/></label>
+        <label>Additional generated budget<input id="cs_gen" type="number" min="0" value="${csDraft.generated}"/></label>
+        <label>Additional Full-WFO budget<input id="cs_wfo" type="number" min="0" value="${csDraft.full_wfo}"/></label>
       </div>
       <p class="sub">search_program_id=${statusText((run.config_snapshot||{}).search_program_id || (run.config_snapshot||{}).multi_family?.search_program_id || report.budget_allocation?.search_program_id)} · pending by gate: ${JSON.stringify(report.budget_allocation?.pending_by_gate || {})}</p>
       <button id="cs_continue">Continue Search</button>
@@ -1133,6 +1204,8 @@ async function renderAlpha() {
 
 function scheduleAlphaRefresh(delay = 900) {
   if (!["alpha-miner", "registry"].includes(state.page) || state.alphaRefreshTimer || state.alphaRefreshInFlight) return;
+  // Terminal Alpha Miner pages stay stable — no automatic background refresh loop.
+  if (!state.alphaRunActive) return;
   state.alphaRefreshTimer = setTimeout(async () => {
     state.alphaRefreshTimer = null; state.alphaRefreshInFlight = true;
     try { await route({background:true, preserveScroll:true}); } finally { state.alphaRefreshInFlight = false; }
@@ -1144,18 +1217,25 @@ function wireAlpha() {
   if (sel) sel.onchange = () => { setRun(sel.value); route(); };
   const f = $("#cand_filter");
   if (f) f.oninput = () => { state.filter = f.value; route(); };
+  const id = state.selectedRunId;
+  wireContinueSearchDraftInputs(id);
   const cs = $("#cs_continue");
   if (cs) {
     cs.onclick = async () => {
-      const id = state.selectedRunId;
       if (!id) return;
+      // Persist visible values immediately before submit.
+      const draft = saveContinueSearchDraft(id, {
+        runtime: $("#cs_runtime")?.value,
+        generated: $("#cs_gen")?.value,
+        full_wfo: $("#cs_wfo")?.value,
+      });
       cs.disabled = true;
       try {
         const body = {
           search_mode: "EXTEND_BUDGET",
-          additional_runtime_seconds: Number($("#cs_runtime")?.value || 0),
-          additional_generated_budget: Number($("#cs_gen")?.value || 0),
-          additional_full_wfo_budget: Number($("#cs_wfo")?.value || 0),
+          additional_runtime_seconds: Number(draft.runtime),
+          additional_generated_budget: Number(draft.generated),
+          additional_full_wfo_budget: Number(draft.full_wfo),
         };
         const run = await api(`/api/runs/${id}/continue_search`, {
           method: "POST",
@@ -1177,13 +1257,13 @@ function wireAlpha() {
       route();
     };
   });
-  // SSE live updates + reconnect with after_seq
-  const id = state.selectedRunId;
+  // SSE live updates + reconnect with after_seq — only while the run is active.
   const box = $("#miner_events");
   if (!id || !box) return;
   stopSSE();
   let after = 0;
   const connect = () => {
+    if (!state.alphaRunActive) return;
     const es = new EventSource(`/api/runs/${id}/events/stream?after_seq=${after}`);
     state.sse = es;
     es.onmessage = (ev) => {
@@ -1196,18 +1276,27 @@ function wireAlpha() {
           live.textContent = `State: live update · progress ${Number(e.progress).toFixed(0)}% · ${e.event_type}`;
         }
       } catch {}
-        scheduleAlphaRefresh(650);
+      if (state.alphaRunActive) scheduleAlphaRefresh(650);
     };
-    es.addEventListener("end", () => { es.close(); scheduleAlphaRefresh(50); });
+    es.addEventListener("end", () => {
+      es.close();
+      // Do not schedule another automatic Alpha refresh for terminal runs.
+      if (state.alphaRunActive) scheduleAlphaRefresh(50);
+    });
     es.onerror = () => {
       es.close();
-      // Pull missed events, refresh, then reconnect
+      // Pull missed events, refresh, then reconnect only while active.
       api(`/api/runs/${id}/events?after_seq=${after}`).then(data => {
         for (const e of (data.events || [])) {
           after = Math.max(after, e.seq || 0);
           box.textContent = `${e.seq} [${e.event_type}] ${e.message}\n` + box.textContent;
         }
-      }).catch(() => {}).finally(() => { scheduleAlphaRefresh(100); if (state.alphaRunActive) setTimeout(connect, 1000); });
+      }).catch(() => {}).finally(() => {
+        if (state.alphaRunActive) {
+          scheduleAlphaRefresh(100);
+          setTimeout(connect, 1000);
+        }
+      });
     };
   };
   // Seed from persistence first
@@ -1215,8 +1304,10 @@ function wireAlpha() {
     const events = data.events || [];
     box.textContent = events.map(e => `${e.seq} [${e.event_type}] ${e.message}`).join("\n") || "No events";
     after = events.reduce((m, e) => Math.max(m, e.seq || 0), 0);
-    connect();
-    if (state.alphaRunActive) scheduleAlphaRefresh(1400);
+    if (state.alphaRunActive) {
+      connect();
+      scheduleAlphaRefresh(1400);
+    }
   }).catch(() => { box.textContent = "Failed to load events"; });
 }
 
