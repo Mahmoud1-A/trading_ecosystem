@@ -134,6 +134,84 @@ def create_app(manager: RunManager | None = None, *, root: Path | None = None) -
         except ConfigValidationError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/runs/{run_id}/continue_search")
+    def continue_search(run_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Resume / extend a RUNTIME_EXHAUSTED (or completed) Multi-Family search program."""
+        payload = dict(payload or {})
+        run = _mgr().store.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        if run.run_type.value != "ALPHA_MINER":
+            raise HTTPException(status_code=400, detail="continue_search only for ALPHA_MINER")
+        snap = dict(run.config_snapshot or {})
+        mf = dict(snap.get("multi_family") or {})
+        if not mf.get("enabled"):
+            raise HTTPException(status_code=400, detail="continue_search requires multi_family")
+        terminal = str(run.terminal_reason or "")
+        mode = str(payload.get("search_mode") or "RESUME_SEARCH").upper()
+        if mode == "EXTEND_BUDGET" or terminal == "RUNTIME_EXHAUSTED":
+            if mode == "RESUME_SEARCH" and terminal == "RUNTIME_EXHAUSTED":
+                mode = "EXTEND_BUDGET"
+        program_id = (
+            snap.get("search_program_id")
+            or mf.get("search_program_id")
+            or payload.get("search_program_id")
+        )
+        body = {
+            "run_type": "ALPHA_MINER",
+            "confirm_alpha_miner": True,
+            "smoke_test": bool(snap.get("smoke_test")),
+            "dataset": snap.get("dataset") or "synthetic_demo",
+            "symbols": list(snap.get("symbols") or ["ES"]),
+            "timeframe": snap.get("timeframe") or "5min",
+            "strategy_family": snap.get("strategy_family") or "multi_family_generated",
+            "random_seed": int(snap.get("random_seed") or run.random_seed or 42),
+            "search_budget": dict(snap.get("search_budget") or {}),
+            "wfo": dict(snap.get("wfo") or {}),
+            "cost_model_version": snap.get("cost_model_version") or run.cost_model_version,
+            "risk_profile": snap.get("risk_profile") or "demo",
+            "feature_set_version": snap.get("feature_set_version") or run.feature_set_version,
+            "grammar_version": snap.get("grammar_version") or run.grammar_version,
+            "ui_canary": dict(snap.get("ui_canary") or {}),
+            "multi_family": {
+                **mf,
+                "search_program_id": program_id,
+                "source_run_id": run_id,
+                "resumed_from_run_id": run_id,
+                "search_mode": mode,
+                "additional_runtime_seconds": float(
+                    payload.get("additional_runtime_seconds") or 0.0
+                ),
+                "additional_generated_budget": int(
+                    payload.get("additional_generated_budget") or 0
+                ),
+                "additional_full_wfo_budget": int(
+                    payload.get("additional_full_wfo_budget") or 0
+                ),
+            },
+            "search_mode": mode,
+            "search_program_id": program_id,
+            "source_run_id": run_id,
+            "resumed_from_run_id": run_id,
+            "additional_runtime_seconds": float(
+                payload.get("additional_runtime_seconds") or 0.0
+            ),
+            "additional_generated_budget": int(
+                payload.get("additional_generated_budget") or 0
+            ),
+            "additional_full_wfo_budget": int(
+                payload.get("additional_full_wfo_budget") or 0
+            ),
+        }
+        try:
+            req = CreateRunRequest.model_validate(body)
+            req.require_confirmations()
+            new_run = _mgr().create_run(req)
+            new_run = _mgr().enqueue(new_run.run_id)
+            return new_run.as_dict()
+        except (ValidationError, ConfigValidationError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/runs/{run_id}/events")
     def get_events(run_id: str, after_seq: int = Query(0, ge=0)) -> dict[str, Any]:
         try:

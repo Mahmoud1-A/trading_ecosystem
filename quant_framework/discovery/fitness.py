@@ -45,6 +45,23 @@ class FoldOOSMetrics:
             "n_trades": self.n_trades,
         }
 
+    @staticmethod
+    def from_dict(raw: dict[str, Any]) -> FoldOOSMetrics:
+        return FoldOOSMetrics(
+            fold_id=int(raw.get("fold_id", 0)),
+            expectancy=float(raw.get("expectancy", 0.0)),
+            sharpe=float(raw.get("sharpe", 0.0)),
+            profit_factor=float(raw.get("profit_factor", 0.0)),
+            calmar=float(raw.get("calmar", 0.0)),
+            max_drawdown=float(raw.get("max_drawdown", 0.0)),
+            drawdown_duration=float(raw.get("drawdown_duration", 0.0)),
+            worst_day=float(raw.get("worst_day", 0.0)),
+            turnover=float(raw.get("turnover", 0.0)),
+            prop_breach_prob=float(raw.get("prop_breach_prob", 0.0)),
+            regime_entropy=float(raw.get("regime_entropy", 1.0)),
+            n_trades=int(raw.get("n_trades", 0)),
+        )
+
 
 @dataclass(frozen=True)
 class FitnessResult:
@@ -64,6 +81,17 @@ class FitnessResult:
             "rejected": self.rejected,
             "rejection_reason": self.rejection_reason,
         }
+
+    @staticmethod
+    def from_dict(raw: dict[str, Any]) -> FitnessResult:
+        return FitnessResult(
+            fitness=float(raw.get("fitness", 0.0)),
+            ranking_source=str(raw.get("ranking_source") or "validation_oos"),
+            components={str(k): float(v) for k, v in (raw.get("components") or {}).items()},
+            fold_scores=tuple(float(x) for x in (raw.get("fold_scores") or ())),
+            rejected=bool(raw.get("rejected", False)),
+            rejection_reason=raw.get("rejection_reason"),
+        )
 
 
 RANKING_SOURCE_OOS = "validation_oos"

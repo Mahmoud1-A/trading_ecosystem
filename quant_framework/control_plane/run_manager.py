@@ -119,9 +119,33 @@ class RunManager:
             "hold_seconds": req.hold_seconds,
             "ui_canary": dict(req.ui_canary or {}),
             "multi_family": dict(req.multi_family or {}),
+            "search_mode": req.search_mode,
+            "search_program_id": req.search_program_id,
+            "source_run_id": req.source_run_id,
+            "resumed_from_run_id": req.resumed_from_run_id,
+            "additional_runtime_seconds": float(req.additional_runtime_seconds or 0.0),
+            "additional_generated_budget": int(req.additional_generated_budget or 0),
+            "additional_full_wfo_budget": int(req.additional_full_wfo_budget or 0),
             "environment": "research",
             "live_trading_enabled": False,
         }
+        # Enrich multi_family frozen config with search-program resume metadata.
+        mf = dict(snapshot.get("multi_family") or {})
+        if mf.get("enabled"):
+            mf["search_mode"] = req.search_mode
+            if req.search_program_id:
+                mf["search_program_id"] = req.search_program_id
+            if req.source_run_id:
+                mf["source_run_id"] = req.source_run_id
+            if req.resumed_from_run_id:
+                mf["resumed_from_run_id"] = req.resumed_from_run_id
+            if req.additional_runtime_seconds:
+                mf["additional_runtime_seconds"] = float(req.additional_runtime_seconds)
+            if req.additional_generated_budget:
+                mf["additional_generated_budget"] = int(req.additional_generated_budget)
+            if req.additional_full_wfo_budget:
+                mf["additional_full_wfo_budget"] = int(req.additional_full_wfo_budget)
+            snapshot["multi_family"] = mf
         run = build_run_record(
             run_type=req.run_type,
             system_version=cfg.system_version,

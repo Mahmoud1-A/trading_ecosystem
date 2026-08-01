@@ -65,10 +65,32 @@ class CreateRunRequest(BaseModel):
     ui_canary: dict[str, Any] = Field(default_factory=dict)
     # Multi-family Strategy Family Generator campaign (above Alpha Miner)
     multi_family: dict[str, Any] = Field(default_factory=dict)
+    # Persistent search-program resume controls
+    search_mode: str = "NEW_SEARCH"
+    search_program_id: str | None = None
+    source_run_id: str | None = None
+    resumed_from_run_id: str | None = None
+    additional_runtime_seconds: float = Field(default=0.0, ge=0.0)
+    additional_generated_budget: int = Field(default=0, ge=0)
+    additional_full_wfo_budget: int = Field(default=0, ge=0)
     # Explicitly rejected if present via validator on nested dicts
     environment: str | None = None
     trading_mode: str | None = None
     credentials: dict[str, Any] | None = None
+
+    @field_validator("search_mode")
+    @classmethod
+    def _valid_search_mode(cls, v: str) -> str:
+        allowed = {
+            "NEW_SEARCH",
+            "RESUME_SEARCH",
+            "EXTEND_BUDGET",
+            "REEVALUATE_FROZEN_CANDIDATES",
+        }
+        mode = str(v or "NEW_SEARCH").upper()
+        if mode not in allowed:
+            raise ValueError(f"search_mode must be one of {sorted(allowed)}")
+        return mode
 
     @field_validator("environment", "trading_mode")
     @classmethod

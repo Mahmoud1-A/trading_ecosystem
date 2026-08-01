@@ -68,6 +68,51 @@ class StrategyCandidate:
             "family_provenance": dict(self.family_provenance),
         }
 
+    @staticmethod
+    def from_dict(payload: dict[str, Any]) -> StrategyCandidate:
+        """Rehydrate a candidate from :meth:`as_dict` (checkpoint / registry)."""
+        from discovery.expression_tree import ExprNode
+
+        def _tree(raw: dict[str, Any] | None) -> ExprNode | None:
+            if raw is None:
+                return None
+            return ExprNode.from_dict(raw)
+
+        entry = _tree(payload["entry_tree"])
+        assert entry is not None
+        creation = payload.get("creation_method", CreationMethod.RANDOM.value)
+        if isinstance(creation, CreationMethod):
+            method = creation
+        else:
+            method = CreationMethod(str(creation))
+        return StrategyCandidate(
+            candidate_id=str(payload["candidate_id"]),
+            lineage_id=str(payload["lineage_id"]),
+            generation=int(payload.get("generation", 0)),
+            parent_ids=tuple(str(p) for p in (payload.get("parent_ids") or ())),
+            creation_method=method,
+            strategy_family=str(payload.get("strategy_family") or "dsl_generated"),
+            expression_tree=_tree(payload.get("expression_tree")) or entry,
+            entry_tree=entry,
+            exit_tree=_tree(payload.get("exit_tree")),
+            stop=_tree(payload.get("stop")),
+            target=_tree(payload.get("target")),
+            sizing=_tree(payload.get("sizing")),
+            regime_gates=tuple(
+                ExprNode.from_dict(g) for g in (payload.get("regime_gates") or [])
+            ),
+            feature_ids=tuple(str(f) for f in (payload.get("feature_ids") or ())),
+            parameters={str(k): float(v) for k, v in (payload.get("parameters") or {}).items()},
+            complexity_score=float(payload.get("complexity_score") or 0.0),
+            grammar_version=str(payload.get("grammar_version") or ""),
+            feature_set_version=str(payload.get("feature_set_version") or ""),
+            cost_model_version=str(payload.get("cost_model_version") or "cost_v1"),
+            asset_universe=tuple(str(a) for a in (payload.get("asset_universe") or ("ES",))),
+            random_seed=int(payload.get("random_seed") or 0),
+            creation_timestamp=str(payload.get("creation_timestamp") or ""),
+            family_provenance=dict(payload.get("family_provenance") or {}),
+        )
+
 
 def collect_features(*trees: ExprNode | None) -> tuple[str, ...]:
     ids: set[str] = set()

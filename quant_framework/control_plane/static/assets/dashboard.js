@@ -812,7 +812,35 @@ async function renderAlpha() {
       <p class="sub" id="live_status">State: ${run.state} · progress ${(run.progress_pct||0).toFixed(0)}% · stage ${run.current_stage || "IDLE"}</p>
     </div>
     ${isFailed ? `<div class="warn-box" style="border-color:#c0392b;background:rgba(192,57,43,0.12)"><strong style="color:#c0392b">SOFTWARE FAILURE</strong><br/>${softwareErr}<br/><span class="sub">Backend: ${statusText(report.evaluation_backend || run.summary?.evaluation_backend, "unknown")} · path: ${statusText(report.evaluation_path, report.evaluation_backend)}</span></div>` : (noFinalists && run.state === "COMPLETED" ? `<div class="warn-box"><strong>No candidate passed all mandatory Alpha Miner gates.</strong> Status: ${statusText(report.qualified_candidate_status, report.discovery_result || "NO_QUALIFIED_CANDIDATE")}<br/><span class="sub">${statusText(report.generation_cap_explanation, "")}</span></div>` : "")}
+    ${(run.terminal_reason === "RUNTIME_EXHAUSTED" || report.terminal_reason === "RUNTIME_EXHAUSTED") ? `
+    <div class="panel" id="continue_search_panel">
+      <h3>Continue Search</h3>
+      <p class="sub">Resume the persistent search program without regenerating Generation 0 or repeating completed evaluations.</p>
+      <div class="grid" style="grid-template-columns:repeat(3,minmax(0,1fr));gap:0.5rem">
+        <label>Additional runtime (sec)<input id="cs_runtime" type="number" min="0" value="3600"/></label>
+        <label>Additional generated budget<input id="cs_gen" type="number" min="0" value="0"/></label>
+        <label>Additional Full-WFO budget<input id="cs_wfo" type="number" min="0" value="0"/></label>
+      </div>
+      <p class="sub">search_program_id=${statusText((run.config_snapshot||{}).search_program_id || (run.config_snapshot||{}).multi_family?.search_program_id || report.budget_allocation?.search_program_id)} · pending by gate: ${JSON.stringify(report.budget_allocation?.pending_by_gate || {})}</p>
+      <button id="cs_continue">Continue Search</button>
+    </div>` : ""}
     <p class="sub">Backend: ${statusText(report.evaluation_backend, "unknown")} · path: ${statusText(report.evaluation_path, report.evaluation_backend)} · signal_source=${statusText(signalSource)} · is_full_event_wfo=${report.is_full_event_wfo === true} · terminal: ${statusText(report.terminal_reason)} · proxy_metric_used=${report.proxy_metric_used === true}</p>
+    ${(report.budget_allocation && (report.budget_allocation.search_program_id || report.budget_allocation.cumulative_totals)) ? `
+    <div class="panel">
+      <h3>Search program totals</h3>
+      <pre class="mono">${JSON.stringify({
+        search_program_id: report.budget_allocation.search_program_id,
+        search_mode: report.budget_allocation.search_mode,
+        compatibility_fingerprint: report.budget_allocation.compatibility_fingerprint,
+        source_run_id: report.budget_allocation.source_run_id,
+        resumed_from_run_id: report.budget_allocation.resumed_from_run_id,
+        cumulative: report.budget_allocation.cumulative_totals,
+        session: report.budget_allocation.session_totals,
+        pending_by_gate: report.budget_allocation.pending_by_gate,
+        evaluation_cache_hits: report.budget_allocation.evaluation_cache_hits,
+        evaluation_cache_misses: report.budget_allocation.evaluation_cache_misses,
+      }, null, 2)}</pre>
+    </div>` : ""}
     ${provenance && provenance.git_commit_sha ? `<div class="panel"><h3>Runtime provenance</h3><pre class="mono">${JSON.stringify({
       git_commit_sha: provenance.git_commit_sha,
       python_executable: provenance.python_executable,
@@ -1116,6 +1144,31 @@ function wireAlpha() {
   if (sel) sel.onchange = () => { setRun(sel.value); route(); };
   const f = $("#cand_filter");
   if (f) f.oninput = () => { state.filter = f.value; route(); };
+  const cs = $("#cs_continue");
+  if (cs) {
+    cs.onclick = async () => {
+      const id = state.selectedRunId;
+      if (!id) return;
+      cs.disabled = true;
+      try {
+        const body = {
+          search_mode: "EXTEND_BUDGET",
+          additional_runtime_seconds: Number($("#cs_runtime")?.value || 0),
+          additional_generated_budget: Number($("#cs_gen")?.value || 0),
+          additional_full_wfo_budget: Number($("#cs_wfo")?.value || 0),
+        };
+        const run = await api(`/api/runs/${id}/continue_search`, {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        setRun(run.run_id);
+        await route();
+      } catch (err) {
+        alert(String(err.message || err));
+        cs.disabled = false;
+      }
+    };
+  }
   document.querySelectorAll("th[data-k]").forEach(th => {
     th.onclick = () => {
       const k = th.dataset.k;

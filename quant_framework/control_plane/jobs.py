@@ -541,7 +541,65 @@ def run_alpha_miner_job(
 
     try:
         if multi_cfg is not None:
-            # Align search_budget caps with campaign totals for reporting.
+            from discovery.evaluation_cache import EvaluationCache
+            from discovery.search_checkpoint import load_checkpoint
+            from discovery.search_program import (
+                INCOMPATIBLE_FINGERPRINT,
+                SearchMode,
+                SearchProgramStore,
+                SearchSessionRecord,
+                assert_fingerprint_compatible,
+                compute_compatibility_fingerprint,
+                hash_multi_family_config,
+                hash_wfo_config,
+                new_search_program_id,
+                now_iso,
+            )
+            from discovery.search_resume import apply_budget_extension
+            from registry.hashing import sha256_json
+
+            search_mode = str(
+                run.config_snapshot.get("search_mode")
+                or (run.config_snapshot.get("multi_family") or {}).get("search_mode")
+                or SearchMode.NEW_SEARCH.value
+            ).upper()
+            mf_raw = dict(run.config_snapshot.get("multi_family") or {})
+            source_run_id = run.config_snapshot.get("source_run_id") or mf_raw.get(
+                "source_run_id"
+            )
+            resumed_from_run_id = run.config_snapshot.get("resumed_from_run_id") or mf_raw.get(
+                "resumed_from_run_id"
+            )
+            program_id = (
+                run.config_snapshot.get("search_program_id")
+                or mf_raw.get("search_program_id")
+            )
+            add_runtime = float(
+                run.config_snapshot.get("additional_runtime_seconds")
+                or mf_raw.get("additional_runtime_seconds")
+                or 0.0
+            )
+            add_gen = int(
+                run.config_snapshot.get("additional_generated_budget")
+                or mf_raw.get("additional_generated_budget")
+                or 0
+            )
+            add_wfo = int(
+                run.config_snapshot.get("additional_full_wfo_budget")
+                or mf_raw.get("additional_full_wfo_budget")
+                or 0
+            )
+            if search_mode in {
+                SearchMode.EXTEND_BUDGET.value,
+                SearchMode.RESUME_SEARCH.value,
+            }:
+                apply_budget_extension(
+                    multi_cfg,
+                    additional_runtime_seconds=add_runtime,
+                    additional_generated_budget=add_gen,
+                    additional_full_wfo_budget=add_wfo,
+                )
+            # Re-align search_budget caps after possible extension.
             budget = budget.with_overrides(
                 max_generated_candidates=multi_cfg.total_candidate_budget,
                 max_evaluated_candidates=int(
@@ -556,6 +614,124 @@ def run_alpha_miner_job(
                 stagnation_limit=multi_cfg.stagnation_generations,
                 population_size=multi_cfg.population_size,
             )
+
+            dataset_hash = str(
+                silver_meta.get("content_hash")
+                or silver_meta.get("dataset_hash")
+                or run.config_snapshot.get("dataset")
+                or "synthetic_demo"
+            )
+            wfo_hash = hash_wfo_config(run.config_snapshot.get("wfo"))
+            mf_hash = hash_multi_family_config(mf_raw)
+            code_hash = str(
+                provenance.get("git_commit_sha")
+                or provenance.get("code_hash")
+                or "local"
+            )
+            fp_components = {
+                "dataset_hash": dataset_hash,
+                "timeframe": str(timeframe),
+                "wfo_config_hash": wfo_hash,
+                "cost_model_version": str(
+                    run.config_snapshot.get("cost_model_version") or run.cost_model_version
+                ),
+                "risk_model_version": str(
+                    run.config_snapshot.get("risk_profile") or "demo"
+                ),
+                "execution_engine_code_hash": code_hash,
+            }
+            compatibility_fp = compute_compatibility_fingerprint(
+                dataset_hash=fp_components["dataset_hash"],
+                timeframe=fp_components["timeframe"],
+                wfo_config_hash=fp_components["wfo_config_hash"],
+                cost_model_version=fp_components["cost_model_version"],
+                risk_model_version=fp_components["risk_model_version"],
+                execution_engine_code_hash=fp_components["execution_engine_code_hash"],
+                multi_family_config_hash=mf_hash,
+                seed=int(multi_cfg.seed),
+                family_ids=list(multi_cfg.family_ids) if multi_cfg.family_ids else None,
+            )
+
+            program_root = Path(run.artifact_dir).resolve().parents[1] / "search_programs"
+            program_store = SearchProgramStore(program_root)
+            resume_ckpt = None
+            if search_mode == SearchMode.NEW_SEARCH.value or not program_id:
+                program_id = program_id or new_search_program_id()
+                program_store.create(
+                    compatibility_fingerprint=compatibility_fp,
+                    seed=int(multi_cfg.seed),
+                    family_ids=list(multi_cfg.family_ids) if multi_cfg.family_ids else None,
+                    search_program_id=program_id,
+                    metadata={"created_by_run_id": run.run_id},
+                )
+            else:
+                existing = program_store.get(str(program_id))
+                if existing is None:
+                    raise RuntimeError(f"unknown search_program_id={program_id!r}")
+                assert_fingerprint_compatible(
+                    existing.compatibility_fingerprint,
+                    compatibility_fp,
+                    mode=SearchMode(search_mode),
+                )
+                resume_ckpt = load_checkpoint(program_store.checkpoint_path(str(program_id)))
+                if resume_ckpt is None and source_run_id:
+                    # Bootstrap from prior run artifacts when checkpoint missing.
+                    from control_plane.search_bootstrap import (
+                        bootstrap_checkpoint_from_run,
+                    )
+
+                    art_root = Path(run.artifact_dir).resolve().parent
+                    src = art_root / str(source_run_id)
+                    resume_ckpt = bootstrap_checkpoint_from_run(
+                        src,
+                        search_program_id=str(program_id),
+                        compatibility_fingerprint=compatibility_fp,
+                        session_run_id=run.run_id,
+                        search_mode=search_mode,
+                        fingerprint_components=fp_components,
+                        source_run_id=str(source_run_id),
+                        resumed_from_run_id=str(resumed_from_run_id or source_run_id),
+                    )
+                if resume_ckpt is None and search_mode != SearchMode.NEW_SEARCH.value:
+                    raise RuntimeError(
+                        f"MISSING_SEARCH_CHECKPOINT: program={program_id!r} "
+                        f"mode={search_mode}"
+                    )
+
+            program_store.append_session(
+                str(program_id),
+                SearchSessionRecord(
+                    run_id=run.run_id,
+                    search_mode=search_mode,
+                    source_run_id=str(source_run_id) if source_run_id else None,
+                    resumed_from_run_id=(
+                        str(resumed_from_run_id) if resumed_from_run_id else None
+                    ),
+                    started_at=now_iso(),
+                ),
+            )
+            # Freeze search_program metadata into config snapshot for dashboard.
+            mf_raw = dict(run.config_snapshot.get("multi_family") or {})
+            mf_raw.update(
+                {
+                    "search_program_id": program_id,
+                    "search_mode": search_mode,
+                    "source_run_id": source_run_id,
+                    "resumed_from_run_id": resumed_from_run_id,
+                    "compatibility_fingerprint": compatibility_fp,
+                    "fingerprint_components": fp_components,
+                }
+            )
+            run.config_snapshot["multi_family"] = mf_raw
+            run.config_snapshot["search_program_id"] = program_id
+            run.config_snapshot["search_mode"] = search_mode
+            run.config_hash = "cfg_" + sha256_json(run.config_snapshot)[:24]
+            if on_update is not None:
+                on_update(run)
+
+            eval_cache = EvaluationCache(program_store.evaluation_cache_dir(str(program_id)))
+            ckpt_path = program_store.checkpoint_path(str(program_id))
+
             campaign = MultiFamilyCampaign(
                 config=multi_cfg,
                 registry=registry,
@@ -563,6 +739,21 @@ def run_alpha_miner_job(
                 system_version=run.system_version,
                 discovery_run_id=run.run_id,
                 progress_hook=progress_hook,
+                research_eligible=bool(research_eligible),
+                search_program_id=str(program_id),
+                search_mode=search_mode,
+                compatibility_fingerprint=compatibility_fp,
+                fingerprint_components=fp_components,
+                checkpoint_path=ckpt_path,
+                evaluation_cache=eval_cache,
+                resume_checkpoint=resume_ckpt,
+                source_run_id=str(source_run_id) if source_run_id else None,
+                resumed_from_run_id=(
+                    str(resumed_from_run_id) if resumed_from_run_id else None
+                ),
+                reevaluate_invalidate_cache=(
+                    search_mode == SearchMode.REEVALUATE_FROZEN_CANDIDATES.value
+                ),
             )
 
             def _campaign_progress(name: str, payload: dict[str, Any]) -> None:
@@ -574,7 +765,31 @@ def run_alpha_miner_job(
                 progress_hook(name, payload)
 
             campaign.progress_hook = _campaign_progress
-            campaign_result = campaign.run()
+            try:
+                campaign_result = campaign.run()
+            except ValueError as exc:
+                if INCOMPATIBLE_FINGERPRINT in str(exc):
+                    run.state = RunState.FAILED
+                    run.software_success = False
+                    run.terminal_reason = INCOMPATIBLE_FINGERPRINT
+                    _emit(
+                        sink,
+                        run,
+                        EventType.RUN_FAILED,
+                        str(exc),
+                        severity=EventSeverity.ERROR,
+                    )
+                    return run
+                raise
+            # Persist cumulative program totals after session.
+            if campaign._live_checkpoint is not None:  # noqa: SLF001
+                program_store.update_cumulative(
+                    str(program_id),
+                    generated=campaign._live_checkpoint.campaign_generated,  # noqa: SLF001
+                    evaluated=campaign._live_checkpoint.campaign_evaluated,  # noqa: SLF001
+                    full_wfo=campaign._live_checkpoint.campaign_full_wfo,  # noqa: SLF001
+                    checkpoint_path=str(ckpt_path),
+                )
             # Aggregate counters / discovery result for the existing report builder.
             ctrl_counters = BudgetCounters()
             all_records: list[Any] = []

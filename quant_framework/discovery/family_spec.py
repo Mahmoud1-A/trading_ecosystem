@@ -73,6 +73,28 @@ class FamilySpec:
             "provenance": dict(self.provenance),
         }
 
+    @staticmethod
+    def from_dict(raw: dict[str, Any]) -> FamilySpec:
+        ranges = raw.get("parameter_ranges") or {}
+        param_ranges = {
+            str(k): (float(v[0]), float(v[1])) for k, v in ranges.items()
+        }
+        return FamilySpec(
+            family_id=str(raw["family_id"]),
+            hypothesis=str(raw.get("hypothesis") or ""),
+            allowed_features=tuple(str(x) for x in (raw.get("allowed_features") or ())),
+            allowed_operators=tuple(str(x) for x in (raw.get("allowed_operators") or ())),
+            entry_patterns=tuple(str(x) for x in (raw.get("entry_patterns") or ())),
+            exit_patterns=tuple(str(x) for x in (raw.get("exit_patterns") or ())),
+            regime_constraints=tuple(str(x) for x in (raw.get("regime_constraints") or ())),
+            parameter_ranges=param_ranges,
+            complexity_limits={
+                str(k): int(v) for k, v in (raw.get("complexity_limits") or {}).items()
+            },
+            random_seed=int(raw.get("random_seed") or 0),
+            provenance=dict(raw.get("provenance") or {}),
+        )
+
     def to_grammar(self) -> Grammar:
         leaf_by_id = {leaf.feature_id: leaf for leaf in DEFAULT_FEATURE_LEAVES}
         leaves: list[FeatureLeaf] = []

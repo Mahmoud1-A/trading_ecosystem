@@ -1493,6 +1493,16 @@ class MultiFamilyCampaign:
         synthetic_stress_forbidden: bool | None = None,
         stress_backend_factory: Callable[[str], Any] | None = None,
         synthetic_robustness_forbidden: bool | None = None,
+        search_program_id: str | None = None,
+        search_mode: str = "NEW_SEARCH",
+        compatibility_fingerprint: str | None = None,
+        fingerprint_components: dict[str, str] | None = None,
+        checkpoint_path: Any | None = None,
+        evaluation_cache: Any | None = None,
+        resume_checkpoint: Any | None = None,
+        source_run_id: str | None = None,
+        resumed_from_run_id: str | None = None,
+        reevaluate_invalidate_cache: bool = False,
     ) -> None:
         self.config = config
         self.registry = registry
@@ -1527,6 +1537,27 @@ class MultiFamilyCampaign:
         self.shortlist_rejects: list[ShortlistRejectRecord] = []
         self.research_shortlist_entries: list[ResearchShortlistEntry] = []
         self.population_stats: dict[str, Any] = {}
+        # Persistent search-program resume state
+        from discovery.search_program import SearchMode, new_search_program_id
+
+        self.search_program_id = search_program_id or new_search_program_id()
+        self.search_mode = str(search_mode or SearchMode.NEW_SEARCH.value)
+        self.compatibility_fingerprint = compatibility_fingerprint or ""
+        self.fingerprint_components = dict(fingerprint_components or {})
+        self.checkpoint_path = checkpoint_path
+        self.evaluation_cache = evaluation_cache
+        self.resume_checkpoint = resume_checkpoint
+        self.source_run_id = source_run_id
+        self.resumed_from_run_id = resumed_from_run_id
+        self.reevaluate_invalidate_cache = bool(reevaluate_invalidate_cache)
+        self._live_checkpoint = resume_checkpoint
+        self._session_generated = 0
+        self._session_evaluated = 0
+        self._session_full_wfo = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
+        if self.reevaluate_invalidate_cache and self.evaluation_cache is not None:
+            self.evaluation_cache.invalidate_all()
 
     def _emit(self, name: str, payload: dict[str, Any] | None = None) -> None:
         if self.progress_hook is not None:
@@ -2011,6 +2042,8 @@ class MultiFamilyCampaign:
         records_by_family: dict[str, list[EvaluationRecord]],
         cand_by_id: dict[str, StrategyCandidate],
         t0: float,
+        only_candidate_ids: set[str] | None = None,
+        skip_candidate_ids: set[str] | None = None,
     ) -> CampaignStressAccounting:
         """Connect Score Qualified candidates to the real Stress pipeline."""
         cfg = self.config
@@ -2041,12 +2074,23 @@ class MultiFamilyCampaign:
             budget=budget, counters=counters
         )
 
+        already_done = set(skip_candidate_ids or set())
+        already_done.update(
+            s.candidate_id
+            for s in self.candidate_stress_summaries
+            if s.final_decision in {STRESS_PASSED, STRESS_FAILED}
+        )
+
         # Deterministic order: family_id then candidate_id.
         ordered: list[tuple[str, EvaluationRecord, StrategyCandidate]] = []
         for spec in sorted(families, key=lambda s: s.family_id):
             for rec in records_by_family.get(spec.family_id, []):
                 cand = cand_by_id.get(rec.candidate_id)
                 if cand is None:
+                    continue
+                if rec.candidate_id in already_done:
+                    continue
+                if only_candidate_ids is not None and rec.candidate_id not in only_candidate_ids:
                     continue
                 ordered.append((spec.family_id, rec, cand))
         ordered.sort(key=lambda t: (t[0], t[1].candidate_id))
@@ -2057,6 +2101,8 @@ class MultiFamilyCampaign:
                 "scenarios": list(chosen),
                 "max_stress_evaluations": accounting.max_stress_evaluations,
                 "bind_error": bind_error,
+                "pending_count": len(ordered),
+                "resume_filtered": only_candidate_ids is not None,
             },
         )
 
@@ -2434,6 +2480,8 @@ class MultiFamilyCampaign:
         cand_by_id: dict[str, StrategyCandidate],
         t0: float,
         stress_pipeline_complete: bool,
+        only_candidate_ids: set[str] | None = None,
+        skip_candidate_ids: set[str] | None = None,
     ) -> CampaignRobustnessAccounting:
         """Connect STRESS_PASSED candidates to real Parameter Robustness."""
         cfg = self.config
@@ -2448,12 +2496,24 @@ class MultiFamilyCampaign:
         probe, bind_error, backend_kind = self._resolve_robustness_probe(counters=counters)
         stress_by_id = {s.candidate_id: s for s in self.candidate_stress_summaries}
         family_by_id = {f.family_id: f for f in families}
+        _ = family_by_id
+
+        already_done = set(skip_candidate_ids or set())
+        already_done.update(
+            s.candidate_id
+            for s in self.candidate_robustness_summaries
+            if s.final_decision in {ROBUSTNESS_PASSED, ROBUSTNESS_FAILED}
+        )
 
         ordered: list[tuple[str, EvaluationRecord, StrategyCandidate]] = []
         for spec in sorted(families, key=lambda s: s.family_id):
             for rec in records_by_family.get(spec.family_id, []):
                 cand = cand_by_id.get(rec.candidate_id)
                 if cand is None:
+                    continue
+                if rec.candidate_id in already_done:
+                    continue
+                if only_candidate_ids is not None and rec.candidate_id not in only_candidate_ids:
                     continue
                 ordered.append((spec.family_id, rec, cand))
         ordered.sort(key=lambda t: (t[0], t[1].candidate_id))
@@ -2464,6 +2524,8 @@ class MultiFamilyCampaign:
                 "max_robustness_candidates": accounting.max_robustness_candidates,
                 "max_robustness_evaluations": accounting.max_robustness_evaluations,
                 "bind_error": bind_error,
+                "pending_count": len(ordered),
+                "resume_filtered": only_candidate_ids is not None,
             },
         )
 
@@ -3296,11 +3358,160 @@ class MultiFamilyCampaign:
         full_wfo_counts: dict[str, int],
         fid: str,
     ) -> EvaluationRecord:
+        from discovery.evaluation_cache import (
+            EvaluationCacheEntry,
+            build_evaluation_cache_key,
+        )
+        from discovery.search_program import SearchMode, now_iso
+
+        cache_key = None
+        if (
+            self.evaluation_cache is not None
+            and self.search_mode != SearchMode.REEVALUATE_FROZEN_CANDIDATES.value
+            and self.fingerprint_components
+        ):
+            cache_key = build_evaluation_cache_key(
+                candidate_canonical_hash=cand.candidate_id,
+                dataset_hash=str(self.fingerprint_components.get("dataset_hash") or ""),
+                timeframe=str(self.fingerprint_components.get("timeframe") or ""),
+                wfo_config_hash=str(
+                    self.fingerprint_components.get("wfo_config_hash") or ""
+                ),
+                cost_model_version=str(
+                    self.fingerprint_components.get("cost_model_version") or ""
+                ),
+                risk_model_version=str(
+                    self.fingerprint_components.get("risk_model_version") or ""
+                ),
+                execution_engine_code_hash=str(
+                    self.fingerprint_components.get("execution_engine_code_hash") or ""
+                ),
+            )
+            hit = self.evaluation_cache.get(cache_key)
+            if hit is not None:
+                self._cache_hits += 1
+                rec = EvaluationRecord.from_dict(hit.evaluation_record)
+                # Restore Full-WFO counter accounting without re-running WFO.
+                meta = dict(rec.meta or {})
+                if meta.get("is_full_event_wfo") or (
+                    isinstance(rec.train_metrics, dict)
+                    and rec.train_metrics.get("is_full_event_wfo")
+                ):
+                    full_wfo_counts[fid] = full_wfo_counts.get(fid, 0) + 1
+                elif rec.outcome is EvalOutcome.REGISTERED and rec.oos_folds:
+                    # Honest Full-WFO completed trials always carry fold evidence.
+                    proof_ok = False
+                    if isinstance(rec.meta, dict):
+                        baseline = rec.meta.get("baseline_wfo_artifacts") or {}
+                        proof_ok = bool(baseline.get("is_full_event_wfo"))
+                    if proof_ok or (rec.fitness is not None):
+                        # Prefer explicit proof; fall back for synthetic tests.
+                        if proof_ok or getattr(self.backend, "is_full_event_wfo", False):
+                            full_wfo_counts[fid] = full_wfo_counts.get(fid, 0) + 1
+                return rec
+
         prev_full_wfo = ev.counters.full_wfo
         rec = ev.evaluate(cand)
         if ev.counters.full_wfo > prev_full_wfo:
             full_wfo_counts[fid] = full_wfo_counts.get(fid, 0) + 1
+        self._cache_misses += 1
+        if cache_key is not None and self.evaluation_cache is not None:
+            self.evaluation_cache.put(
+                EvaluationCacheEntry(
+                    cache_key=cache_key,
+                    candidate_id=cand.candidate_id,
+                    candidate_canonical_hash=cand.candidate_id,
+                    evaluation_record=rec.as_dict(),
+                    created_at=now_iso(),
+                    fingerprint_components=dict(self.fingerprint_components),
+                )
+            )
         return rec
+
+    def _persist_live_checkpoint(self) -> None:
+        if self.checkpoint_path is None or self._live_checkpoint is None:
+            return
+        from discovery.search_checkpoint import save_checkpoint
+
+        save_checkpoint(self.checkpoint_path, self._live_checkpoint)
+        self._emit(
+            "SEARCH_CHECKPOINT_SAVED",
+            {
+                "search_program_id": self.search_program_id,
+                "pipeline_phase": self._live_checkpoint.pipeline_phase,
+                "campaign_evaluated": self._live_checkpoint.campaign_evaluated,
+                "pending_by_gate": self._live_checkpoint.pending_by_gate(),
+            },
+        )
+
+    def _ensure_live_checkpoint(self, *, families: list[FamilySpec]) -> Any:
+        from discovery.search_resume import empty_checkpoint
+
+        if self._live_checkpoint is not None:
+            return self._live_checkpoint
+        ckpt = empty_checkpoint(
+            search_program_id=self.search_program_id,
+            compatibility_fingerprint=self.compatibility_fingerprint,
+            session_run_id=self.discovery_run_id,
+            search_mode=self.search_mode,
+            seed=int(self.config.seed),
+            config=self.config.as_dict(),
+            fingerprint_components=self.fingerprint_components,
+            source_run_id=self.source_run_id,
+            resumed_from_run_id=self.resumed_from_run_id,
+            budget_caps={
+                "total_candidate_budget": self.config.total_candidate_budget,
+                "max_full_wfo": self.config.max_full_wfo,
+                "max_runtime_seconds": self.config.max_runtime_seconds,
+                "max_evaluated_candidates": self.config.max_evaluated_candidates,
+            },
+        )
+        ckpt.family_specs = [f.as_dict() for f in families]
+        self._live_checkpoint = ckpt
+        return ckpt
+
+    def _checkpoint_after_candidate(
+        self,
+        *,
+        families: list[FamilySpec],
+        cand: StrategyCandidate,
+        rec: EvaluationRecord,
+        fid: str,
+        gate: str,
+        campaign_generated: int,
+        campaign_evaluated: int,
+        campaign_full_wfo: int,
+        family_states_payload: dict[str, Any] | None = None,
+        pending_eval_ids: list[str] | None = None,
+    ) -> None:
+        from discovery.search_resume import mark_score_qualified_pending
+
+        ckpt = self._ensure_live_checkpoint(families=families)
+        ckpt.candidates[cand.candidate_id] = cand.as_dict()
+        ckpt.evaluation_records[cand.candidate_id] = rec.as_dict()
+        ckpt.candidate_gates[cand.candidate_id] = gate
+        ckpt.campaign_generated = int(campaign_generated)
+        ckpt.campaign_evaluated = int(campaign_evaluated)
+        ckpt.campaign_full_wfo = int(campaign_full_wfo)
+        ckpt.session_generated = int(self._session_generated)
+        ckpt.session_evaluated = int(self._session_evaluated)
+        ckpt.session_full_wfo = int(self._session_full_wfo)
+        ckpt.status_history = [e.as_dict() for e in self.candidate_status_history]
+        ckpt.status_seq = int(self._status_seq)
+        if cand.candidate_id not in ckpt.trial_population_candidate_ids:
+            ckpt.trial_population_candidate_ids.append(cand.candidate_id)
+        if family_states_payload:
+            from discovery.search_checkpoint import FamilyCheckpointState
+
+            for fam_id, payload in family_states_payload.items():
+                if isinstance(payload, FamilyCheckpointState):
+                    ckpt.family_states[fam_id] = payload
+                elif isinstance(payload, dict):
+                    ckpt.family_states[fam_id] = FamilyCheckpointState.from_dict(payload)
+        if pending_eval_ids is not None:
+            ckpt.pending_eval_ids = list(pending_eval_ids)
+        mark_score_qualified_pending(ckpt)
+        self._persist_live_checkpoint()
 
     def _force_generation_zero(self, cand: StrategyCandidate) -> StrategyCandidate:
         if cand.generation == 0 and not cand.parent_ids:
@@ -3551,6 +3762,319 @@ class MultiFamilyCampaign:
         )
         stop_reason = "multi_family_evolutionary_robustness_screening_completed"
         completed_generation_count = 0
+        skip_evolution_loop = False
+        resume_pending_stress: set[str] | None = None
+        resume_pending_robustness: set[str] | None = None
+
+        from discovery.search_program import PipelinePhase, SearchMode
+        from discovery.search_resume import (
+            choose_resume_phase,
+            mark_score_qualified_pending,
+            rebuild_candidates,
+            rebuild_families,
+            rebuild_records_by_family,
+            sync_pending_gate_queues,
+        )
+        from discovery.search_checkpoint import FamilyCheckpointState
+
+        resuming = (
+            self.resume_checkpoint is not None
+            and self.search_mode
+            in {
+                SearchMode.RESUME_SEARCH.value,
+                SearchMode.EXTEND_BUDGET.value,
+                SearchMode.REEVALUATE_FROZEN_CANDIDATES.value,
+            }
+        )
+        if resuming:
+            ckpt = self.resume_checkpoint
+            assert ckpt is not None
+            self._live_checkpoint = ckpt
+            ckpt.session_run_id = self.discovery_run_id
+            ckpt.resumed_from_run_id = self.resumed_from_run_id or ckpt.session_run_id
+            ckpt.source_run_id = self.source_run_id or ckpt.source_run_id
+            ckpt.search_mode = self.search_mode
+            ckpt.session_generated = 0
+            ckpt.session_evaluated = 0
+            ckpt.session_full_wfo = 0
+            # Never regenerate Generation 0 — restore candidates and lineage.
+            restored_families = rebuild_families(ckpt) if ckpt.family_specs else families
+            if restored_families:
+                families = restored_families
+                family_ids = [f.family_id for f in families]
+            cand_by_id = rebuild_candidates(ckpt)
+            seen_ids = set(cand_by_id.keys())
+            records_by_family = rebuild_records_by_family(ckpt, families, cand_by_id)
+            for fid in family_ids:
+                records_by_family.setdefault(fid, [])
+            campaign_generated = int(ckpt.campaign_generated)
+            campaign_evaluated = int(ckpt.campaign_evaluated)
+            campaign_full_wfo = int(ckpt.campaign_full_wfo)
+            evo_reallocation_pool = int(ckpt.evo_reallocation_pool)
+            completed_generation_count = int(ckpt.completed_generation_count)
+            generation_records = [
+                GenerationRecord(
+                    family_id=str(g["family_id"]),
+                    generation=int(g.get("generation") or 0),
+                    input_population_ids=list(g.get("input_population_ids") or []),
+                    evaluated_candidate_ids=list(g.get("evaluated_candidate_ids") or []),
+                    selected_parent_ids=list(g.get("selected_parent_ids") or []),
+                    mutation_candidate_ids=list(g.get("mutation_candidate_ids") or []),
+                    crossover_candidate_ids=list(g.get("crossover_candidate_ids") or []),
+                    completed_full_wfo_candidate_ids=list(
+                        g.get("completed_full_wfo_candidate_ids") or []
+                    ),
+                    score_qualified_candidate_ids=list(
+                        g.get("score_qualified_candidate_ids") or []
+                    ),
+                    best_generation_score=g.get("best_generation_score"),
+                    best_score_so_far=g.get("best_score_so_far"),
+                    generated_count=int(g.get("generated_count") or 0),
+                    evaluated_count=int(g.get("evaluated_count") or 0),
+                    completed_full_wfo_count=int(g.get("completed_full_wfo_count") or 0),
+                    stagnation_count=int(g.get("stagnation_count") or 0),
+                    stop_reason=g.get("stop_reason"),
+                    previous_best_score=g.get("previous_best_score"),
+                    generation_best_score=g.get("generation_best_score"),
+                    improvement=g.get("improvement"),
+                    minimum_required_improvement=g.get("minimum_required_improvement"),
+                    parent_selection_reasons=dict(g.get("parent_selection_reasons") or {}),
+                    parent_eligibility=dict(g.get("parent_eligibility") or {}),
+                    rejected_descendants=list(g.get("rejected_descendants") or []),
+                )
+                for g in ckpt.generation_records
+            ]
+            if ckpt.status_history and not self.candidate_status_history:
+                self._status_seq = int(ckpt.status_seq)
+                self.candidate_status_history = [
+                    CandidateStatusEvent(
+                        sequence=int(e["sequence"]),
+                        candidate_id=str(e["candidate_id"]),
+                        family_id=str(e["family_id"]),
+                        generation=int(e.get("generation") or 0),
+                        prior_status=str(e.get("prior_status") or ""),
+                        new_status=str(e.get("new_status") or ""),
+                        reason=str(e.get("reason") or ""),
+                        artifact_refs=dict(e.get("artifact_refs") or {}),
+                    )
+                    for e in ckpt.status_history
+                ]
+            for fid, fst in ckpt.family_states.items():
+                generated_counts[fid] = int(fst.generated_count)
+                generation_0_counts[fid] = int(fst.generation_0_count)
+                descendant_counts[fid] = int(fst.descendant_count)
+                mutation_counts[fid] = int(fst.mutation_count)
+                crossover_counts[fid] = int(fst.crossover_count)
+                full_wfo_counts[fid] = int(fst.full_wfo_count)
+                highest_generation[fid] = int(fst.highest_generation)
+                structural_parents_found[fid] = int(fst.structural_parents_found)
+                family_stop_reasons[fid] = fst.family_stop_reason
+                family_gen_caps[fid] = int(fst.family_gen_cap or family_gen_caps.get(fid, 0))
+                if fst.family_wfo_cap:
+                    wfo_alloc[fid] = int(fst.family_wfo_cap)
+                descendant_reject_counts[fid] = dict(fst.descendant_reject_counts)
+            # Restore prior gate summaries so DSR/PBO population stays cumulative.
+            if ckpt.stress_summaries and not self.candidate_stress_summaries:
+                for s in ckpt.stress_summaries:
+                    self.candidate_stress_summaries.append(
+                        CandidateStressSummary(
+                            candidate_id=str(s["candidate_id"]),
+                            family_id=str(s.get("family_id") or ""),
+                            generation=int(s.get("generation") or 0),
+                            lineage=dict(s.get("lineage") or {}),
+                            score_qualified_proof=dict(s.get("score_qualified_proof") or {}),
+                            backend_kind=str(s.get("backend_kind") or ""),
+                            research_eligible=bool(s.get("research_eligible")),
+                            final_decision=str(s.get("final_decision") or STRESS_NOT_ENTERED),
+                            final_reason=str(s.get("final_reason") or ""),
+                        )
+                    )
+            if ckpt.robustness_summaries and not self.candidate_robustness_summaries:
+                for s in ckpt.robustness_summaries:
+                    self.candidate_robustness_summaries.append(
+                        CandidateRobustnessSummary(
+                            candidate_id=str(s["candidate_id"]),
+                            family_id=str(s.get("family_id") or ""),
+                            generation=int(s.get("generation") or 0),
+                            lineage=dict(s.get("lineage") or {}),
+                            stress_passed_proof=dict(s.get("stress_passed_proof") or {}),
+                            backend_kind=str(s.get("backend_kind") or ""),
+                            research_eligible=bool(s.get("research_eligible")),
+                            final_decision=str(
+                                s.get("final_decision") or ROBUSTNESS_NOT_ENTERED
+                            ),
+                            final_reason=str(s.get("final_reason") or ""),
+                        )
+                    )
+            mark_score_qualified_pending(ckpt)
+            phase = choose_resume_phase(ckpt)
+            ckpt.pipeline_phase = phase.value
+            resume_pending_stress = set(ckpt.pending_stress_ids)
+            resume_pending_robustness = set(ckpt.pending_robustness_ids)
+            self._emit(
+                "SEARCH_RESUME_STARTED",
+                {
+                    "search_program_id": self.search_program_id,
+                    "search_mode": self.search_mode,
+                    "phase": phase.value,
+                    "pending_by_gate": ckpt.pending_by_gate(),
+                    "generation_0_regenerated": False,
+                    "cache_reuse": self.search_mode
+                    != SearchMode.REEVALUATE_FROZEN_CANDIDATES.value,
+                },
+            )
+            # Priority: Stress → Robustness → Statistics before new evolution.
+            if resume_pending_stress:
+                self._run_stress_phase(
+                    families=families,
+                    records_by_family=records_by_family,
+                    cand_by_id=cand_by_id,
+                    t0=t0,
+                    only_candidate_ids=resume_pending_stress,
+                )
+                for s in self.candidate_stress_summaries:
+                    ckpt.candidate_gates[s.candidate_id] = s.final_decision
+                ckpt.stress_summaries = [s.as_dict() for s in self.candidate_stress_summaries]
+                sync_pending_gate_queues(ckpt)
+                resume_pending_robustness = set(ckpt.pending_robustness_ids)
+                self._persist_live_checkpoint()
+            if resume_pending_robustness or ckpt.pending_robustness_ids:
+                self._run_robustness_phase(
+                    families=families,
+                    records_by_family=records_by_family,
+                    cand_by_id=cand_by_id,
+                    t0=t0,
+                    stress_pipeline_complete=True,
+                    only_candidate_ids=set(ckpt.pending_robustness_ids)
+                    or resume_pending_robustness,
+                )
+                for s in self.candidate_robustness_summaries:
+                    ckpt.candidate_gates[s.candidate_id] = s.final_decision
+                ckpt.robustness_summaries = [
+                    s.as_dict() for s in self.candidate_robustness_summaries
+                ]
+                sync_pending_gate_queues(ckpt)
+                self._persist_live_checkpoint()
+            if ckpt.pending_statistics_ids or any(
+                s.final_decision == ROBUSTNESS_PASSED
+                for s in self.candidate_robustness_summaries
+            ):
+                shortlist_phase = self._run_statistics_clustering_shortlist_phase(
+                    families=families,
+                    records_by_family=records_by_family,
+                    cand_by_id=cand_by_id,
+                    robustness_pipeline_complete=True,
+                )
+                ckpt.statistics_summaries = [
+                    s.as_dict() for s in shortlist_phase.statistics_summaries
+                ]
+                ckpt.clusters = list(shortlist_phase.clusters)
+                ckpt.behavioral_signatures = list(shortlist_phase.behavioral_signatures)
+                ckpt.research_shortlist = [
+                    e.as_dict() if hasattr(e, "as_dict") else e
+                    for e in shortlist_phase.research_shortlist
+                ]
+                ckpt.shortlist_rejects = [
+                    r.as_dict() if hasattr(r, "as_dict") else r
+                    for r in shortlist_phase.shortlist_rejects
+                ]
+                ckpt.population_stats = dict(shortlist_phase.population_stats or {})
+                # Merge historical trials into cumulative DSR population ids.
+                for cid in list(cand_by_id.keys()):
+                    if cid not in ckpt.trial_population_candidate_ids:
+                        ckpt.trial_population_candidate_ids.append(cid)
+                sync_pending_gate_queues(ckpt)
+                self._persist_live_checkpoint()
+            # Complete generated-but-unevaluated before breeding further.
+            if ckpt.pending_eval_ids:
+                for cid in list(ckpt.pending_eval_ids):
+                    if time.perf_counter() - t0 >= float(cfg.max_runtime_seconds):
+                        stop_reason = "max_runtime_seconds"
+                        break
+                    if campaign_evaluated >= max_evaluated:
+                        stop_reason = "max_evaluated_candidates"
+                        break
+                    if campaign_full_wfo >= cfg.max_full_wfo:
+                        stop_reason = "max_full_wfo"
+                        break
+                    cand = cand_by_id.get(cid)
+                    if cand is None:
+                        continue
+                    fid = str(
+                        (cand.family_provenance or {}).get("family_id") or cand.strategy_family
+                    )
+                    spec = next((f for f in families if f.family_id == fid), None)
+                    if spec is None:
+                        continue
+                    ev = self._make_evaluator(
+                        spec=spec,
+                        wfo_cap=max(1, int(wfo_alloc.get(fid, 1)) - full_wfo_counts.get(fid, 0)),
+                        gen_cap=max(1, family_gen_caps.get(fid, 1)),
+                    )
+                    self._bind_evaluator_features(ev)
+                    prev_wfo = full_wfo_counts.get(fid, 0)
+                    rec = self._evaluate_candidate(
+                        ev=ev, cand=cand, full_wfo_counts=full_wfo_counts, fid=fid
+                    )
+                    records_by_family.setdefault(fid, []).append(rec)
+                    campaign_evaluated += 1
+                    self._session_evaluated += 1
+                    if full_wfo_counts.get(fid, 0) > prev_wfo:
+                        campaign_full_wfo += full_wfo_counts[fid] - prev_wfo
+                        self._session_full_wfo += full_wfo_counts[fid] - prev_wfo
+                    parent_status, is_sq, _ = self.classify_parent_eligibility(rec)
+                    gate = SCORE_QUALIFIED if is_sq else parent_status
+                    if pending_eval_ids := [
+                        x for x in ckpt.pending_eval_ids if x != cid
+                    ]:
+                        pass
+                    ckpt.pending_eval_ids = [x for x in ckpt.pending_eval_ids if x != cid]
+                    if fid in ckpt.family_states:
+                        ckpt.family_states[fid].pending_eval_ids = [
+                            x
+                            for x in ckpt.family_states[fid].pending_eval_ids
+                            if x != cid
+                        ]
+                        if cid not in ckpt.family_states[fid].evaluated_ids:
+                            ckpt.family_states[fid].evaluated_ids.append(cid)
+                    self._checkpoint_after_candidate(
+                        families=families,
+                        cand=cand,
+                        rec=rec,
+                        fid=fid,
+                        gate=gate,
+                        campaign_generated=campaign_generated,
+                        campaign_evaluated=campaign_evaluated,
+                        campaign_full_wfo=campaign_full_wfo,
+                    )
+                    _ = pending_eval_ids
+                # After completing pending evals, run any newly score-qualified stress.
+                mark_score_qualified_pending(ckpt)
+                if ckpt.pending_stress_ids:
+                    self._run_stress_phase(
+                        families=families,
+                        records_by_family=records_by_family,
+                        cand_by_id=cand_by_id,
+                        t0=t0,
+                        only_candidate_ids=set(ckpt.pending_stress_ids),
+                    )
+                    ckpt.stress_summaries = [
+                        s.as_dict() for s in self.candidate_stress_summaries
+                    ]
+                    self._persist_live_checkpoint()
+            # Continue family-local evolution only after pending gates/evals.
+            skip_evolution_loop = False
+            # Families that still have room continue below with restored queues.
+            self._emit(
+                "SEARCH_RESUME_GATES_DRAINED",
+                {
+                    "pending_by_gate": ckpt.pending_by_gate(),
+                    "campaign_evaluated": campaign_evaluated,
+                    "session_evaluated": self._session_evaluated,
+                    "cache_hits": self._cache_hits,
+                    "cache_misses": self._cache_misses,
+                },
+            )
 
         self._emit(
             "MULTI_FAMILY_EVOLUTION_STARTED",
@@ -3562,9 +4086,15 @@ class MultiFamilyCampaign:
                 "evolutionary_alloc": dict(evolutionary_alloc),
                 "initial_population_budget": initial_population_budget,
                 "evolutionary_candidate_budget": evolutionary_candidate_budget,
+                "resuming": resuming,
+                "search_program_id": self.search_program_id,
             },
         )
 
+        if skip_evolution_loop:
+            pass  # gates-only resume already handled
+        else:
+            self._ensure_live_checkpoint(families=families)
         for spec in families:
             fid = spec.family_id
             grammar = spec.to_grammar()
@@ -3585,34 +4115,120 @@ class MultiFamilyCampaign:
                     wfo_reserve_for_descendants = 0
 
             # --- Generation 0 queue (initial population only) ---
-            gen_queues: dict[int, list[StrategyCandidate]] = {
-                0: self._generate_initial_population(
+            gen_queues: dict[int, list[StrategyCandidate]] = {}
+            restored_fst = (
+                self._live_checkpoint.family_states.get(fid)
+                if self._live_checkpoint is not None
+                else None
+            )
+            existing_gen0 = [
+                c
+                for c in cand_by_id.values()
+                if c.generation == 0
+                and (
+                    (c.family_provenance or {}).get("family_id") == fid
+                    or c.strategy_family == fid
+                )
+            ]
+            if resuming and (
+                (restored_fst is not None and restored_fst.generation_0_complete)
+                or existing_gen0
+            ):
+                # Never regenerate Generation 0 on resume.
+                gen_queues[0] = []
+                if restored_fst is not None:
+                    for gid_str, ids in restored_fst.gen_queues.items():
+                        gen = int(gid_str)
+                        gen_queues[gen] = [
+                            cand_by_id[cid] for cid in ids if cid in cand_by_id
+                        ]
+                if not gen_queues.get(0):
+                    gen_queues[0] = list(existing_gen0)
+                    if restored_fst is not None:
+                        for cid in restored_fst.pending_eval_ids:
+                            c = cand_by_id.get(cid)
+                            if c is not None and c.generation == 0 and c not in gen_queues[0]:
+                                gen_queues[0].append(c)
+                if restored_fst is not None:
+                    generated_counts[fid] = int(restored_fst.generated_count)
+                    generation_0_counts[fid] = int(
+                        restored_fst.generation_0_count or len(gen_queues[0])
+                    )
+                    highest_generation[fid] = int(restored_fst.highest_generation)
+                else:
+                    generated_counts[fid] = max(
+                        generated_counts.get(fid, 0), len(existing_gen0)
+                    )
+                    generation_0_counts[fid] = len(gen_queues[0])
+                    highest_generation[fid] = max(
+                        (c.generation for c in cand_by_id.values()), default=0
+                    )
+            else:
+                gen_queues[0] = self._generate_initial_population(
                     spec=spec,
                     target=initial_n,
                     seen=seen_ids,
                     budget_consumed_start=campaign_generated,
                 )
-            }
-            if len(gen_queues[0]) < initial_n:
-                raise RuntimeError(
-                    f"FAMILY_GENERATION_SHORTFALL: {fid} produced {len(gen_queues[0])} "
-                    f"< initial_candidates_per_family={initial_n}"
-                )
-            generated_counts[fid] = len(gen_queues[0])
-            generation_0_counts[fid] = len(gen_queues[0])
-            campaign_generated += len(gen_queues[0])
-            for c in gen_queues[0]:
-                cand_by_id[c.candidate_id] = c
-            highest_generation[fid] = 0
+                if len(gen_queues[0]) < initial_n:
+                    raise RuntimeError(
+                        f"FAMILY_GENERATION_SHORTFALL: {fid} produced {len(gen_queues[0])} "
+                        f"< initial_candidates_per_family={initial_n}"
+                    )
+                generated_counts[fid] = len(gen_queues[0])
+                generation_0_counts[fid] = len(gen_queues[0])
+                campaign_generated += len(gen_queues[0])
+                self._session_generated += len(gen_queues[0])
+                for c in gen_queues[0]:
+                    cand_by_id[c.candidate_id] = c
+                highest_generation[fid] = 0
+
+            if not (resuming and restored_fst and restored_fst.generation_0_complete):
+                pass  # counts already set above for fresh gen-0
+            else:
+                for c in gen_queues.get(0, []):
+                    cand_by_id.setdefault(c.candidate_id, c)
 
             best_score_so_far = float("-inf")
-            stagnation_count = 0
-            family_stop: str | None = None
-            population: list[StrategyCandidate] = list(gen_queues[0])
-            rec_by_id: dict[str, EvaluationRecord] = {}
+            if restored_fst is not None and restored_fst.best_score_so_far is not None:
+                best_score_so_far = float(restored_fst.best_score_so_far)
+            stagnation_count = int(restored_fst.stagnation_count) if restored_fst else 0
+            family_stop: str | None = (
+                restored_fst.family_stop_reason if restored_fst else None
+            )
+            # If runtime-exhausted previously, clear stop so EXTEND/RESUME can continue.
+            if family_stop == "max_runtime_seconds" and resuming:
+                family_stop = None
+                family_stop_reasons[fid] = None
+            population: list[StrategyCandidate] = []
+            if restored_fst and restored_fst.population_ids:
+                population = [
+                    cand_by_id[cid]
+                    for cid in restored_fst.population_ids
+                    if cid in cand_by_id
+                ]
+            if not population:
+                population = list(gen_queues.get(0, []))
+            rec_by_id: dict[str, EvaluationRecord] = {
+                r.candidate_id: r for r in records_by_family.get(fid, [])
+            }
 
             max_gen_index = max(0, int(cfg.evolution_generations) - 1)
-            for gen in range(0, max_gen_index + 1):
+            start_gen = int(restored_fst.current_generation) if restored_fst else 0
+            # Skip families that already completed evolution (unless runtime-exhausted).
+            if (
+                family_stop
+                and family_stop
+                not in {
+                    None,
+                    "max_runtime_seconds",
+                    "budget_exhausted_before_breed",
+                    "empty_generation_queue",
+                }
+            ):
+                family_stop_reasons[fid] = family_stop
+                continue
+            for gen in range(start_gen, max_gen_index + 1):
                 runtime = time.perf_counter() - t0
                 if runtime >= float(cfg.max_runtime_seconds):
                     family_stop = "max_runtime_seconds"
@@ -3725,6 +4341,26 @@ class MultiFamilyCampaign:
                         f"candidate {cand.candidate_id} generation={cand.generation} "
                         f"!= queue generation={gen}"
                     )
+                    # Never repeat a completed evaluation when resume/cache already holds it.
+                    if cand.candidate_id in rec_by_id:
+                        rec = rec_by_id[cand.candidate_id]
+                        if cand.candidate_id not in greg.evaluated_candidate_ids:
+                            greg.evaluated_candidate_ids.append(cand.candidate_id)
+                            greg.evaluated_count += 1
+                            parent_status, is_sq, reason = self.classify_parent_eligibility(rec)
+                            greg.parent_eligibility[cand.candidate_id] = parent_status
+                            if is_sq:
+                                greg.score_qualified_candidate_ids.append(cand.candidate_id)
+                            if parent_status != NOT_PARENT_ELIGIBLE and rec.fitness is not None:
+                                score_val = float(rec.fitness.fitness)
+                                if score_val == score_val and abs(score_val) != float("inf"):
+                                    valid_eval_count += 1
+                                    gen_scores.append(score_val)
+                                elif parent_status == STRUCTURAL_PARENT_ELIGIBLE:
+                                    valid_eval_count += 1
+                            _ = reason
+                        continue
+
                     prev_campaign_wfo = campaign_full_wfo
                     prev_family_wfo = full_wfo_counts[fid]
                     rec = self._evaluate_candidate(
@@ -3736,12 +4372,14 @@ class MultiFamilyCampaign:
                     records_by_family[fid].append(rec)
                     rec_by_id[cand.candidate_id] = rec
                     campaign_evaluated += 1
+                    self._session_evaluated += 1
                     greg.evaluated_candidate_ids.append(cand.candidate_id)
                     greg.evaluated_count += 1
 
                     if full_wfo_counts[fid] > prev_family_wfo:
                         delta = full_wfo_counts[fid] - prev_family_wfo
                         campaign_full_wfo += delta
+                        self._session_full_wfo += delta
                         greg.completed_full_wfo_candidate_ids.append(cand.candidate_id)
                         greg.completed_full_wfo_count += delta
 
@@ -3760,6 +4398,61 @@ class MultiFamilyCampaign:
                             valid_eval_count += 1
                     _ = reason
                     _ = prev_campaign_wfo
+                    gate = SCORE_QUALIFIED if is_sq else (
+                        FULL_WFO_COMPLETED if full_wfo_counts[fid] > prev_family_wfo else parent_status
+                    )
+                    pending_left = [
+                        c.candidate_id
+                        for c in take
+                        if c.candidate_id not in rec_by_id
+                    ]
+                    fst_payload = FamilyCheckpointState(
+                        family_id=fid,
+                        generated_count=int(generated_counts[fid]),
+                        generation_0_count=int(generation_0_counts[fid]),
+                        descendant_count=int(descendant_counts[fid]),
+                        mutation_count=int(mutation_counts[fid]),
+                        crossover_count=int(crossover_counts[fid]),
+                        full_wfo_count=int(full_wfo_counts[fid]),
+                        highest_generation=int(highest_generation[fid]),
+                        structural_parents_found=int(structural_parents_found[fid]),
+                        family_stop_reason=family_stop,
+                        family_gen_cap=int(family_gen_cap),
+                        family_wfo_cap=int(family_wfo_cap),
+                        initial_alloc=int(initial_alloc[fid]),
+                        evolutionary_alloc=int(evolutionary_alloc.get(fid, 0)),
+                        best_score_so_far=(
+                            None
+                            if best_score_so_far == float("-inf")
+                            else float(best_score_so_far)
+                        ),
+                        stagnation_count=int(stagnation_count),
+                        current_generation=int(gen),
+                        generation_0_complete=True,
+                        gen_queues={
+                            str(g): [c.candidate_id for c in qs]
+                            for g, qs in gen_queues.items()
+                        },
+                        pending_eval_ids=pending_left,
+                        evaluated_ids=list(rec_by_id.keys()),
+                        parent_pool_ids=[p.candidate_id for p in population],
+                        population_ids=[p.candidate_id for p in population],
+                        descendant_reject_counts=dict(
+                            descendant_reject_counts.get(fid) or {}
+                        ),
+                    )
+                    self._checkpoint_after_candidate(
+                        families=families,
+                        cand=cand,
+                        rec=rec,
+                        fid=fid,
+                        gate=gate,
+                        campaign_generated=campaign_generated,
+                        campaign_evaluated=campaign_evaluated,
+                        campaign_full_wfo=campaign_full_wfo,
+                        family_states_payload={fid: fst_payload},
+                        pending_eval_ids=pending_left,
+                    )
 
                 generation_best = max(gen_scores) if gen_scores else None
                 greg.best_generation_score = generation_best
@@ -4213,18 +4906,23 @@ class MultiFamilyCampaign:
         assert campaign_generated <= cfg.total_candidate_budget + 0  # noqa: S101
         assert campaign_full_wfo <= cfg.max_full_wfo
         assert campaign_evaluated <= max_evaluated
-        assert initial_candidates_generated == len(family_ids) * initial_per
-        assert campaign_generated == (
-            initial_candidates_generated + evolutionary_candidates_generated
-        )
-        for fid in family_ids:
-            assert full_wfo_counts[fid] <= wfo_alloc[fid]
-            assert generation_0_counts[fid] == int(initial_alloc[fid])
-            assert (
-                generated_counts[fid]
-                == generation_0_counts[fid] + descendant_counts[fid]
+        if not resuming:
+            assert initial_candidates_generated == len(family_ids) * initial_per
+            assert campaign_generated == (
+                initial_candidates_generated + evolutionary_candidates_generated
             )
-            assert generated_counts[fid] <= cfg.total_candidate_budget
+            for fid in family_ids:
+                assert full_wfo_counts[fid] <= wfo_alloc[fid]
+                assert generation_0_counts[fid] == int(initial_alloc[fid])
+                assert (
+                    generated_counts[fid]
+                    == generation_0_counts[fid] + descendant_counts[fid]
+                )
+                assert generated_counts[fid] <= cfg.total_candidate_budget
+        else:
+            for fid in family_ids:
+                assert full_wfo_counts.get(fid, 0) <= wfo_alloc.get(fid, cfg.max_full_wfo)
+                assert generated_counts.get(fid, 0) <= cfg.total_candidate_budget
         rankings: list[dict[str, Any]] = []
         for st in family_stats:
             for cid in st.best_candidate_ids:
@@ -4336,7 +5034,72 @@ class MultiFamilyCampaign:
             "robustness_accounting": robustness_accounting.as_dict(),
             "statistics_accounting": shortlist_phase.statistics_accounting.as_dict(),
             "clustering_accounting": shortlist_phase.clustering_accounting.as_dict(),
+            "search_program_id": self.search_program_id,
+            "search_mode": self.search_mode,
+            "compatibility_fingerprint": self.compatibility_fingerprint,
+            "source_run_id": self.source_run_id,
+            "resumed_from_run_id": self.resumed_from_run_id,
+            "session_totals": {
+                "generated": self._session_generated,
+                "evaluated": self._session_evaluated,
+                "full_wfo": self._session_full_wfo,
+            },
+            "cumulative_totals": {
+                "generated": campaign_generated,
+                "evaluated": campaign_evaluated,
+                "full_wfo": campaign_full_wfo,
+            },
+            "evaluation_cache_hits": self._cache_hits,
+            "evaluation_cache_misses": self._cache_misses,
+            "pending_by_gate": (
+                self._live_checkpoint.pending_by_gate()
+                if self._live_checkpoint is not None
+                else {}
+            ),
         }
+        # Final atomic checkpoint — crash after this loses nothing completed.
+        if self._live_checkpoint is not None:
+            from discovery.search_program import PipelinePhase
+            from discovery.search_resume import mark_score_qualified_pending
+
+            ckpt = self._live_checkpoint
+            ckpt.pipeline_phase = (
+                PipelinePhase.COMPLETE.value
+                if stop_reason
+                not in {"max_runtime_seconds", "max_full_wfo", "max_evaluated_candidates"}
+                else PipelinePhase.STRESS.value
+            )
+            if stop_reason == "max_runtime_seconds":
+                mark_score_qualified_pending(ckpt)
+                from discovery.search_resume import choose_resume_phase
+
+                ckpt.pipeline_phase = choose_resume_phase(ckpt).value
+            ckpt.campaign_generated = campaign_generated
+            ckpt.campaign_evaluated = campaign_evaluated
+            ckpt.campaign_full_wfo = campaign_full_wfo
+            ckpt.session_generated = self._session_generated
+            ckpt.session_evaluated = self._session_evaluated
+            ckpt.session_full_wfo = self._session_full_wfo
+            ckpt.stop_reason = stop_reason
+            ckpt.generation_records = [g.as_dict() for g in generation_records]
+            ckpt.stress_summaries = [s.as_dict() for s in self.candidate_stress_summaries]
+            ckpt.robustness_summaries = [
+                s.as_dict() for s in self.candidate_robustness_summaries
+            ]
+            ckpt.statistics_summaries = [
+                s.as_dict() for s in shortlist_phase.statistics_summaries
+            ]
+            ckpt.clusters = list(shortlist_phase.clusters)
+            ckpt.research_shortlist = list(shortlist_payload)
+            ckpt.population_stats = dict(shortlist_phase.population_stats or {})
+            ckpt.family_specs = [f.as_dict() for f in families]
+            for cid, cand in cand_by_id.items():
+                ckpt.candidates[cid] = cand.as_dict()
+            for fid, recs in records_by_family.items():
+                for rec in recs:
+                    ckpt.evaluation_records[rec.candidate_id] = rec.as_dict()
+            self._persist_live_checkpoint()
+
         fingerprint = sha256_json(
             {
                 "families": [f.canonical_hash() for f in families],

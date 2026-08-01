@@ -155,6 +155,26 @@ class EvaluationRecord:
             "meta": dict(self.meta),
         }
 
+    @staticmethod
+    def from_dict(raw: dict[str, Any]) -> EvaluationRecord:
+        fitness_raw = raw.get("fitness")
+        return EvaluationRecord(
+            outcome=EvalOutcome(str(raw["outcome"])),
+            candidate_id=str(raw["candidate_id"]),
+            lineage_id=str(raw.get("lineage_id") or ""),
+            trial_id=raw.get("trial_id"),
+            fitness=FitnessResult.from_dict(fitness_raw) if fitness_raw else None,
+            rejection_reason=raw.get("rejection_reason"),
+            oos_folds=[FoldOOSMetrics.from_dict(f) for f in (raw.get("oos_folds") or [])],
+            train_metrics=dict(raw.get("train_metrics") or {}),
+            runtime_seconds=float(raw.get("runtime_seconds") or 0.0),
+            memory_mb=float(raw.get("memory_mb") or 0.0),
+            stress_results=dict(raw.get("stress_results") or {}),
+            robustness_results=dict(raw.get("robustness_results") or {}),
+            behavioral_cluster=raw.get("behavioral_cluster"),
+            meta=dict(raw.get("meta") or {}),
+        )
+
 
 class BacktestBackend(Protocol):
     """Produces OOS fold metrics — never used for IS ranking."""
