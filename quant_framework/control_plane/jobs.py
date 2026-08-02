@@ -399,8 +399,25 @@ def run_alpha_miner_job(
         try:
             canary_max_rows = canary_cfg.get("max_rows")
             max_rows = int(canary_max_rows) if canary_max_rows is not None else None
-            resolved = resolve_bid_ask_bars(entry, timeframe=timeframe, max_rows=max_rows)
-        except (SilverResolutionError, ValueError) as exc:
+            from control_plane.direct_bid_ask_dataset import (
+                DirectBidAskResolutionError,
+                direct_bid_ask_path,
+                resolve_direct_bid_ask_bars,
+            )
+
+            if direct_bid_ask_path(entry) is not None:
+                resolved = resolve_direct_bid_ask_bars(
+                    entry,
+                    timeframe=timeframe,
+                    max_rows=max_rows,
+                )
+            else:
+                resolved = resolve_bid_ask_bars(
+                    entry,
+                    timeframe=timeframe,
+                    max_rows=max_rows,
+                )
+        except (SilverResolutionError, DirectBidAskResolutionError, ValueError) as exc:
             run.state = RunState.FAILED
             run.software_success = False
             run.terminal_reason = REAL_DATA_BACKEND_UNAVAILABLE
