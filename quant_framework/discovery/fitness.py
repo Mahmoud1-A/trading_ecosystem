@@ -136,6 +136,7 @@ INSUFFICIENT_OOS_TRADES = "INSUFFICIENT_OOS_TRADES"
 NEGATIVE_EXPECTANCY = "NEGATIVE_EXPECTANCY"
 PF_BELOW_ONE = "PF_BELOW_ONE"
 MAX_DRAWDOWN_EXCEEDED = "MAX_DRAWDOWN_EXCEEDED"
+ECONOMIC_RETURN_BELOW_MINIMUM = "ECONOMIC_RETURN_BELOW_MINIMUM"
 
 # Exact SCORE_QUALIFIED hard rejects (fitness gate — never advance to Stress).
 SCORE_QUALIFIED_REJECT_REASONS = frozenset(
@@ -145,6 +146,7 @@ SCORE_QUALIFIED_REJECT_REASONS = frozenset(
         NEGATIVE_EXPECTANCY,
         PF_BELOW_ONE,
         MAX_DRAWDOWN_EXCEEDED,
+        ECONOMIC_RETURN_BELOW_MINIMUM,
     }
 )
 
@@ -180,23 +182,69 @@ def _percentile(xs: Sequence[float], q: float = 25.0) -> float:
     return float(np.percentile(np.asarray(xs, dtype=float), q))
 
 
+def _clip(value: float, low: float, high: float) -> float:
+    return float(min(max(float(value), float(low)), float(high)))
+
+
+def _bounded_signed(value: float, scale: float) -> float:
+    """Map an unbounded signed metric to [-1, 1] without unit domination."""
+    safe_scale = max(abs(float(scale)), 1e-12)
+    return float(math.tanh(float(value) / safe_scale))
+
+
+def _implied_annual_return(fold: FoldOOSMetrics) -> float:
+    """Recover Calmar's numerator for economic diagnostics.
+
+    The event backend currently exposes Calmar and MaxDD, not CAGR directly.
+    Since ``Calmar = annual_return / |MaxDD|``, their product recovers the
+    annualized return used by that fold. A zero/invalid denominator fails closed.
+    """
+    dd = abs(float(fold.max_drawdown))
+    calmar = float(fold.calmar)
+    if dd <= 1e-12 or not math.isfinite(dd) or not math.isfinite(calmar):
+        return 0.0
+    return float(calmar * dd)
+
+
+def _risk_normalized_annual_return(
+    fold: FoldOOSMetrics,
+    *,
+    target_drawdown: float,
+    max_risk_scale: float,
+    drawdown_floor: float,
+) -> tuple[float, float, float]:
+    """Return (raw annual return, permitted scale, risk-normalized annual return).
+
+    Scaling is capped so a microscopic drawdown cannot imply absurd leverage.
+    Candidates with drawdown above the target are scaled down as well.
+    """
+    annual_return = _implied_annual_return(fold)
+    observed_dd = abs(float(fold.max_drawdown))
+    effective_dd = max(observed_dd, max(float(drawdown_floor), 1e-12))
+    scale = min(max(float(max_risk_scale), 0.0), float(target_drawdown) / effective_dd)
+    scale = max(scale, 0.0)
+    return annual_return, float(scale), float(annual_return * scale)
+
+
 @dataclass
 class RobustFitness:
-    """
-    Aggregate fold-level OOS evidence into a single ranking score.
+    """Aggregate fold-level OOS evidence into a bounded economic ranking.
 
     One exceptional fold cannot dominate: medians, trimmed means, and lower
-    confidence bounds are preferred over raw means.
+    confidence bounds are preferred over raw means. Metrics with incompatible
+    units are bounded before aggregation, so Calmar cannot win merely by making
+    an already tiny drawdown ten times smaller.
 
     SCORE_QUALIFIED hard gates (all required):
-    - median OOS expectancy > 0
-    - median profit factor > 1
+    - median OOS expectancy >= ``min_median_expectancy``
+    - median profit factor >= ``min_median_profit_factor``
+    - median risk-normalized annual return >= economic minimum
     - total OOS trades >= ``min_total_oos_trades`` (and per-fold floors)
     - worst |MaxDD| <= ``max_oos_drawdown``
     """
 
     complexity_penalty: float = 0.05
-    drawdown_penalty: float = 1.0
+    drawdown_penalty: float = 0.10
     turnover_penalty: float = 0.1
     similarity_penalty: float = 0.5
     multiple_testing_penalty: float = 0.0
@@ -204,8 +252,31 @@ class RobustFitness:
     # Closed OOS trade floors (synced from SearchBudget in the controller).
     min_total_oos_trades: int = 8
     min_oos_trades_per_fold: int = 1
+    # Economic qualification. Defaults are deliberate research gates.
+    min_median_expectancy: float = 0.0
+    min_median_profit_factor: float = 1.10
+    min_risk_normalized_annual_return: float = 0.12
+    target_risk_drawdown: float = 0.05
+    max_risk_scale: float = 4.0
+    drawdown_floor: float = 0.0025
+    # Bounded scoring scales/caps. These affect ranking, never raw diagnostics.
+    expectancy_score_scale: float = 0.05
+    annual_return_score_target: float = 0.25
+    sharpe_cap: float = 3.0
+    profit_factor_cap: float = 2.0
+    calmar_cap: float = 3.0
     # Absolute drawdown ceiling as a positive fraction (0.20 == 20%).
     max_oos_drawdown: float = 0.20
+
+    def _fold_economic_metrics(
+        self, fold: FoldOOSMetrics
+    ) -> tuple[float, float, float]:
+        return _risk_normalized_annual_return(
+            fold,
+            target_drawdown=float(self.target_risk_drawdown),
+            max_risk_scale=float(self.max_risk_scale),
+            drawdown_floor=float(self.drawdown_floor),
+        )
 
     def score(
         self,
@@ -224,7 +295,7 @@ class RobustFitness:
                 f"got {ranking_source!r}. Training metrics cannot promote."
             )
         if train_metrics:
-            # Explicitly ignore IS metrics for ranking — presence is diagnostic only
+            # Explicitly ignore IS metrics for ranking — presence is diagnostic only.
             pass
         if len(folds) < self.min_folds:
             return FitnessResult(
@@ -245,8 +316,15 @@ class RobustFitness:
         expectancies = [float(f.expectancy) for f in folds]
         pfs = [float(f.profit_factor) for f in folds]
         dds = [float(f.max_drawdown) for f in folds]
+        economic = [self._fold_economic_metrics(f) for f in folds]
+        annual_returns = [x[0] for x in economic]
+        permitted_scales = [x[1] for x in economic]
+        risk_normalized_returns = [x[2] for x in economic]
         median_expectancy = _median(expectancies)
         median_pf = _median(pfs)
+        median_annual_return = _median(annual_returns)
+        median_risk_scale = _median(permitted_scales)
+        median_risk_normalized_return = _median(risk_normalized_returns)
         # Worst drawdown magnitude (fold max_drawdown is typically <= 0).
         worst_dd = float(min(dds)) if dds else 0.0
         abs_worst_dd = abs(worst_dd)
@@ -255,10 +333,28 @@ class RobustFitness:
             "minimum_required_oos_trades": float(self.min_total_oos_trades),
             "minimum_required_oos_trades_per_fold": float(self.min_oos_trades_per_fold),
             "median_oos_expectancy": float(median_expectancy),
+            "minimum_required_median_expectancy": float(self.min_median_expectancy),
             "median_profit_factor": float(median_pf),
+            "minimum_required_profit_factor": float(self.min_median_profit_factor),
+            "median_implied_annual_return": float(median_annual_return),
+            "median_permitted_risk_scale": float(median_risk_scale),
+            "median_risk_normalized_annual_return": float(
+                median_risk_normalized_return
+            ),
+            "minimum_required_risk_normalized_annual_return": float(
+                self.min_risk_normalized_annual_return
+            ),
+            "target_risk_drawdown": float(self.target_risk_drawdown),
+            "max_risk_scale": float(self.max_risk_scale),
             "worst_oos_max_drawdown": float(worst_dd),
             "max_oos_drawdown_limit": float(self.max_oos_drawdown),
             **{f"fold_{i}_oos_trades": float(n) for i, n in enumerate(fold_trade_counts)},
+            **{f"fold_{i}_implied_annual_return": float(v) for i, v in enumerate(annual_returns)},
+            **{f"fold_{i}_permitted_risk_scale": float(v) for i, v in enumerate(permitted_scales)},
+            **{
+                f"fold_{i}_risk_normalized_annual_return": float(v)
+                for i, v in enumerate(risk_normalized_returns)
+            },
         }
         if total_oos_trades == 0:
             return FitnessResult(
@@ -280,7 +376,9 @@ class RobustFitness:
                 rejected=True,
                 rejection_reason=INSUFFICIENT_OOS_TRADES,
             )
-        if not (median_expectancy > 0.0):
+        if median_expectancy < float(self.min_median_expectancy) or not (
+            median_expectancy > 0.0
+        ):
             return FitnessResult(
                 fitness=float("-inf"),
                 ranking_source=ranking_source,
@@ -289,7 +387,7 @@ class RobustFitness:
                 rejected=True,
                 rejection_reason=NEGATIVE_EXPECTANCY,
             )
-        if not (median_pf > 1.0):
+        if median_pf < float(self.min_median_profit_factor):
             return FitnessResult(
                 fitness=float("-inf"),
                 ranking_source=ranking_source,
@@ -307,29 +405,82 @@ class RobustFitness:
                 rejected=True,
                 rejection_reason=MAX_DRAWDOWN_EXCEEDED,
             )
+        if median_risk_normalized_return < float(
+            self.min_risk_normalized_annual_return
+        ):
+            return FitnessResult(
+                fitness=float("-inf"),
+                ranking_source=ranking_source,
+                components=trade_components,
+                fold_scores=(),
+                rejected=True,
+                rejection_reason=ECONOMIC_RETURN_BELOW_MINIMUM,
+            )
 
-        sharpes = [f.sharpe for f in folds]
-        calmars = [f.calmar for f in folds]
-        turnovers = [f.turnover for f in folds]
-        breaches = [f.prop_breach_prob for f in folds]
-        regimes = [f.regime_entropy for f in folds]
+        sharpes = [float(f.sharpe) for f in folds]
+        calmars = [float(f.calmar) for f in folds]
+        turnovers = [float(f.turnover) for f in folds]
+        breaches = [float(f.prop_breach_prob) for f in folds]
+        regimes = [float(f.regime_entropy) for f in folds]
 
-        fold_scores = tuple(
-            0.35 * f.expectancy
-            + 0.25 * f.sharpe
-            + 0.15 * min(f.profit_factor, 3.0)
-            + 0.15 * f.calmar
-            - self.drawdown_penalty * abs(f.max_drawdown)
-            - 0.5 * f.prop_breach_prob
-            for f in folds
-        )
+        fold_scores_list: list[float] = []
+        for fold, (_, _, risk_return) in zip(folds, economic, strict=True):
+            expectancy_score = _bounded_signed(
+                float(fold.expectancy), float(self.expectancy_score_scale)
+            )
+            sharpe_score = _clip(
+                float(fold.sharpe) / max(float(self.sharpe_cap), 1e-12), -1.0, 1.0
+            )
+            pf_score = _clip(
+                (float(fold.profit_factor) - 1.0)
+                / max(float(self.profit_factor_cap) - 1.0, 1e-12),
+                -1.0,
+                1.0,
+            )
+            calmar_score = _clip(
+                float(fold.calmar) / max(float(self.calmar_cap), 1e-12),
+                -1.0,
+                1.0,
+            )
+            annual_return_score = _clip(
+                float(risk_return)
+                / max(float(self.annual_return_score_target), 1e-12),
+                -1.0,
+                1.0,
+            )
+            dd_utilization = _clip(
+                abs(float(fold.max_drawdown))
+                / max(float(self.max_oos_drawdown), 1e-12),
+                0.0,
+                1.0,
+            )
+            low_breach = 1.0 - _clip(float(fold.prop_breach_prob), 0.0, 1.0)
+            regime_score = _clip(float(fold.regime_entropy), 0.0, 1.0)
+            fold_scores_list.append(
+                0.30 * annual_return_score
+                + 0.25 * expectancy_score
+                + 0.15 * sharpe_score
+                + 0.10 * pf_score
+                + 0.05 * calmar_score
+                + 0.05 * regime_score
+                + 0.10 * low_breach
+                - float(self.drawdown_penalty) * dd_utilization
+            )
+        fold_scores = tuple(fold_scores_list)
 
+        capped_calmars = [
+            _clip(c, -float(self.calmar_cap), float(self.calmar_cap)) for c in calmars
+        ]
         positive = {
             "median_oos_expectancy": median_expectancy,
             "oos_dsr_proxy": _lower_confidence_bound(sharpes),
             "oos_profit_factor": median_pf,
             "oos_calmar": _median(calmars),
-            "fold_stability": 1.0 / (1.0 + float(np.std(fold_scores)) if fold_scores else 1.0),
+            "oos_calmar_capped": _median(capped_calmars),
+            "implied_annual_return": median_annual_return,
+            "risk_normalized_annual_return": median_risk_normalized_return,
+            "fold_stability": 1.0
+            / (1.0 + float(np.std(fold_scores)) if fold_scores else 1.0),
             "regime_breadth": _median(regimes),
             "low_prop_breach": 1.0 - _median(breaches),
             "worst_fold_score": float(min(fold_scores)) if fold_scores else 0.0,
@@ -347,12 +498,11 @@ class RobustFitness:
         }
 
         fitness = (
-            0.40 * positive["trimmed_mean_fold"]
-            + 0.20 * positive["pct25_fold_score"]
+            0.45 * positive["trimmed_mean_fold"]
+            + 0.25 * positive["pct25_fold_score"]
             + 0.15 * positive["worst_fold_score"]
             + 0.10 * positive["fold_stability"]
-            + 0.10 * positive["low_prop_breach"]
-            + 0.05 * positive["regime_breadth"]
+            + 0.05 * positive["low_prop_breach"]
             - self.complexity_penalty * negative["complexity"]
             - self.turnover_penalty * negative["turnover"]
             - self.similarity_penalty * negative["behavioral_similarity"]
