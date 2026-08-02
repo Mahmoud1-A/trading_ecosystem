@@ -60,6 +60,7 @@ jobs:
           from pathlib import Path
 
           campaign = Path("quant_framework/discovery/multi_family_campaign.py").read_text(encoding="utf-8")
+          robustness = Path("quant_framework/discovery/parameter_robustness.py").read_text(encoding="utf-8")
           stress = Path("quant_framework/discovery/stress.py").read_text(encoding="utf-8")
           jobs = Path("quant_framework/control_plane/jobs.py").read_text(encoding="utf-8")
           dsl_test = Path("quant_framework/tests/test_dsl_regime_gate_typing.py").read_text(encoding="utf-8")
@@ -75,6 +76,11 @@ jobs:
               "def _reproducible_allocation_payload(",
               '"search_program_id"',
               '_reproducible_allocation_payload(allocation_payload)',
+              'if forbid and kind != _REQUIRED_ROBUSTNESS_BACKEND_KIND:',
+          )
+          required_robustness = (
+              'if kind != self.expected_backend_kind:',
+              'from discovery.event_wfo_backend import EventDrivenDiscoveryBackend',
           )
           required_stress = (
               "STRESS_SCENARIO_STARTED",
@@ -89,6 +95,7 @@ jobs:
           )
           assert all(token in campaign for token in required_campaign)
           assert campaign.count('_reproducible_allocation_payload(allocation_payload)') == 2
+          assert all(token in robustness for token in required_robustness)
           assert all(token in stress for token in required_stress)
           assert all(token in jobs for token in required_jobs)
           assert 'state in {"RUNNING", "PAUSED", "COMPLETED"}' in dsl_test
@@ -111,6 +118,7 @@ jobs:
           git add \
             quant_framework/discovery/fitness.py \
             quant_framework/discovery/multi_family_campaign.py \
+            quant_framework/discovery/parameter_robustness.py \
             quant_framework/discovery/stress.py \
             quant_framework/control_plane/jobs.py \
             quant_framework/tests/test_dsl_regime_gate_typing.py \
