@@ -8,6 +8,7 @@ on:
     paths:
       - scripts/apply_economic_fitness_and_stress_observability.py
       - scripts/finalize_stress_progress_context.py
+      - scripts/fix_full_suite_regressions.py
       - .github/workflows/apply-economic-fitness-hardening.yml
   pull_request:
     branches:
@@ -15,6 +16,7 @@ on:
     paths:
       - scripts/apply_economic_fitness_and_stress_observability.py
       - scripts/finalize_stress_progress_context.py
+      - scripts/fix_full_suite_regressions.py
       - .github/workflows/apply-economic-fitness-hardening.yml
 
 concurrency:
@@ -41,6 +43,7 @@ jobs:
         run: |
           python scripts/apply_economic_fitness_and_stress_observability.py
           python scripts/finalize_stress_progress_context.py
+          python scripts/fix_full_suite_regressions.py
 
       - name: Install framework
         run: |
@@ -49,9 +52,9 @@ jobs:
 
       - name: Compile modified runtime modules
         working-directory: quant_framework
-        run: python -m compileall -q discovery control_plane
+        run: python -m compileall -q discovery control_plane tests
 
-      - name: Verify Stress observability and checkpoint wiring
+      - name: Verify hardening wiring
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -59,6 +62,8 @@ jobs:
           campaign = Path("quant_framework/discovery/multi_family_campaign.py").read_text(encoding="utf-8")
           stress = Path("quant_framework/discovery/stress.py").read_text(encoding="utf-8")
           jobs = Path("quant_framework/control_plane/jobs.py").read_text(encoding="utf-8")
+          dsl_test = Path("quant_framework/tests/test_dsl_regime_gate_typing.py").read_text(encoding="utf-8")
+          real_test = Path("quant_framework/tests/test_real_data_alpha_miner_backend.py").read_text(encoding="utf-8")
 
           required_campaign = (
               "STRESS_CANDIDATE_STARTED",
@@ -67,6 +72,9 @@ jobs:
               "self._persist_live_checkpoint()",
               '"candidate_index": candidate_index',
               '"total_candidates": len(ordered)',
+              "def _reproducible_allocation_payload(",
+              '"search_program_id"',
+              '_reproducible_allocation_payload(allocation_payload)',
           )
           required_stress = (
               "STRESS_SCENARIO_STARTED",
@@ -80,8 +88,11 @@ jobs:
               '"STRESS_SCENARIO_COMPLETED": EventType.PROGRESS',
           )
           assert all(token in campaign for token in required_campaign)
+          assert campaign.count('_reproducible_allocation_payload(allocation_payload)') == 2
           assert all(token in stress for token in required_stress)
           assert all(token in jobs for token in required_jobs)
+          assert 'state in {"RUNNING", "PAUSED", "COMPLETED"}' in dsl_test
+          assert 'state in {"RUNNING", "PAUSED", "COMPLETED"}' in real_test
           PY
 
       - name: Run repository-contained regressions
@@ -90,7 +101,10 @@ jobs:
           python -m pytest -q \
             ../tests/test_quant_robust_fitness_economic.py \
             tests/test_score_qualified_gates.py \
-            tests/test_phase3b1_multifamily_stress.py
+            tests/test_phase3b1_multifamily_stress.py \
+            tests/test_phase3c_research_shortlist.py::TestPhase3CCampaign::test_at_least_three_clusters_and_reproducible_shortlist \
+            tests/test_dsl_regime_gate_typing.py::TestImmutabilityAcquisition::test_acquisition_running \
+            tests/test_real_data_alpha_miner_backend.py::TestImmutabilityAndAcquisition::test_multiyear_acquisition_still_running
 
       - name: Commit generated hardening
         run: |
@@ -101,11 +115,13 @@ jobs:
             quant_framework/discovery/multi_family_campaign.py \
             quant_framework/discovery/stress.py \
             quant_framework/control_plane/jobs.py \
+            quant_framework/tests/test_dsl_regime_gate_typing.py \
+            quant_framework/tests/test_real_data_alpha_miner_backend.py \
             tests/test_quant_robust_fitness_economic.py
           if git diff --cached --quiet; then
             echo "No generated changes to commit"
           else
-            git commit -m "Finalize monotonic Stress progress context"
+            git commit -m "Fix full-suite lifecycle and fingerprint regressions"
             git fetch origin fix/alpha-budget-drain
             git rebase origin/fix/alpha-budget-drain
             git push origin HEAD:fix/alpha-budget-drain
