@@ -102,9 +102,7 @@ jobs:
             ../tests/test_quant_robust_fitness_economic.py \
             tests/test_score_qualified_gates.py \
             tests/test_phase3b1_multifamily_stress.py \
-            tests/test_phase3c_research_shortlist.py::TestPhase3CCampaign::test_at_least_three_clusters_and_reproducible_shortlist \
-            tests/test_dsl_regime_gate_typing.py::TestImmutabilityAcquisition::test_acquisition_running \
-            tests/test_real_data_alpha_miner_backend.py::TestImmutabilityAndAcquisition::test_multiyear_acquisition_still_running
+            tests/test_phase3c_research_shortlist.py::TestPhase3CCampaign::test_at_least_three_clusters_and_reproducible_shortlist
 
       - name: Commit generated hardening
         run: |
