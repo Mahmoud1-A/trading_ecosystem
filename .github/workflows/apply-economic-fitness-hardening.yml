@@ -21,6 +21,8 @@ permissions:
 jobs:
   apply-and-test:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}/quant_framework:${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
         with:
