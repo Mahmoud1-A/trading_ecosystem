@@ -24,10 +24,15 @@ from discovery.search_checkpoint import (
 )
 from discovery.search_program import (
     INCOMPATIBLE_FINGERPRINT,
+    IncompatibleSearchFingerprint,
     SearchMode,
     SearchProgramStore,
     assert_fingerprint_compatible,
+    build_fingerprint_components,
+    canonical_multi_family_payload,
     compute_compatibility_fingerprint,
+    hash_multi_family_config,
+    hash_wfo_config,
     new_search_program_id,
 )
 from discovery.search_resume import (
@@ -265,7 +270,7 @@ def test_resume_does_not_repeat_completed_wfo(tmp_path: Path) -> None:
         resumed_from_run_id="run_session_1",
     )
     result2 = campaign2.run()
-    # Completed evaluations are restored from checkpoint (and/or cache) — do not
+    # Completed evaluations are restored from checkpoint (and/or cache) ? do not
     # re-run WFO for the same candidate universe when fingerprints match.
     assert campaign2._cache_hits + len(ckpt.evaluation_records) >= 1  # noqa: SLF001
     # Fresh WFO calls on resume must be strictly fewer than a full re-run.
@@ -1404,3 +1409,512 @@ def test_legacy_incomplete_score_qualified_fails_closed(tmp_path: Path) -> None:
         )
     assert list(store.root.glob("sp_*")) == []
     assert meta["score_qualified_id"]
+
+
+def _new_search_mf(**overrides: Any) -> dict[str, Any]:
+    """Structural NEW_SEARCH multi_family config (pre-runtime enrichment)."""
+    raw = {
+        "enabled": True,
+        "requested_family_count": 2,
+        "min_candidates_per_family": 2,
+        "initial_candidates_per_family": 2,
+        "total_candidate_budget": 8,
+        "max_full_wfo": 8,
+        "max_evaluated_candidates": 8,
+        "adaptive_reallocation": False,
+        "seed": 7,
+        "family_ids": ["mean_reversion", "trend_following"],
+        "max_runtime_seconds": 120.0,
+        "family_local_evolution": True,
+        "evolution_generations": 1,
+        "population_size": 2,
+        "stagnation_generations": 99,
+        "minimum_improvement": 1e-4,
+        "allow_cross_family_crossover": False,
+        "max_stress_evaluations": 8,
+        "max_stress_scenarios_per_candidate": 2,
+        "min_stress_pass_rate": 0.5,
+        "stress_scenarios": ["base_costs", "costs_2x"],
+        "fail_closed_unsupported_stress": True,
+        "max_robustness_candidates": 2,
+        "max_robustness_evaluations": 10,
+        "max_parameters_per_candidate": 2,
+        "max_points_per_parameter": 5,
+        "allow_one_sided_neighborhood": False,
+        "min_valid_neighborhood_points": 3,
+        "min_dsr": 0.0,
+        "max_pbo": 1.0,
+        "pbo_n_splits": 4,
+        "behavioral_similarity_threshold": 0.85,
+        "min_oos_observations_for_dsr": 1,
+        "preview_family_specs": [{"family_id": "mean_reversion"}],
+        "distinct_grammar_fingerprints": 2,
+        "grammar_fingerprints": ["g1", "g2"],
+    }
+    raw.update(overrides)
+    return raw
+
+
+def _enrich_frozen_mf(mf: dict[str, Any], *, program_id: str, fp: str, comps: dict[str, Any]) -> dict[str, Any]:
+    """Simulate jobs.py writing runtime resume metadata into config_snapshot."""
+    out = dict(mf)
+    out.update(
+        {
+            "search_program_id": program_id,
+            "search_mode": SearchMode.NEW_SEARCH.value,
+            "source_run_id": None,
+            "resumed_from_run_id": None,
+            "compatibility_fingerprint": fp,
+            "fingerprint_components": dict(comps),
+        }
+    )
+    return out
+
+
+def _clone_for_extend(enriched: dict[str, Any], *, program_id: str, source_run_id: str) -> dict[str, Any]:
+    """Simulate Continue Search cloning the enriched source config."""
+    out = dict(enriched)
+    out.update(
+        {
+            "search_program_id": program_id,
+            "source_run_id": source_run_id,
+            "resumed_from_run_id": source_run_id,
+            "search_mode": SearchMode.EXTEND_BUDGET.value,
+            "additional_runtime_seconds": 300.0,
+            "additional_generated_budget": 50,
+            "additional_full_wfo_budget": 25,
+            "max_runtime_seconds": 300.0,
+            "total_candidate_budget": int(enriched.get("total_candidate_budget") or 0) + 50,
+            "max_full_wfo": int(enriched.get("max_full_wfo") or 0) + 25,
+        }
+    )
+    return out
+
+
+def _fp_from_mf(mf: dict[str, Any], **comp_overrides: Any) -> tuple[str, dict[str, Any]]:
+    comps = build_fingerprint_components(
+        dataset_hash=str(comp_overrides.get("dataset_hash", "ds_test")),
+        timeframe=str(comp_overrides.get("timeframe", "5min")),
+        wfo_config_hash=str(comp_overrides.get("wfo_config_hash", hash_wfo_config({"n_folds": 3}))),
+        cost_model_version=str(comp_overrides.get("cost_model_version", "cost_v1")),
+        risk_model_version=str(comp_overrides.get("risk_model_version", "demo")),
+        execution_engine_code_hash=str(
+            comp_overrides.get("execution_engine_code_hash", "code_test")
+        ),
+        multi_family_config_hash=hash_multi_family_config(mf),
+        seed=int(mf.get("seed") or 7),
+        family_ids=list(mf.get("family_ids") or []),
+    )
+    fp = compute_compatibility_fingerprint(
+        dataset_hash=str(comps["dataset_hash"]),
+        timeframe=str(comps["timeframe"]),
+        wfo_config_hash=str(comps["wfo_config_hash"]),
+        cost_model_version=str(comps["cost_model_version"]),
+        risk_model_version=str(comps["risk_model_version"]),
+        execution_engine_code_hash=str(comps["execution_engine_code_hash"]),
+        multi_family_config_hash=str(comps["multi_family_config_hash"]),
+        seed=int(comps["seed"]),
+        family_ids=list(mf.get("family_ids") or []),
+    )
+    return fp, comps
+
+
+def test_hash_multi_family_ignores_runtime_and_dashboard_metadata() -> None:
+    base = _new_search_mf()
+    enriched = _enrich_frozen_mf(
+        base, program_id="sp_x", fp="fp_x", comps={"dataset_hash": "ds"}
+    )
+    extended = _clone_for_extend(enriched, program_id="sp_x", source_run_id="run_src")
+    assert hash_multi_family_config(base) == hash_multi_family_config(enriched)
+    assert hash_multi_family_config(base) == hash_multi_family_config(extended)
+    assert "compatibility_fingerprint" not in canonical_multi_family_payload(enriched)
+    assert "preview_family_specs" not in canonical_multi_family_payload(enriched)
+    assert "total_candidate_budget" not in canonical_multi_family_payload(extended)
+
+
+def test_extend_budget_fingerprint_matches_after_runtime_enrichment(tmp_path: Path) -> None:
+    """NEW_SEARCH fingerprint equals EXTEND_BUDGET clone of the enriched snapshot."""
+    from control_plane.search_bootstrap import prepare_search_program_session
+
+    base = _new_search_mf()
+    fp, comps = _fp_from_mf(base)
+    program_id = new_search_program_id()
+    store = SearchProgramStore(tmp_path / "search_programs")
+    store.create(
+        compatibility_fingerprint=fp,
+        seed=7,
+        family_ids=list(base["family_ids"]),
+        search_program_id=program_id,
+        metadata={"fingerprint_components": comps},
+    )
+    # Persist a minimal checkpoint with the same components (as NEW_SEARCH would).
+    ckpt = empty_checkpoint(
+        search_program_id=program_id,
+        compatibility_fingerprint=fp,
+        session_run_id="run_new",
+        search_mode=SearchMode.NEW_SEARCH.value,
+        seed=7,
+        config=dict(base),
+        fingerprint_components={
+            k: str(comps[k])
+            for k in (
+                "dataset_hash",
+                "timeframe",
+                "wfo_config_hash",
+                "cost_model_version",
+                "risk_model_version",
+                "execution_engine_code_hash",
+            )
+        },
+    )
+    ckpt.campaign_generated = 10
+    ckpt.campaign_evaluated = 10
+    ckpt.campaign_full_wfo = 10
+    ckpt.pipeline_phase = PipelinePhase.STRESS.value
+    # Fingerprint-only prepare path: empty pending avoids candidate rebuild.
+    ckpt.pending_stress_ids = []
+    save_checkpoint(store.checkpoint_path(program_id), ckpt)
+    store.update_cumulative(
+        program_id,
+        generated=10,
+        evaluated=10,
+        full_wfo=10,
+        checkpoint_path=str(store.checkpoint_path(program_id)),
+    )
+    before = store.get(program_id)
+    assert before is not None
+    cum_before = (
+        before.cumulative_generated,
+        before.cumulative_evaluated,
+        before.cumulative_full_wfo,
+    )
+
+    enriched = _enrich_frozen_mf(base, program_id=program_id, fp=fp, comps=comps)
+    extend_mf = _clone_for_extend(enriched, program_id=program_id, source_run_id="run_new")
+    incoming_fp, incoming_comps = _fp_from_mf(extend_mf)
+    assert incoming_fp == fp
+    assert incoming_comps["multi_family_config_hash"] == comps["multi_family_config_hash"]
+
+    prepared = prepare_search_program_session(
+        search_mode=SearchMode.EXTEND_BUDGET.value,
+        program_id=program_id,
+        program_store=store,
+        compatibility_fingerprint=incoming_fp,
+        seed=7,
+        family_ids=list(base["family_ids"]),
+        run_id="run_extend",
+        source_run_id="run_new",
+        resumed_from_run_id="run_new",
+        artifacts_root=tmp_path / "artifacts",
+        fingerprint_components=incoming_comps,
+        multi_family_config=extend_mf,
+        run_artifact_dir=tmp_path / "artifacts" / "run_extend",
+    )
+    assert prepared.search_program_id == program_id
+    assert prepared.resume_checkpoint is not None
+    after = store.get(program_id)
+    assert after is not None
+    assert (
+        after.cumulative_generated,
+        after.cumulative_evaluated,
+        after.cumulative_full_wfo,
+    ) == cum_before
+
+
+def test_fingerprint_rejects_dataset_wfo_code_and_structure_changes(tmp_path: Path) -> None:
+    from control_plane.search_bootstrap import prepare_search_program_session
+
+    base = _new_search_mf()
+    fp, comps = _fp_from_mf(base)
+    program_id = new_search_program_id()
+    store = SearchProgramStore(tmp_path / "search_programs")
+    store.create(
+        compatibility_fingerprint=fp,
+        seed=7,
+        family_ids=list(base["family_ids"]),
+        search_program_id=program_id,
+        metadata={"fingerprint_components": comps},
+    )
+    ckpt = empty_checkpoint(
+        search_program_id=program_id,
+        compatibility_fingerprint=fp,
+        session_run_id="run_new",
+        search_mode=SearchMode.NEW_SEARCH.value,
+        seed=7,
+        config=dict(base),
+        fingerprint_components={
+            k: str(comps[k])
+            for k in (
+                "dataset_hash",
+                "timeframe",
+                "wfo_config_hash",
+                "cost_model_version",
+                "risk_model_version",
+                "execution_engine_code_hash",
+            )
+        },
+    )
+    save_checkpoint(store.checkpoint_path(program_id), ckpt)
+
+    cases = [
+        ("dataset_hash", "ds_CHANGED", "DATASET_HASH_CHANGED"),
+        ("wfo_config_hash", "wfo_CHANGED", "WFO_CONFIG_CHANGED"),
+        ("execution_engine_code_hash", "code_CHANGED", "CODE_HASH_CHANGED"),
+    ]
+    for key, value, reason in cases:
+        art = tmp_path / f"art_{key}"
+        art.mkdir(parents=True, exist_ok=True)
+        bad_fp, bad_comps = _fp_from_mf(base, **{key: value})
+        with pytest.raises(IncompatibleSearchFingerprint, match=reason) as ei:
+            prepare_search_program_session(
+                search_mode=SearchMode.EXTEND_BUDGET.value,
+                program_id=program_id,
+                program_store=store,
+                compatibility_fingerprint=bad_fp,
+                seed=7,
+                family_ids=list(base["family_ids"]),
+                run_id=f"run_bad_{key}",
+                source_run_id="run_new",
+                resumed_from_run_id="run_new",
+                artifacts_root=tmp_path / "artifacts",
+                fingerprint_components=bad_comps,
+                multi_family_config=base,
+                run_artifact_dir=art,
+            )
+        assert (art / "fingerprint_diff.json").is_file()
+        assert reason in ei.value.diff.changed_reason_codes
+
+    # Structural multi-family threshold change
+    art_mf = tmp_path / "art_mf"
+    art_mf.mkdir(parents=True, exist_ok=True)
+    changed = _new_search_mf(min_dsr=0.99)
+    bad_fp, bad_comps = _fp_from_mf(changed)
+    with pytest.raises(IncompatibleSearchFingerprint, match="MULTI_FAMILY_STRUCTURE_CHANGED"):
+        prepare_search_program_session(
+            search_mode=SearchMode.EXTEND_BUDGET.value,
+            program_id=program_id,
+            program_store=store,
+            compatibility_fingerprint=bad_fp,
+            seed=7,
+            family_ids=list(base["family_ids"]),
+            run_id="run_bad_mf",
+            source_run_id="run_new",
+            resumed_from_run_id="run_new",
+            artifacts_root=tmp_path / "artifacts",
+            fingerprint_components=bad_comps,
+            multi_family_config=changed,
+            run_artifact_dir=art_mf,
+        )
+
+    # Seed / family change
+    art_seed = tmp_path / "art_seed"
+    art_seed.mkdir(parents=True, exist_ok=True)
+    seeded = _new_search_mf(seed=99)
+    bad_fp, bad_comps = _fp_from_mf(seeded)
+    with pytest.raises(IncompatibleSearchFingerprint, match="SEED_CHANGED"):
+        prepare_search_program_session(
+            search_mode=SearchMode.EXTEND_BUDGET.value,
+            program_id=program_id,
+            program_store=store,
+            compatibility_fingerprint=bad_fp,
+            seed=99,
+            family_ids=list(base["family_ids"]),
+            run_id="run_bad_seed",
+            source_run_id="run_new",
+            resumed_from_run_id="run_new",
+            artifacts_root=tmp_path / "artifacts",
+            fingerprint_components=bad_comps,
+            multi_family_config=seeded,
+            run_artifact_dir=art_seed,
+        )
+
+    # Failed checks must not mutate cumulative totals or append sessions.
+    prog = store.get(program_id)
+    assert prog is not None
+    assert prog.sessions == []
+    assert prog.cumulative_generated == 0
+
+
+def test_legacy_aggregate_fingerprint_migrates_when_components_match(tmp_path: Path) -> None:
+    """Programs hashed before runtime-metadata exclusion still resume."""
+    from control_plane.search_bootstrap import prepare_search_program_session
+
+    base = _new_search_mf()
+    modern_fp, comps = _fp_from_mf(base)
+    # Simulate the OLD polluted aggregate that included dashboard fields.
+    polluted = dict(base)
+    # Old denylist left preview/grammar fields in the hash payload.
+    from registry.hashing import sha256_json
+
+    old_payload = dict(polluted)
+    for k in (
+        "max_runtime_seconds",
+        "total_candidate_budget",
+        "max_full_wfo",
+        "max_evaluated_candidates",
+        "max_stress_evaluations",
+        "max_robustness_evaluations",
+        "search_mode",
+        "search_program_id",
+        "source_run_id",
+        "resumed_from_run_id",
+        "additional_runtime_seconds",
+        "additional_generated_budget",
+        "additional_full_wfo_budget",
+    ):
+        old_payload.pop(k, None)
+    old_mf_hash = "mf_" + sha256_json(old_payload)[:24]
+    old_fp = compute_compatibility_fingerprint(
+        dataset_hash=str(comps["dataset_hash"]),
+        timeframe=str(comps["timeframe"]),
+        wfo_config_hash=str(comps["wfo_config_hash"]),
+        cost_model_version=str(comps["cost_model_version"]),
+        risk_model_version=str(comps["risk_model_version"]),
+        execution_engine_code_hash=str(comps["execution_engine_code_hash"]),
+        multi_family_config_hash=old_mf_hash,
+        seed=7,
+        family_ids=list(base["family_ids"]),
+    )
+    assert old_fp != modern_fp
+
+    program_id = new_search_program_id()
+    store = SearchProgramStore(tmp_path / "search_programs")
+    store.create(
+        compatibility_fingerprint=old_fp,
+        seed=7,
+        family_ids=list(base["family_ids"]),
+        search_program_id=program_id,
+        metadata={"fingerprint_components": comps},
+    )
+    ckpt = empty_checkpoint(
+        search_program_id=program_id,
+        compatibility_fingerprint=old_fp,
+        session_run_id="run_new",
+        search_mode=SearchMode.NEW_SEARCH.value,
+        seed=7,
+        config=dict(base),
+        fingerprint_components={
+            k: str(comps[k])
+            for k in (
+                "dataset_hash",
+                "timeframe",
+                "wfo_config_hash",
+                "cost_model_version",
+                "risk_model_version",
+                "execution_engine_code_hash",
+            )
+        },
+    )
+    save_checkpoint(store.checkpoint_path(program_id), ckpt)
+
+    enriched = _enrich_frozen_mf(base, program_id=program_id, fp=old_fp, comps=comps)
+    extend_mf = _clone_for_extend(enriched, program_id=program_id, source_run_id="run_new")
+    incoming_fp, incoming_comps = _fp_from_mf(extend_mf)
+    assert incoming_fp == modern_fp
+
+    prepared = prepare_search_program_session(
+        search_mode=SearchMode.EXTEND_BUDGET.value,
+        program_id=program_id,
+        program_store=store,
+        compatibility_fingerprint=incoming_fp,
+        seed=7,
+        family_ids=list(base["family_ids"]),
+        run_id="run_migrate",
+        source_run_id="run_new",
+        resumed_from_run_id="run_new",
+        artifacts_root=tmp_path / "artifacts",
+        fingerprint_components=incoming_comps,
+        multi_family_config=extend_mf,
+        run_artifact_dir=tmp_path / "artifacts" / "run_migrate",
+    )
+    assert prepared.fingerprint_migrated is True
+    prog = store.get(program_id)
+    assert prog is not None
+    assert prog.compatibility_fingerprint == modern_fp
+
+
+def test_continue_enters_pending_stress_without_regen(tmp_path: Path) -> None:
+    """EXTEND_BUDGET with pending SCORE_QUALIFIED resumes at Stress, no Gen0 redo."""
+    fp = _fp_components()
+    program_id = new_search_program_id()
+    store = SearchProgramStore(tmp_path / "search_programs")
+    store.create(
+        compatibility_fingerprint="fp_stress",
+        seed=7,
+        family_ids=["mean_reversion"],
+        search_program_id=program_id,
+    )
+    cache = EvaluationCache(store.evaluation_cache_dir(program_id))
+    ckpt_path = store.checkpoint_path(program_id)
+    cfg = _tiny_cfg()
+    campaign = MultiFamilyCampaign(
+        config=cfg,
+        registry=ExperimentRegistry(tmp_path / "reg1"),
+        backend=CountingBackend(),
+        discovery_run_id="run_session_1",
+        research_eligible=False,
+        synthetic_stress_forbidden=False,
+        search_program_id=program_id,
+        search_mode=SearchMode.NEW_SEARCH.value,
+        compatibility_fingerprint="fp_stress",
+        fingerprint_components=fp,
+        checkpoint_path=ckpt_path,
+        evaluation_cache=cache,
+    )
+    result1 = campaign.run()
+    calls_after_first = CountingBackend.evaluate_calls
+    assert calls_after_first > 0
+    ckpt = load_checkpoint(ckpt_path)
+    assert ckpt is not None
+    # Force pending stress queue as if runtime exhausted before Stress finished.
+    any_cid = next(iter(ckpt.candidates))
+    ckpt.candidate_gates[any_cid] = SCORE_QUALIFIED
+    # Clear prior stress outcomes so the candidate is treated as awaiting Stress.
+    ckpt.stress_summaries = [
+        s for s in ckpt.stress_summaries if s.get("candidate_id") != any_cid
+    ]
+    mark_score_qualified_pending(ckpt)
+    assert ckpt.pending_stress_ids
+    assert choose_resume_phase(ckpt) is PipelinePhase.STRESS
+    save_checkpoint(ckpt_path, ckpt)
+    gen0_before = {
+        cid
+        for cid, raw in ckpt.candidates.items()
+        if int(raw.get("generation") or 0) == 0
+    }
+    evaluated_before = set(ckpt.evaluation_records.keys())
+
+    CountingBackend.evaluate_calls = 0
+    campaign2 = MultiFamilyCampaign(
+        config=apply_budget_extension(
+            _tiny_cfg(),
+            additional_runtime_seconds=60.0,
+            additional_generated_budget=0,
+            additional_full_wfo_budget=0,
+        ),
+        registry=ExperimentRegistry(tmp_path / "reg2"),
+        backend=CountingBackend(),
+        discovery_run_id="run_session_2",
+        research_eligible=False,
+        synthetic_stress_forbidden=False,
+        search_program_id=program_id,
+        search_mode=SearchMode.EXTEND_BUDGET.value,
+        compatibility_fingerprint="fp_stress",
+        fingerprint_components=fp,
+        checkpoint_path=ckpt_path,
+        evaluation_cache=cache,
+        resume_checkpoint=ckpt,
+    )
+    result2 = campaign2.run()
+    ckpt2 = load_checkpoint(ckpt_path)
+    assert ckpt2 is not None
+    gen0_after = {
+        cid
+        for cid, raw in ckpt2.candidates.items()
+        if int(raw.get("generation") or 0) == 0
+    }
+    assert gen0_before == gen0_after
+    # Completed WFO evaluations must not be repeated via cache.
+    assert CountingBackend.evaluate_calls < calls_after_first
+    assert evaluated_before.issubset(set(ckpt2.evaluation_records.keys()))
+    assert result1 is not None and result2 is not None

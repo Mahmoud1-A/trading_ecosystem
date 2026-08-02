@@ -543,9 +543,11 @@ def run_alpha_miner_job(
         if multi_cfg is not None:
             from discovery.search_program import (
                 INCOMPATIBLE_FINGERPRINT,
+                IncompatibleSearchFingerprint,
                 SearchMode,
                 SearchProgramStore,
                 SearchSessionRecord,
+                build_fingerprint_components,
                 compute_compatibility_fingerprint,
                 hash_multi_family_config,
                 hash_wfo_config,
@@ -625,47 +627,86 @@ def run_alpha_miner_job(
                 or provenance.get("code_hash")
                 or "local"
             )
-            fp_components = {
-                "dataset_hash": dataset_hash,
-                "timeframe": str(timeframe),
-                "wfo_config_hash": wfo_hash,
-                "cost_model_version": str(
+            family_ids = list(multi_cfg.family_ids) if multi_cfg.family_ids else None
+            fp_components = build_fingerprint_components(
+                dataset_hash=dataset_hash,
+                timeframe=str(timeframe),
+                wfo_config_hash=wfo_hash,
+                cost_model_version=str(
                     run.config_snapshot.get("cost_model_version") or run.cost_model_version
                 ),
-                "risk_model_version": str(
+                risk_model_version=str(
                     run.config_snapshot.get("risk_profile") or "demo"
                 ),
-                "execution_engine_code_hash": code_hash,
-            }
-            compatibility_fp = compute_compatibility_fingerprint(
-                dataset_hash=fp_components["dataset_hash"],
-                timeframe=fp_components["timeframe"],
-                wfo_config_hash=fp_components["wfo_config_hash"],
-                cost_model_version=fp_components["cost_model_version"],
-                risk_model_version=fp_components["risk_model_version"],
-                execution_engine_code_hash=fp_components["execution_engine_code_hash"],
+                execution_engine_code_hash=code_hash,
                 multi_family_config_hash=mf_hash,
                 seed=int(multi_cfg.seed),
-                family_ids=list(multi_cfg.family_ids) if multi_cfg.family_ids else None,
+                family_ids=family_ids,
+            )
+            compatibility_fp = compute_compatibility_fingerprint(
+                dataset_hash=str(fp_components["dataset_hash"]),
+                timeframe=str(fp_components["timeframe"]),
+                wfo_config_hash=str(fp_components["wfo_config_hash"]),
+                cost_model_version=str(fp_components["cost_model_version"]),
+                risk_model_version=str(fp_components["risk_model_version"]),
+                execution_engine_code_hash=str(
+                    fp_components["execution_engine_code_hash"]
+                ),
+                multi_family_config_hash=str(fp_components["multi_family_config_hash"]),
+                seed=int(fp_components["seed"]),
+                family_ids=family_ids,
             )
 
             program_root = Path(run.artifact_dir).resolve().parents[1] / "search_programs"
             program_store = SearchProgramStore(program_root)
-            prepared = prepare_search_program_session(
-                search_mode=search_mode,
-                program_id=str(program_id) if program_id else None,
-                program_store=program_store,
-                compatibility_fingerprint=compatibility_fp,
-                seed=int(multi_cfg.seed),
-                family_ids=list(multi_cfg.family_ids) if multi_cfg.family_ids else None,
-                run_id=run.run_id,
-                source_run_id=str(source_run_id) if source_run_id else None,
-                resumed_from_run_id=(
-                    str(resumed_from_run_id) if resumed_from_run_id else None
-                ),
-                artifacts_root=Path(run.artifact_dir).resolve().parent,
-                fingerprint_components=fp_components,
-            )
+            try:
+                prepared = prepare_search_program_session(
+                    search_mode=search_mode,
+                    program_id=str(program_id) if program_id else None,
+                    program_store=program_store,
+                    compatibility_fingerprint=compatibility_fp,
+                    seed=int(multi_cfg.seed),
+                    family_ids=family_ids,
+                    run_id=run.run_id,
+                    source_run_id=str(source_run_id) if source_run_id else None,
+                    resumed_from_run_id=(
+                        str(resumed_from_run_id) if resumed_from_run_id else None
+                    ),
+                    artifacts_root=Path(run.artifact_dir).resolve().parent,
+                    fingerprint_components=fp_components,
+                    multi_family_config=mf_raw,
+                    run_artifact_dir=art,
+                )
+            except IncompatibleSearchFingerprint as exc:
+                # Zero-work failure: do not append sessions or mutate checkpoint/totals.
+                run.state = RunState.FAILED
+                run.software_success = False
+                reasons = ",".join(exc.diff.changed_reason_codes) or INCOMPATIBLE_FINGERPRINT
+                run.terminal_reason = f"{INCOMPATIBLE_FINGERPRINT}: {reasons}"
+                summary = {
+                    "software_execution_status": "SOFTWARE_FAILURE",
+                    "discovery_result": "SOFTWARE_FAILURE",
+                    "terminal_reason": run.terminal_reason,
+                    "fingerprint_diff": exc.diff.as_dict(),
+                    "software_failure_banner": True,
+                }
+                (art / "fingerprint_diff.json").write_text(
+                    json.dumps(exc.diff.as_dict(), indent=2, default=str),
+                    encoding="utf-8",
+                )
+                (art / "run_summary.json").write_text(
+                    json.dumps(summary, indent=2, default=str), encoding="utf-8"
+                )
+                run.summary = summary
+                _emit(
+                    sink,
+                    run,
+                    EventType.RUN_FAILED,
+                    run.terminal_reason,
+                    severity=EventSeverity.ERROR,
+                    payload={"fingerprint_diff": exc.diff.as_dict()},
+                )
+                return run
             if prepared.bootstrap_report is not None:
                 (art / "legacy_bootstrap_report.json").write_text(
                     json.dumps(prepared.bootstrap_report.as_dict(), indent=2, default=str),
@@ -718,7 +759,20 @@ def run_alpha_miner_job(
                 search_program_id=str(program_id),
                 search_mode=search_mode,
                 compatibility_fingerprint=compatibility_fp,
-                fingerprint_components=fp_components,
+                fingerprint_components={
+                    k: str(v)
+                    for k, v in fp_components.items()
+                    if k
+                    in {
+                        "dataset_hash",
+                        "timeframe",
+                        "wfo_config_hash",
+                        "cost_model_version",
+                        "risk_model_version",
+                        "execution_engine_code_hash",
+                    }
+                    and v is not None
+                },
                 checkpoint_path=ckpt_path,
                 evaluation_cache=eval_cache,
                 resume_checkpoint=resume_ckpt,
@@ -742,6 +796,24 @@ def run_alpha_miner_job(
             campaign.progress_hook = _campaign_progress
             try:
                 campaign_result = campaign.run()
+            except IncompatibleSearchFingerprint as exc:
+                run.state = RunState.FAILED
+                run.software_success = False
+                reasons = ",".join(exc.diff.changed_reason_codes) or INCOMPATIBLE_FINGERPRINT
+                run.terminal_reason = f"{INCOMPATIBLE_FINGERPRINT}: {reasons}"
+                (art / "fingerprint_diff.json").write_text(
+                    json.dumps(exc.diff.as_dict(), indent=2, default=str),
+                    encoding="utf-8",
+                )
+                _emit(
+                    sink,
+                    run,
+                    EventType.RUN_FAILED,
+                    run.terminal_reason,
+                    severity=EventSeverity.ERROR,
+                    payload={"fingerprint_diff": exc.diff.as_dict()},
+                )
+                return run
             except ValueError as exc:
                 if INCOMPATIBLE_FINGERPRINT in str(exc):
                     run.state = RunState.FAILED

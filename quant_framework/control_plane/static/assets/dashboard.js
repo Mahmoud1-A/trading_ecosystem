@@ -871,6 +871,23 @@ async function renderAlpha() {
     run.summary?.signal_source ||
     "unknown";
   const softwareErr = statusText(report.terminal_reason || run.terminal_reason || report.error, "SOFTWARE_FAILURE");
+  const fpDiff = report.fingerprint_diff || run.summary?.fingerprint_diff || null;
+  const fpMismatchHtml = fpDiff ? `
+    <div class="sub" style="margin-top:0.5rem">
+      <strong>Fingerprint mismatch:</strong> ${(fpDiff.changed_reason_codes || []).join(", ") || "INCOMPATIBLE_SEARCH_FINGERPRINT"}
+      <pre class="mono" style="margin-top:0.35rem;white-space:pre-wrap">${JSON.stringify({
+        changed_components: fpDiff.changed_components,
+        changed_reason_codes: fpDiff.changed_reason_codes,
+        stored_dataset_hash: fpDiff.stored_dataset_hash,
+        incoming_dataset_hash: fpDiff.incoming_dataset_hash,
+        stored_wfo_hash: fpDiff.stored_wfo_hash,
+        incoming_wfo_hash: fpDiff.incoming_wfo_hash,
+        stored_git_commit_sha: fpDiff.stored_git_commit_sha,
+        incoming_git_commit_sha: fpDiff.incoming_git_commit_sha,
+        stored_components: fpDiff.stored_components,
+        incoming_components: fpDiff.incoming_components,
+      }, null, 2)}</pre>
+    </div>` : "";
   const budget = report.search_budget_consumed || {};
   const dist = report.rejection_reason_distribution || {};
   state.alphaRunActive = ACTIVE.has(run.state);
@@ -882,7 +899,7 @@ async function renderAlpha() {
     <div class="panel">${picker}
       <p class="sub" id="live_status">State: ${run.state} · progress ${(run.progress_pct||0).toFixed(0)}% · stage ${run.current_stage || "IDLE"}</p>
     </div>
-    ${isFailed ? `<div class="warn-box" style="border-color:#c0392b;background:rgba(192,57,43,0.12)"><strong style="color:#c0392b">SOFTWARE FAILURE</strong><br/>${softwareErr}<br/><span class="sub">Backend: ${statusText(report.evaluation_backend || run.summary?.evaluation_backend, "unknown")} · path: ${statusText(report.evaluation_path, report.evaluation_backend)}</span></div>` : (noFinalists && run.state === "COMPLETED" ? `<div class="warn-box"><strong>No candidate passed all mandatory Alpha Miner gates.</strong> Status: ${statusText(report.qualified_candidate_status, report.discovery_result || "NO_QUALIFIED_CANDIDATE")}<br/><span class="sub">${statusText(report.generation_cap_explanation, "")}</span></div>` : "")}
+    ${isFailed ? `<div class="warn-box" style="border-color:#c0392b;background:rgba(192,57,43,0.12)"><strong style="color:#c0392b">SOFTWARE FAILURE</strong><br/>${softwareErr}${fpMismatchHtml}<br/><span class="sub">Backend: ${statusText(report.evaluation_backend || run.summary?.evaluation_backend, "unknown")} · path: ${statusText(report.evaluation_path, report.evaluation_backend)}</span></div>` : (noFinalists && run.state === "COMPLETED" ? `<div class="warn-box"><strong>No candidate passed all mandatory Alpha Miner gates.</strong> Status: ${statusText(report.qualified_candidate_status, report.discovery_result || "NO_QUALIFIED_CANDIDATE")}<br/><span class="sub">${statusText(report.generation_cap_explanation, "")}</span></div>` : "")}
     ${(run.terminal_reason === "RUNTIME_EXHAUSTED" || report.terminal_reason === "RUNTIME_EXHAUSTED") ? `
     <div class="panel" id="continue_search_panel">
       <h3>Continue Search</h3>

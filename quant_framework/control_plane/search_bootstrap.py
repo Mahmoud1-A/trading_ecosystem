@@ -33,6 +33,9 @@ from discovery.search_program import (
     SearchMode,
     SearchProgramStore,
     assert_fingerprint_compatible,
+    build_fingerprint_components,
+    canonical_multi_family_payload,
+    hash_multi_family_config,
     new_search_program_id,
     now_iso,
 )
@@ -108,6 +111,82 @@ class PreparedSearchSession:
     created_new_program: bool
     bootstrapped_from_source: bool
     bootstrap_report: LegacyBootstrapReport | None = None
+    fingerprint_migrated: bool = False
+
+
+def _load_source_multi_family(artifacts_root: Path, source_run_id: str | None) -> dict[str, Any]:
+    if not source_run_id:
+        return {}
+    src = Path(artifacts_root) / str(source_run_id)
+    for name in ("run_record.json", "run_summary.json", "multi_family_campaign.json"):
+        path = src / name
+        if not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if name == "multi_family_campaign.json":
+            cfg = raw.get("config") or (raw.get("budget_allocation") or {}).get("config")
+            if isinstance(cfg, dict):
+                return dict(cfg)
+            continue
+        snap = raw.get("config_snapshot") or {}
+        mf = snap.get("multi_family") or raw.get("multi_family")
+        if isinstance(mf, dict):
+            return dict(mf)
+    return {}
+
+
+def _stored_fingerprint_context(
+    *,
+    program: Any,
+    checkpoint: SearchCheckpoint | None,
+    artifacts_root: Path,
+    source_run_id: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Rebuild stored strict components using canonical multi-family semantics."""
+    stored_mf: dict[str, Any] = {}
+    if checkpoint is not None and checkpoint.config:
+        stored_mf = dict(checkpoint.config)
+    source_mf = _load_source_multi_family(artifacts_root, source_run_id)
+    if not stored_mf:
+        stored_mf = dict(source_mf)
+
+    ckpt_comps = dict(checkpoint.fingerprint_components) if checkpoint is not None else {}
+    meta_comps: dict[str, Any] = {}
+    if isinstance(getattr(program, "metadata", None), dict):
+        meta_comps = dict(program.metadata.get("fingerprint_components") or {})
+    source_comps = dict(source_mf.get("fingerprint_components") or {})
+
+    def _pick(key: str) -> str:
+        for src in (ckpt_comps, meta_comps, source_comps):
+            if src.get(key) not in (None, ""):
+                return str(src[key])
+        return ""
+
+    mf_hash = hash_multi_family_config(stored_mf) if stored_mf else str(
+        ckpt_comps.get("multi_family_config_hash")
+        or meta_comps.get("multi_family_config_hash")
+        or source_comps.get("multi_family_config_hash")
+        or ""
+    )
+    family_ids = list(program.family_ids) if program.family_ids else None
+    if family_ids is None and stored_mf.get("family_ids"):
+        family_ids = list(stored_mf.get("family_ids") or [])
+
+    stored_components = build_fingerprint_components(
+        dataset_hash=_pick("dataset_hash"),
+        timeframe=_pick("timeframe"),
+        wfo_config_hash=_pick("wfo_config_hash"),
+        cost_model_version=_pick("cost_model_version"),
+        risk_model_version=_pick("risk_model_version"),
+        execution_engine_code_hash=_pick("execution_engine_code_hash"),
+        multi_family_config_hash=mf_hash,
+        seed=int(program.seed),
+        family_ids=family_ids,
+    )
+    return stored_components, canonical_multi_family_payload(stored_mf)
 
 
 def _tree_from_raw(raw: Any) -> ExprNode | None:
@@ -732,7 +811,9 @@ def prepare_search_program_session(
     source_run_id: str | None,
     resumed_from_run_id: str | None,
     artifacts_root: Path,
-    fingerprint_components: dict[str, str] | None = None,
+    fingerprint_components: dict[str, Any] | None = None,
+    multi_family_config: dict[str, Any] | None = None,
+    run_artifact_dir: Path | None = None,
 ) -> PreparedSearchSession:
     """Create or resume a search program, bootstrapping legacy runs when needed.
 
@@ -744,8 +825,11 @@ def prepare_search_program_session(
     mode = SearchMode(str(search_mode or SearchMode.NEW_SEARCH.value).upper())
     created_new = False
     bootstrapped = False
+    fingerprint_migrated = False
     resume_ckpt: SearchCheckpoint | None = None
     bootstrap_report: LegacyBootstrapReport | None = None
+    incoming_components = dict(fingerprint_components or {})
+    incoming_mf_canonical = canonical_multi_family_payload(multi_family_config)
 
     if mode is SearchMode.NEW_SEARCH:
         pid = program_id or new_search_program_id()
@@ -755,7 +839,10 @@ def prepare_search_program_session(
                 seed=int(seed),
                 family_ids=list(family_ids) if family_ids else None,
                 search_program_id=pid,
-                metadata={"created_by_run_id": run_id},
+                metadata={
+                    "created_by_run_id": run_id,
+                    "fingerprint_components": dict(incoming_components),
+                },
             )
             created_new = True
         ckpt_path = program_store.checkpoint_path(pid)
@@ -768,6 +855,7 @@ def prepare_search_program_session(
             created_new_program=created_new,
             bootstrapped_from_source=False,
             bootstrap_report=None,
+            fingerprint_migrated=False,
         )
 
     # RESUME_SEARCH / EXTEND_BUDGET / REEVALUATE_FROZEN_CANDIDATES
@@ -781,11 +869,46 @@ def prepare_search_program_session(
         if existing is None:
             deferred_create = True
         else:
-            assert_fingerprint_compatible(
+            ckpt_path_early = program_store.checkpoint_path(pid)
+            stored_ckpt = load_checkpoint(ckpt_path_early)
+            stored_components, stored_mf_canonical = _stored_fingerprint_context(
+                program=existing,
+                checkpoint=stored_ckpt,
+                artifacts_root=artifacts_root,
+                source_run_id=source_run_id,
+            )
+            if (
+                "multi_family_config_hash" not in incoming_components
+                and multi_family_config is not None
+            ):
+                incoming_components["multi_family_config_hash"] = hash_multi_family_config(
+                    multi_family_config
+                )
+            if "seed" not in incoming_components:
+                incoming_components["seed"] = int(seed)
+            if "family_ids" not in incoming_components:
+                incoming_components["family_ids"] = (
+                    sorted(str(x) for x in family_ids) if family_ids else None
+                )
+            migrate_diff = assert_fingerprint_compatible(
                 existing.compatibility_fingerprint,
                 compatibility_fingerprint,
                 mode=mode,
+                stored_components=stored_components,
+                incoming_components=incoming_components,
+                stored_multi_family_canonical=stored_mf_canonical,
+                incoming_multi_family_canonical=incoming_mf_canonical,
+                artifact_dir=run_artifact_dir,
             )
+            if migrate_diff is not None and migrate_diff.migrated_aggregate:
+                existing.compatibility_fingerprint = compatibility_fingerprint
+                meta = dict(existing.metadata or {})
+                meta["fingerprint_components"] = dict(incoming_components)
+                meta["fingerprint_migrated_at"] = now_iso()
+                meta["fingerprint_migrated_from"] = migrate_diff.stored_fingerprint
+                existing.metadata = meta
+                program_store.save(existing)
+                fingerprint_migrated = True
 
     ckpt_path = program_store.checkpoint_path(pid)
     # Do not mkdir the program dir until bootstrap publishes (atomic rollback).
@@ -837,7 +960,20 @@ def prepare_search_program_session(
                 compatibility_fingerprint=compatibility_fingerprint,
                 session_run_id=run_id,
                 search_mode=mode.value,
-                fingerprint_components=fingerprint_components,
+                fingerprint_components={
+                    k: str(v)
+                    for k, v in incoming_components.items()
+                    if k
+                    in {
+                        "dataset_hash",
+                        "timeframe",
+                        "wfo_config_hash",
+                        "cost_model_version",
+                        "risk_model_version",
+                        "execution_engine_code_hash",
+                    }
+                    and v is not None
+                },
                 source_run_id=str(source_run_id),
                 resumed_from_run_id=str(resumed_from_run_id or source_run_id),
             )
@@ -863,6 +999,7 @@ def prepare_search_program_session(
                         "created_by_run_id": run_id,
                         "legacy_bootstrap": True,
                         "source_run_id": source_run_id,
+                        "fingerprint_components": dict(incoming_components),
                     },
                 )
                 created_new = True
@@ -921,4 +1058,5 @@ def prepare_search_program_session(
         created_new_program=created_new,
         bootstrapped_from_source=bootstrapped,
         bootstrap_report=bootstrap_report,
+        fingerprint_migrated=fingerprint_migrated,
     )
