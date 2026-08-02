@@ -9,6 +9,13 @@ on:
       - scripts/apply_economic_fitness_and_stress_observability.py
       - scripts/finalize_stress_progress_context.py
       - .github/workflows/apply-economic-fitness-hardening.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - scripts/apply_economic_fitness_and_stress_observability.py
+      - scripts/finalize_stress_progress_context.py
+      - .github/workflows/apply-economic-fitness-hardening.yml
 
 concurrency:
   group: economic-hardening-${{ github.ref }}
