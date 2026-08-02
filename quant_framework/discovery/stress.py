@@ -132,6 +132,7 @@ class StressTester:
     research_eligible: bool = False
     synthetic_stress_forbidden: bool = False
     progress_hook: Callable[[str, dict[str, Any]], None] | None = None
+    progress_context: dict[str, Any] = field(default_factory=dict)
     # Legacy field retained but NOT used as sole pass criterion on research paths.
     min_fitness_ratio: float = 0.35
     # Accounting from the most recent run() call (honest Stress budget proof).
@@ -139,7 +140,9 @@ class StressTester:
 
     def _emit(self, name: str, payload: dict[str, Any]) -> None:
         if self.progress_hook is not None:
-            self.progress_hook(name, payload)
+            # Candidate-level context is supplied by MultiFamilyCampaign so
+            # scenario progress is monotonic across the full Stress queue.
+            self.progress_hook(name, {**self.progress_context, **payload})
 
     def run(
         self,

@@ -2240,6 +2240,11 @@ class MultiFamilyCampaign:
                 raw_baseline = rec.meta.get("baseline_wfo_artifacts")
                 if isinstance(raw_baseline, dict):
                     baseline_arts = dict(raw_baseline)
+            tester.progress_context = {
+                "candidate_index": candidate_index,
+                "total_candidates": len(ordered),
+                "family_id": family_id,
+            }
             try:
                 results = tester.run(
                     cand,
