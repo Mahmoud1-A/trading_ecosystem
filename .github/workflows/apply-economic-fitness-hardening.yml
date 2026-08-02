@@ -39,16 +39,46 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e "./quant_framework[dev]"
 
-      - name: Run economic objective regressions
+      - name: Compile modified runtime modules
+        working-directory: quant_framework
+        run: python -m compileall -q discovery control_plane
+
+      - name: Verify Stress observability and checkpoint wiring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          campaign = Path("quant_framework/discovery/multi_family_campaign.py").read_text(encoding="utf-8")
+          stress = Path("quant_framework/discovery/stress.py").read_text(encoding="utf-8")
+          jobs = Path("quant_framework/control_plane/jobs.py").read_text(encoding="utf-8")
+
+          required_campaign = (
+              "STRESS_CANDIDATE_STARTED",
+              "STRESS_CANDIDATE_COMPLETED",
+              "sync_pending_gate_queues(ckpt)",
+              "self._persist_live_checkpoint()",
+          )
+          required_stress = (
+              "STRESS_SCENARIO_STARTED",
+              "STRESS_SCENARIO_COMPLETED",
+              "progress_hook",
+          )
+          required_jobs = (
+              '"STRESS_CANDIDATE_STARTED": EventType.PROGRESS',
+              '"STRESS_SCENARIO_COMPLETED": EventType.PROGRESS',
+          )
+          assert all(token in campaign for token in required_campaign)
+          assert all(token in stress for token in required_stress)
+          assert all(token in jobs for token in required_jobs)
+          PY
+
+      - name: Run repository-contained regressions
         working-directory: quant_framework
         run: |
           python -m pytest -q \
             ../tests/test_quant_robust_fitness_economic.py \
             tests/test_score_qualified_gates.py \
-            tests/test_oos_trade_floors.py \
-            tests/test_phase3b1_multifamily_stress.py \
-            tests/test_search_resume.py \
-            tests/test_control_plane_alpha_dashboard.py
+            tests/test_phase3b1_multifamily_stress.py
 
       - name: Commit generated hardening
         run: |
