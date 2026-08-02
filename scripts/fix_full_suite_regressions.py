@@ -72,6 +72,59 @@ def _reproducible_allocation_payload(payload: dict[str, Any]) -> dict[str, Any]:
     path.write_text(text, encoding="utf-8")
 
 
+def patch_declared_event_backend_imports() -> None:
+    """Preserve backend checks without importing the local data stack needlessly.
+
+    Both old checks already accepted an injected backend when its declared
+    backend_kind matched the required event-driven kind. Importing the concrete
+    EventDrivenDiscoveryBackend class before that declaration check added no
+    integrity and made data-independent tests require the local lake package.
+    """
+    campaign = ROOT / "quant_framework" / "discovery" / "multi_family_campaign.py"
+    old_campaign = '''        from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
+
+        kind = str(getattr(self.backend, "backend_kind", type(self.backend).__name__))
+        if forbid and not isinstance(self.backend, EventDrivenDiscoveryBackend):
+            if kind != _REQUIRED_ROBUSTNESS_BACKEND_KIND:
+                return None, REAL_ROBUSTNESS_BACKEND_REQUIRED, kind
+'''
+    new_campaign = '''        kind = str(getattr(self.backend, "backend_kind", type(self.backend).__name__))
+        if forbid and kind != _REQUIRED_ROBUSTNESS_BACKEND_KIND:
+            # Only import the concrete real-data backend when a declaration did
+            # not already satisfy the exact kind required by the existing gate.
+            from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
+
+            if not isinstance(self.backend, EventDrivenDiscoveryBackend):
+                return None, REAL_ROBUSTNESS_BACKEND_REQUIRED, kind
+'''
+    replace_once(campaign, old_campaign, new_campaign)
+
+    robustness = ROOT / "quant_framework" / "discovery" / "parameter_robustness.py"
+    old_robustness = '''        if forbid:
+            kind = str(getattr(self.backend, "backend_kind", ""))
+            # Real EventDrivenDiscoveryBackend or an injected backend that
+            # honestly declares the expected event-driven kind.
+            from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
+
+            is_real = isinstance(self.backend, EventDrivenDiscoveryBackend)
+            if not is_real and kind != self.expected_backend_kind:
+                raise RuntimeError(REAL_ROBUSTNESS_BACKEND_REQUIRED)
+'''
+    new_robustness = '''        if forbid:
+            kind = str(getattr(self.backend, "backend_kind", ""))
+            # The existing integrity contract accepts either the concrete real
+            # backend or an injected backend declaring the exact expected kind.
+            # Avoid importing the local data stack when that declaration already
+            # satisfies the gate; import only for the concrete-class fallback.
+            if kind != self.expected_backend_kind:
+                from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
+
+                if not isinstance(self.backend, EventDrivenDiscoveryBackend):
+                    raise RuntimeError(REAL_ROBUSTNESS_BACKEND_REQUIRED)
+'''
+    replace_once(robustness, old_robustness, new_robustness)
+
+
 def patch_acquisition_tests() -> None:
     dsl = ROOT / "quant_framework" / "tests" / "test_dsl_regime_gate_typing.py"
     old_dsl = '''        parent = json.loads(MULTIYEAR_PARENT.read_text(encoding="utf-8"))
@@ -160,6 +213,7 @@ def patch_acquisition_tests() -> None:
 
 def main() -> None:
     patch_reproducible_fingerprint()
+    patch_declared_event_backend_imports()
     patch_acquisition_tests()
     print("Full-suite lifecycle and fingerprint regressions fixed.")
 
