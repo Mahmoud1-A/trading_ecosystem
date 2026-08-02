@@ -1,6 +1,7 @@
 name: Apply economic fitness and Stress observability hardening
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - fix/alpha-budget-drain
