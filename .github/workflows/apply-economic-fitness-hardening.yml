@@ -1,0 +1,60 @@
+name: Apply economic fitness and Stress observability hardening
+
+on:
+  push:
+    branches:
+      - fix/alpha-budget-drain
+    paths:
+      - scripts/apply_economic_fitness_and_stress_observability.py
+      - .github/workflows/apply-economic-fitness-hardening.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/alpha-budget-drain
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply targeted hardening
+        run: python scripts/apply_economic_fitness_and_stress_observability.py
+
+      - name: Install framework
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "./quant_framework[dev]"
+
+      - name: Run economic objective regressions
+        run: |
+          python -m pytest -q \
+            tests/test_quant_robust_fitness_economic.py \
+            quant_framework/tests/test_score_qualified_gates.py \
+            quant_framework/tests/test_oos_trade_floors.py \
+            quant_framework/tests/test_phase3b1_multifamily_stress.py \
+            quant_framework/tests/test_search_resume.py \
+            quant_framework/tests/test_control_plane_alpha_dashboard.py
+
+      - name: Commit generated hardening
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            quant_framework/discovery/fitness.py \
+            quant_framework/discovery/multi_family_campaign.py \
+            quant_framework/discovery/stress.py \
+            quant_framework/control_plane/jobs.py \
+            tests/test_quant_robust_fitness_economic.py
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit"
+          else
+            git commit -m "Harden economic fitness and make Stress observable"
+            git push origin HEAD:fix/alpha-budget-drain
+          fi
