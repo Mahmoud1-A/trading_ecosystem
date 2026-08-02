@@ -8,6 +8,12 @@ on:
     paths:
       - scripts/apply_economic_fitness_and_stress_observability.py
       - .github/workflows/apply-economic-fitness-hardening.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - scripts/apply_economic_fitness_and_stress_observability.py
+      - .github/workflows/apply-economic-fitness-hardening.yml
 
 permissions:
   contents: write
