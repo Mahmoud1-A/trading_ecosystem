@@ -1,0 +1,700 @@
+{
+  "schema_version": 1,
+  "included_paths": [
+    {
+      "path": "quant_framework/cfds/cost_policy.py",
+      "content_sha256": "412365e2b3d69562933728789ef2475fb729aa8195183860f8b63ecb813450d1"
+    },
+    {
+      "path": "quant_framework/cfds/execution_profile.py",
+      "content_sha256": "723440d3c5d8dea823d995bd79efdd6fbb1d3e0e7119fbd0582ee217451eee24"
+    },
+    {
+      "path": "quant_framework/cfds/financing_profile.py",
+      "content_sha256": "d7869d4cf33386b376b02d24d3858664bdb729e6ad4b555dcb3fb4ce35aee0bf"
+    },
+    {
+      "path": "quant_framework/cfds/instrument_spec.py",
+      "content_sha256": "e14b81fc339538a1b93429ac1bdc7c6c3f48f53a07b225edd2f6cf6f248ed387"
+    },
+    {
+      "path": "quant_framework/cfds/prop_profile.py",
+      "content_sha256": "57a8c7def2576511375ceec29c1fe6d3b16b180b95c4fea20cbf95ea1c4b99b4"
+    },
+    {
+      "path": "quant_framework/config/asset_spec.py",
+      "content_sha256": "5f68ebfd21a19529255b7585a0f3fa0dda13d9e0d4f51e0a558f6e5e2f7d6509"
+    },
+    {
+      "path": "quant_framework/config/cost_model.py",
+      "content_sha256": "28ba77b5353cf2b1b0494965723baf015426c964819ebba4b579068c67944124"
+    },
+    {
+      "path": "quant_framework/config/models.py",
+      "content_sha256": "1266371b1bc774cb45d97080d657cecae0fdb5e66da3c62b1486c5a9efbef57d"
+    },
+    {
+      "path": "quant_framework/config/prop_profile.py",
+      "content_sha256": "2a3b9ab9b56a7d9d31eb639b1a245a63abaa2284ebcc7de46f179278c68f51c2"
+    },
+    {
+      "path": "quant_framework/config/system_config.py",
+      "content_sha256": "4952ec762b70fcb16fa1150ec0f09260ae6769bd6f75e627538631231e6fadd8"
+    },
+    {
+      "path": "quant_framework/config/walk_forward_config.py",
+      "content_sha256": "d46a302ebe5faf5a78275f882e91fec5a365347861214a9710259fc8b9c0a9d5"
+    },
+    {
+      "path": "quant_framework/discovery/behavioral_dedup.py",
+      "content_sha256": "d05eacee4b70ff6e7590965e8eba2fbac236f75f7f8d60c457d2fc861c3f49ba"
+    },
+    {
+      "path": "quant_framework/discovery/candidate.py",
+      "content_sha256": "053e3997041990874fcf0d0055345e8b2c1a96208ef5c0db66d85b6dd59bcab8"
+    },
+    {
+      "path": "quant_framework/discovery/canonicalization.py",
+      "content_sha256": "bf5f49aa8ef41f85ee5be8d27291158021d5253b2494909db6c2fe0a6d9a3775"
+    },
+    {
+      "path": "quant_framework/discovery/complexity.py",
+      "content_sha256": "0cffa92a4326ccea5d8131c8fa8e43e77283bef52b1b99590a348c238285e043"
+    },
+    {
+      "path": "quant_framework/discovery/crossover.py",
+      "content_sha256": "6d445ed0f58e8bf4fd9a104cb8edba7038c74926f8a6d8be0c30af06f3676781"
+    },
+    {
+      "path": "quant_framework/discovery/dsl_series.py",
+      "content_sha256": "86b5daa66e67b811820ad8acd1177d483164055fd01b2b8dde09e4ed2866715c"
+    },
+    {
+      "path": "quant_framework/discovery/dsl_signal_adapter.py",
+      "content_sha256": "2289fc1cdef0c4fae1135e7d8baabe6388ddc44bfaabc80fc87c9722a50fe218"
+    },
+    {
+      "path": "quant_framework/discovery/evaluator.py",
+      "content_sha256": "0d8b1cd035429b675d7cb0329b76b10a5aee0fdda2e7f4ee722000db973ef8a4"
+    },
+    {
+      "path": "quant_framework/discovery/event_wfo_backend.py",
+      "content_sha256": "8acc3f6a7b60fc500b265d8459d23bb7a299c419d2e8ccc43cbc1d0cfb1eca53"
+    },
+    {
+      "path": "quant_framework/discovery/expression_tree.py",
+      "content_sha256": "aebc4b93b3840ad0a6f4bd73cfd0ad3a38b55fc36d31762e82e9997804250058"
+    },
+    {
+      "path": "quant_framework/discovery/family_catalog.py",
+      "content_sha256": "9cba7e030bff167ace7c4471c67273b0a6761d4b7a659e5fafa82372febccf3b"
+    },
+    {
+      "path": "quant_framework/discovery/family_generator.py",
+      "content_sha256": "cc393ca769d71686d8d0d353999982ea3d0f6a7b3281738674e0ddd35eafdb0b"
+    },
+    {
+      "path": "quant_framework/discovery/family_spec.py",
+      "content_sha256": "9bb1ff704c683e47563d19e9332c04d394ea880dcdffeb63fd3d4c3e5f5a3846"
+    },
+    {
+      "path": "quant_framework/discovery/feature_domains.py",
+      "content_sha256": "a04e92dbbb4e7d876c1ccaf1c889a80fef7341e8b51191769add3210265d70f1"
+    },
+    {
+      "path": "quant_framework/discovery/fitness.py",
+      "content_sha256": "f87a11a4154c425044003419e5417f95246fc80c1cd71639a12f563d79899fdf"
+    },
+    {
+      "path": "quant_framework/discovery/freezing.py",
+      "content_sha256": "3d64843998740729987f8ece4ed2b1839e262d95bb87319a41cd0eb2f1f1cd4b"
+    },
+    {
+      "path": "quant_framework/discovery/generator.py",
+      "content_sha256": "139d630003aae8761bc4285fa34ee54271a987ea4a723ec5770a6a20d19164aa"
+    },
+    {
+      "path": "quant_framework/discovery/grammar.py",
+      "content_sha256": "71a6cfcf8f8371272e7549f95dafec49ccf53554cba9a7714785b45b5a4b9678"
+    },
+    {
+      "path": "quant_framework/discovery/legacy_parameters.py",
+      "content_sha256": "beba64af779b880579e80c775df32cf18402568d0ccc385829e04c7a0b647949"
+    },
+    {
+      "path": "quant_framework/discovery/lineage.py",
+      "content_sha256": "dd3e42c0f481d5bab25418576894c883b1cd8cc13dc3c710354500d3b2e9d530"
+    },
+    {
+      "path": "quant_framework/discovery/multi_family_campaign.py",
+      "content_sha256": "1eb352de01fc7635e07db04e1e90506323c309f64105dd9513ddd9d4f3419494"
+    },
+    {
+      "path": "quant_framework/discovery/mutation.py",
+      "content_sha256": "2a5f03d5ff5a97fbab49300398831c7ed407570763acf092136af22314a83fce"
+    },
+    {
+      "path": "quant_framework/discovery/operators.py",
+      "content_sha256": "b5969a9692b55475beea22a2404bb8dbe2481df2d175b00ac45829c39a999d3a"
+    },
+    {
+      "path": "quant_framework/discovery/parameter_robustness.py",
+      "content_sha256": "9be45456489e148c4c4ccb99655218d1ebf5b320f6bee30960cdf4e340eefc3f"
+    },
+    {
+      "path": "quant_framework/discovery/prechecks.py",
+      "content_sha256": "d083af9f2c3b6f985fdf3106bea421b0831cc332d8fdb6b28dc4ffd034a9bcea"
+    },
+    {
+      "path": "quant_framework/discovery/regime_gates.py",
+      "content_sha256": "d8fcb2517e93be1b8e23909ba4d4a57b6fafa7d6d6cc0597d7c86488b7dfb365"
+    },
+    {
+      "path": "quant_framework/discovery/repair.py",
+      "content_sha256": "480ea515eab2fee3469abf5fe2c2cb87dc076161bb2dedeab9ef3bb809c737e3"
+    },
+    {
+      "path": "quant_framework/discovery/search_controller.py",
+      "content_sha256": "47ca3f2316062a8a222d138a2be3f1db27a7eb0f3d5c0606ab1b16b9f1661ea4"
+    },
+    {
+      "path": "quant_framework/discovery/selection.py",
+      "content_sha256": "260f6c9a9ee768fd7ed464dfb7e3357606c5c4122ffe86e2ab8c03ed212a39e7"
+    },
+    {
+      "path": "quant_framework/discovery/stable_hash.py",
+      "content_sha256": "2104ac374ac4a6c9903640fef9901cb16eaad00c25ba51790a76d8a207aad112"
+    },
+    {
+      "path": "quant_framework/discovery/stress.py",
+      "content_sha256": "3748c8e8825e193861365078e4ec37feac7d9fd188d4808a8b1ebf21c2460dff"
+    },
+    {
+      "path": "quant_framework/discovery/stress_backend.py",
+      "content_sha256": "68c9f45c39bf88617acb100a973394ba9375f416a6d3c0df0e4d13c970393c86"
+    },
+    {
+      "path": "quant_framework/discovery/typecheck.py",
+      "content_sha256": "0b2e0880559859782226a5d4c7fc3668566263b26ffe7f2c14952be5bf350cb1"
+    },
+    {
+      "path": "quant_framework/discovery/types.py",
+      "content_sha256": "42c9f9686a9c77c2e983db6c4c8b66bb742696142f0e6aafa1923690e8d309f2"
+    },
+    {
+      "path": "quant_framework/engine/event_execution.py",
+      "content_sha256": "983534784248220a153b54dab36181d918822805c0b634f5bb0def4f11e52ac9"
+    },
+    {
+      "path": "quant_framework/engine/events.py",
+      "content_sha256": "4162695fad5cae51d23d04518946bb270e977acfbe7fe1ecf46e1d840f53a8a8"
+    },
+    {
+      "path": "quant_framework/engine/fills.py",
+      "content_sha256": "67675a39983757cf1ebcd77a60c75141b002cac723bcdaa3e5016b642d798868"
+    },
+    {
+      "path": "quant_framework/engine/financing.py",
+      "content_sha256": "a4aa08611de82d210f1ab01d3fa96d624576fb016ae18583c37cce890c0b45d2"
+    },
+    {
+      "path": "quant_framework/engine/friction.py",
+      "content_sha256": "88d66ae99bab8ef821fc0ba5e94187e6021c60db551394544956b7cc99af9b69"
+    },
+    {
+      "path": "quant_framework/engine/ids.py",
+      "content_sha256": "d78e7f7e8ee569db3e6af901828ad95550d2e79d917d2f8128f0dbdcff378c53"
+    },
+    {
+      "path": "quant_framework/engine/intrabar_policy.py",
+      "content_sha256": "8fadbbdf610a55448306ea2721754589acc34d4f91429de5822d3280c1e901f4"
+    },
+    {
+      "path": "quant_framework/engine/orders.py",
+      "content_sha256": "6228477e8564eeff90769b5c18564be63ec3c61be9986e95fdeb20cd21844f6f"
+    },
+    {
+      "path": "quant_framework/engine/portfolio.py",
+      "content_sha256": "89b11aaffe4cf4eb4497665d3f1c6ff029a930aafb207626c7b965f728d0e3d9"
+    },
+    {
+      "path": "quant_framework/engine/positions.py",
+      "content_sha256": "5fbf52a3602998b1c189992431eef6ff756738ee9d550253bf2ca1497cecc2a9"
+    },
+    {
+      "path": "quant_framework/engine/rollover.py",
+      "content_sha256": "aa860fbec3379853e976a77520d5e9311d395f0bb25c280b1775e15a3ed52a73"
+    },
+    {
+      "path": "quant_framework/engine/vectorized_features.py",
+      "content_sha256": "79d1f4b12ec157635b81fb94d034e89269080727eaa943ad4d66ce52176bd321"
+    },
+    {
+      "path": "quant_framework/features/catalog.py",
+      "content_sha256": "ca9412c51f63cde1b766e7e826035fa38dccbaef4f491237f6594a789ed79d7d"
+    },
+    {
+      "path": "quant_framework/features/contracts.py",
+      "content_sha256": "77efd77b6046ff4ee4ef88c82c90df734f1e9783ade9660887749c80e1642267"
+    },
+    {
+      "path": "quant_framework/features/cross_asset.py",
+      "content_sha256": "65939c80e3524d29382c9eec7ebf85feeefe8673c657bce6f237f5e17f7039ed"
+    },
+    {
+      "path": "quant_framework/features/definitions.py",
+      "content_sha256": "6a5c31f2689e5d55390a2dbdcf8c9e09e2f1c7d2f304b8681e55bca4ff0973aa"
+    },
+    {
+      "path": "quant_framework/features/generator.py",
+      "content_sha256": "37145218605e1b6c73bbc68b5998d6e1cac3110339cec4219e98c28d23e89e6f"
+    },
+    {
+      "path": "quant_framework/features/liquidity.py",
+      "content_sha256": "ceece7b18ba999f2d393f3125ba4cc7c71464a4b03c05f69691d9dffdf8417d4"
+    },
+    {
+      "path": "quant_framework/features/microstructure.py",
+      "content_sha256": "78bb737304485fc74e400673778b86517705612ed7c5ee157e7f72119a91e9e8"
+    },
+    {
+      "path": "quant_framework/features/normalization.py",
+      "content_sha256": "32117770c71df082ef09cc4541b4e3c3b00d5e26b7fe625f3c5021cf4c7df5d6"
+    },
+    {
+      "path": "quant_framework/features/price.py",
+      "content_sha256": "4828ff0ec05dc25587421e1d1413278345c1c84431c9eef56989cfddfbba693b"
+    },
+    {
+      "path": "quant_framework/features/regime_features.py",
+      "content_sha256": "0e1c0ae82c835e5b736725eb2be7e49501b7bd0acfb952f5be9505e7cc9051cc"
+    },
+    {
+      "path": "quant_framework/features/temporal.py",
+      "content_sha256": "273307cfe98ba2519ce376395a7a155d63281dd4973fdc4986ec164909318fa9"
+    },
+    {
+      "path": "quant_framework/features/validation.py",
+      "content_sha256": "51d5ce7f1cebac181f21d959e25d29f8d8d2949f076e717f840979aa8ecc6fdf"
+    },
+    {
+      "path": "quant_framework/features/volatility.py",
+      "content_sha256": "3cc95c9cc55e50d4b33caf83ce05adc85207d9c1690d9cee69b84eb75a971b11"
+    },
+    {
+      "path": "quant_framework/metrics/diagnostics.py",
+      "content_sha256": "9049046f8fc43ad86879b6c15592a55c2dac93bdff801ce8dd3cf5b77c9ebf93"
+    },
+    {
+      "path": "quant_framework/metrics/drawdown.py",
+      "content_sha256": "0cc31c2d882f8f108263358979f99003b7149564ac2d07dc2bcfedb7c2054db0"
+    },
+    {
+      "path": "quant_framework/metrics/dsr.py",
+      "content_sha256": "85959d84ebe1d7e66d83cf441762aa043a2dd5dda4e11ba8f2d918e456d27a4c"
+    },
+    {
+      "path": "quant_framework/metrics/pbo.py",
+      "content_sha256": "c2599eb986db210dc4383051a2d84b6ad631ed33c2678a9be2c5dc2c8a02dde5"
+    },
+    {
+      "path": "quant_framework/metrics/performance.py",
+      "content_sha256": "79ab6660c25103c8b54f0789a6e27e7fb66e588979f3621b4b91aa205f4de6ed"
+    },
+    {
+      "path": "quant_framework/regime/detector.py",
+      "content_sha256": "281be533fb0fa69818de536f0fb3c843d46237daf3370d82509d14eb9618bb23"
+    },
+    {
+      "path": "quant_framework/risk/exposure.py",
+      "content_sha256": "8bd2e50ee8633bc566c4cca02430686946aeb32bf86ed009efee25c59ef61872"
+    },
+    {
+      "path": "quant_framework/risk/fsm.py",
+      "content_sha256": "9b56ca51fcd5e34826af1c4d7fc80bc8840ad4f48f67bcc615255ed15dca1fe5"
+    },
+    {
+      "path": "quant_framework/risk/position_sizing.py",
+      "content_sha256": "5cf0b7ac621c3ce0b026e046e343594184d46de107536a55e44a16cabe0bcee0"
+    },
+    {
+      "path": "quant_framework/validation/bootstrap.py",
+      "content_sha256": "9d2395c4b588b42c69e2830a5933d58f81144b56e55688868278b80d4ca50934"
+    },
+    {
+      "path": "quant_framework/validation/event_driven_wfo.py",
+      "content_sha256": "e51090019fe422ebba599134d708e32294709b710e86c395e48644907cbc3a02"
+    },
+    {
+      "path": "quant_framework/validation/purge_embargo.py",
+      "content_sha256": "98cff334cbd3307dfa1dffc73eaf4229e5ac55dc698ab84b7fe7ac5c0bce2314"
+    },
+    {
+      "path": "quant_framework/validation/walk_forward.py",
+      "content_sha256": "5e8310b24ed589408f157c391a1bde195ddea7ad60f41bf72bed04112a9ec095"
+    }
+  ],
+  "included_paths_current": [
+    {
+      "path": "quant_framework/cfds/cost_policy.py",
+      "content_sha256": "412365e2b3d69562933728789ef2475fb729aa8195183860f8b63ecb813450d1"
+    },
+    {
+      "path": "quant_framework/cfds/execution_profile.py",
+      "content_sha256": "723440d3c5d8dea823d995bd79efdd6fbb1d3e0e7119fbd0582ee217451eee24"
+    },
+    {
+      "path": "quant_framework/cfds/financing_profile.py",
+      "content_sha256": "d7869d4cf33386b376b02d24d3858664bdb729e6ad4b555dcb3fb4ce35aee0bf"
+    },
+    {
+      "path": "quant_framework/cfds/instrument_spec.py",
+      "content_sha256": "e14b81fc339538a1b93429ac1bdc7c6c3f48f53a07b225edd2f6cf6f248ed387"
+    },
+    {
+      "path": "quant_framework/cfds/prop_profile.py",
+      "content_sha256": "57a8c7def2576511375ceec29c1fe6d3b16b180b95c4fea20cbf95ea1c4b99b4"
+    },
+    {
+      "path": "quant_framework/config/asset_spec.py",
+      "content_sha256": "5f68ebfd21a19529255b7585a0f3fa0dda13d9e0d4f51e0a558f6e5e2f7d6509"
+    },
+    {
+      "path": "quant_framework/config/cost_model.py",
+      "content_sha256": "28ba77b5353cf2b1b0494965723baf015426c964819ebba4b579068c67944124"
+    },
+    {
+      "path": "quant_framework/config/models.py",
+      "content_sha256": "1266371b1bc774cb45d97080d657cecae0fdb5e66da3c62b1486c5a9efbef57d"
+    },
+    {
+      "path": "quant_framework/config/prop_profile.py",
+      "content_sha256": "2a3b9ab9b56a7d9d31eb639b1a245a63abaa2284ebcc7de46f179278c68f51c2"
+    },
+    {
+      "path": "quant_framework/config/system_config.py",
+      "content_sha256": "4952ec762b70fcb16fa1150ec0f09260ae6769bd6f75e627538631231e6fadd8"
+    },
+    {
+      "path": "quant_framework/config/walk_forward_config.py",
+      "content_sha256": "d46a302ebe5faf5a78275f882e91fec5a365347861214a9710259fc8b9c0a9d5"
+    },
+    {
+      "path": "quant_framework/discovery/behavioral_dedup.py",
+      "content_sha256": "d05eacee4b70ff6e7590965e8eba2fbac236f75f7f8d60c457d2fc861c3f49ba"
+    },
+    {
+      "path": "quant_framework/discovery/candidate.py",
+      "content_sha256": "053e3997041990874fcf0d0055345e8b2c1a96208ef5c0db66d85b6dd59bcab8"
+    },
+    {
+      "path": "quant_framework/discovery/canonicalization.py",
+      "content_sha256": "bf5f49aa8ef41f85ee5be8d27291158021d5253b2494909db6c2fe0a6d9a3775"
+    },
+    {
+      "path": "quant_framework/discovery/complexity.py",
+      "content_sha256": "0cffa92a4326ccea5d8131c8fa8e43e77283bef52b1b99590a348c238285e043"
+    },
+    {
+      "path": "quant_framework/discovery/crossover.py",
+      "content_sha256": "6d445ed0f58e8bf4fd9a104cb8edba7038c74926f8a6d8be0c30af06f3676781"
+    },
+    {
+      "path": "quant_framework/discovery/dsl_series.py",
+      "content_sha256": "86b5daa66e67b811820ad8acd1177d483164055fd01b2b8dde09e4ed2866715c"
+    },
+    {
+      "path": "quant_framework/discovery/dsl_signal_adapter.py",
+      "content_sha256": "2289fc1cdef0c4fae1135e7d8baabe6388ddc44bfaabc80fc87c9722a50fe218"
+    },
+    {
+      "path": "quant_framework/discovery/evaluator.py",
+      "content_sha256": "0d8b1cd035429b675d7cb0329b76b10a5aee0fdda2e7f4ee722000db973ef8a4"
+    },
+    {
+      "path": "quant_framework/discovery/event_wfo_backend.py",
+      "content_sha256": "8acc3f6a7b60fc500b265d8459d23bb7a299c419d2e8ccc43cbc1d0cfb1eca53"
+    },
+    {
+      "path": "quant_framework/discovery/expression_tree.py",
+      "content_sha256": "aebc4b93b3840ad0a6f4bd73cfd0ad3a38b55fc36d31762e82e9997804250058"
+    },
+    {
+      "path": "quant_framework/discovery/family_catalog.py",
+      "content_sha256": "9cba7e030bff167ace7c4471c67273b0a6761d4b7a659e5fafa82372febccf3b"
+    },
+    {
+      "path": "quant_framework/discovery/family_generator.py",
+      "content_sha256": "cc393ca769d71686d8d0d353999982ea3d0f6a7b3281738674e0ddd35eafdb0b"
+    },
+    {
+      "path": "quant_framework/discovery/family_spec.py",
+      "content_sha256": "9bb1ff704c683e47563d19e9332c04d394ea880dcdffeb63fd3d4c3e5f5a3846"
+    },
+    {
+      "path": "quant_framework/discovery/feature_domains.py",
+      "content_sha256": "a04e92dbbb4e7d876c1ccaf1c889a80fef7341e8b51191769add3210265d70f1"
+    },
+    {
+      "path": "quant_framework/discovery/fitness.py",
+      "content_sha256": "f87a11a4154c425044003419e5417f95246fc80c1cd71639a12f563d79899fdf"
+    },
+    {
+      "path": "quant_framework/discovery/freezing.py",
+      "content_sha256": "3d64843998740729987f8ece4ed2b1839e262d95bb87319a41cd0eb2f1f1cd4b"
+    },
+    {
+      "path": "quant_framework/discovery/generator.py",
+      "content_sha256": "139d630003aae8761bc4285fa34ee54271a987ea4a723ec5770a6a20d19164aa"
+    },
+    {
+      "path": "quant_framework/discovery/grammar.py",
+      "content_sha256": "71a6cfcf8f8371272e7549f95dafec49ccf53554cba9a7714785b45b5a4b9678"
+    },
+    {
+      "path": "quant_framework/discovery/legacy_parameters.py",
+      "content_sha256": "beba64af779b880579e80c775df32cf18402568d0ccc385829e04c7a0b647949"
+    },
+    {
+      "path": "quant_framework/discovery/lineage.py",
+      "content_sha256": "dd3e42c0f481d5bab25418576894c883b1cd8cc13dc3c710354500d3b2e9d530"
+    },
+    {
+      "path": "quant_framework/discovery/multi_family_campaign.py",
+      "content_sha256": "1eb352de01fc7635e07db04e1e90506323c309f64105dd9513ddd9d4f3419494"
+    },
+    {
+      "path": "quant_framework/discovery/mutation.py",
+      "content_sha256": "2a5f03d5ff5a97fbab49300398831c7ed407570763acf092136af22314a83fce"
+    },
+    {
+      "path": "quant_framework/discovery/operators.py",
+      "content_sha256": "b5969a9692b55475beea22a2404bb8dbe2481df2d175b00ac45829c39a999d3a"
+    },
+    {
+      "path": "quant_framework/discovery/parameter_robustness.py",
+      "content_sha256": "9be45456489e148c4c4ccb99655218d1ebf5b320f6bee30960cdf4e340eefc3f"
+    },
+    {
+      "path": "quant_framework/discovery/prechecks.py",
+      "content_sha256": "d083af9f2c3b6f985fdf3106bea421b0831cc332d8fdb6b28dc4ffd034a9bcea"
+    },
+    {
+      "path": "quant_framework/discovery/regime_gates.py",
+      "content_sha256": "d8fcb2517e93be1b8e23909ba4d4a57b6fafa7d6d6cc0597d7c86488b7dfb365"
+    },
+    {
+      "path": "quant_framework/discovery/repair.py",
+      "content_sha256": "480ea515eab2fee3469abf5fe2c2cb87dc076161bb2dedeab9ef3bb809c737e3"
+    },
+    {
+      "path": "quant_framework/discovery/search_controller.py",
+      "content_sha256": "47ca3f2316062a8a222d138a2be3f1db27a7eb0f3d5c0606ab1b16b9f1661ea4"
+    },
+    {
+      "path": "quant_framework/discovery/selection.py",
+      "content_sha256": "260f6c9a9ee768fd7ed464dfb7e3357606c5c4122ffe86e2ab8c03ed212a39e7"
+    },
+    {
+      "path": "quant_framework/discovery/stable_hash.py",
+      "content_sha256": "2104ac374ac4a6c9903640fef9901cb16eaad00c25ba51790a76d8a207aad112"
+    },
+    {
+      "path": "quant_framework/discovery/stress.py",
+      "content_sha256": "3748c8e8825e193861365078e4ec37feac7d9fd188d4808a8b1ebf21c2460dff"
+    },
+    {
+      "path": "quant_framework/discovery/stress_backend.py",
+      "content_sha256": "68c9f45c39bf88617acb100a973394ba9375f416a6d3c0df0e4d13c970393c86"
+    },
+    {
+      "path": "quant_framework/discovery/typecheck.py",
+      "content_sha256": "0b2e0880559859782226a5d4c7fc3668566263b26ffe7f2c14952be5bf350cb1"
+    },
+    {
+      "path": "quant_framework/discovery/types.py",
+      "content_sha256": "42c9f9686a9c77c2e983db6c4c8b66bb742696142f0e6aafa1923690e8d309f2"
+    },
+    {
+      "path": "quant_framework/engine/event_execution.py",
+      "content_sha256": "983534784248220a153b54dab36181d918822805c0b634f5bb0def4f11e52ac9"
+    },
+    {
+      "path": "quant_framework/engine/events.py",
+      "content_sha256": "4162695fad5cae51d23d04518946bb270e977acfbe7fe1ecf46e1d840f53a8a8"
+    },
+    {
+      "path": "quant_framework/engine/fills.py",
+      "content_sha256": "67675a39983757cf1ebcd77a60c75141b002cac723bcdaa3e5016b642d798868"
+    },
+    {
+      "path": "quant_framework/engine/financing.py",
+      "content_sha256": "a4aa08611de82d210f1ab01d3fa96d624576fb016ae18583c37cce890c0b45d2"
+    },
+    {
+      "path": "quant_framework/engine/friction.py",
+      "content_sha256": "88d66ae99bab8ef821fc0ba5e94187e6021c60db551394544956b7cc99af9b69"
+    },
+    {
+      "path": "quant_framework/engine/ids.py",
+      "content_sha256": "d78e7f7e8ee569db3e6af901828ad95550d2e79d917d2f8128f0dbdcff378c53"
+    },
+    {
+      "path": "quant_framework/engine/intrabar_policy.py",
+      "content_sha256": "8fadbbdf610a55448306ea2721754589acc34d4f91429de5822d3280c1e901f4"
+    },
+    {
+      "path": "quant_framework/engine/orders.py",
+      "content_sha256": "6228477e8564eeff90769b5c18564be63ec3c61be9986e95fdeb20cd21844f6f"
+    },
+    {
+      "path": "quant_framework/engine/portfolio.py",
+      "content_sha256": "89b11aaffe4cf4eb4497665d3f1c6ff029a930aafb207626c7b965f728d0e3d9"
+    },
+    {
+      "path": "quant_framework/engine/positions.py",
+      "content_sha256": "5fbf52a3602998b1c189992431eef6ff756738ee9d550253bf2ca1497cecc2a9"
+    },
+    {
+      "path": "quant_framework/engine/rollover.py",
+      "content_sha256": "aa860fbec3379853e976a77520d5e9311d395f0bb25c280b1775e15a3ed52a73"
+    },
+    {
+      "path": "quant_framework/engine/vectorized_features.py",
+      "content_sha256": "79d1f4b12ec157635b81fb94d034e89269080727eaa943ad4d66ce52176bd321"
+    },
+    {
+      "path": "quant_framework/features/catalog.py",
+      "content_sha256": "ca9412c51f63cde1b766e7e826035fa38dccbaef4f491237f6594a789ed79d7d"
+    },
+    {
+      "path": "quant_framework/features/contracts.py",
+      "content_sha256": "77efd77b6046ff4ee4ef88c82c90df734f1e9783ade9660887749c80e1642267"
+    },
+    {
+      "path": "quant_framework/features/cross_asset.py",
+      "content_sha256": "65939c80e3524d29382c9eec7ebf85feeefe8673c657bce6f237f5e17f7039ed"
+    },
+    {
+      "path": "quant_framework/features/definitions.py",
+      "content_sha256": "6a5c31f2689e5d55390a2dbdcf8c9e09e2f1c7d2f304b8681e55bca4ff0973aa"
+    },
+    {
+      "path": "quant_framework/features/generator.py",
+      "content_sha256": "37145218605e1b6c73bbc68b5998d6e1cac3110339cec4219e98c28d23e89e6f"
+    },
+    {
+      "path": "quant_framework/features/liquidity.py",
+      "content_sha256": "ceece7b18ba999f2d393f3125ba4cc7c71464a4b03c05f69691d9dffdf8417d4"
+    },
+    {
+      "path": "quant_framework/features/microstructure.py",
+      "content_sha256": "78bb737304485fc74e400673778b86517705612ed7c5ee157e7f72119a91e9e8"
+    },
+    {
+      "path": "quant_framework/features/normalization.py",
+      "content_sha256": "32117770c71df082ef09cc4541b4e3c3b00d5e26b7fe625f3c5021cf4c7df5d6"
+    },
+    {
+      "path": "quant_framework/features/price.py",
+      "content_sha256": "4828ff0ec05dc25587421e1d1413278345c1c84431c9eef56989cfddfbba693b"
+    },
+    {
+      "path": "quant_framework/features/regime_features.py",
+      "content_sha256": "0e1c0ae82c835e5b736725eb2be7e49501b7bd0acfb952f5be9505e7cc9051cc"
+    },
+    {
+      "path": "quant_framework/features/temporal.py",
+      "content_sha256": "273307cfe98ba2519ce376395a7a155d63281dd4973fdc4986ec164909318fa9"
+    },
+    {
+      "path": "quant_framework/features/validation.py",
+      "content_sha256": "51d5ce7f1cebac181f21d959e25d29f8d8d2949f076e717f840979aa8ecc6fdf"
+    },
+    {
+      "path": "quant_framework/features/volatility.py",
+      "content_sha256": "3cc95c9cc55e50d4b33caf83ce05adc85207d9c1690d9cee69b84eb75a971b11"
+    },
+    {
+      "path": "quant_framework/metrics/diagnostics.py",
+      "content_sha256": "9049046f8fc43ad86879b6c15592a55c2dac93bdff801ce8dd3cf5b77c9ebf93"
+    },
+    {
+      "path": "quant_framework/metrics/drawdown.py",
+      "content_sha256": "0cc31c2d882f8f108263358979f99003b7149564ac2d07dc2bcfedb7c2054db0"
+    },
+    {
+      "path": "quant_framework/metrics/dsr.py",
+      "content_sha256": "85959d84ebe1d7e66d83cf441762aa043a2dd5dda4e11ba8f2d918e456d27a4c"
+    },
+    {
+      "path": "quant_framework/metrics/pbo.py",
+      "content_sha256": "c2599eb986db210dc4383051a2d84b6ad631ed33c2678a9be2c5dc2c8a02dde5"
+    },
+    {
+      "path": "quant_framework/metrics/performance.py",
+      "content_sha256": "79ab6660c25103c8b54f0789a6e27e7fb66e588979f3621b4b91aa205f4de6ed"
+    },
+    {
+      "path": "quant_framework/regime/detector.py",
+      "content_sha256": "281be533fb0fa69818de536f0fb3c843d46237daf3370d82509d14eb9618bb23"
+    },
+    {
+      "path": "quant_framework/risk/exposure.py",
+      "content_sha256": "8bd2e50ee8633bc566c4cca02430686946aeb32bf86ed009efee25c59ef61872"
+    },
+    {
+      "path": "quant_framework/risk/fsm.py",
+      "content_sha256": "9b56ca51fcd5e34826af1c4d7fc80bc8840ad4f48f67bcc615255ed15dca1fe5"
+    },
+    {
+      "path": "quant_framework/risk/position_sizing.py",
+      "content_sha256": "5cf0b7ac621c3ce0b026e046e343594184d46de107536a55e44a16cabe0bcee0"
+    },
+    {
+      "path": "quant_framework/validation/bootstrap.py",
+      "content_sha256": "9d2395c4b588b42c69e2830a5933d58f81144b56e55688868278b80d4ca50934"
+    },
+    {
+      "path": "quant_framework/validation/event_driven_wfo.py",
+      "content_sha256": "e51090019fe422ebba599134d708e32294709b710e86c395e48644907cbc3a02"
+    },
+    {
+      "path": "quant_framework/validation/purge_embargo.py",
+      "content_sha256": "98cff334cbd3307dfa1dffc73eaf4229e5ac55dc698ab84b7fe7ac5c0bce2314"
+    },
+    {
+      "path": "quant_framework/validation/walk_forward.py",
+      "content_sha256": "5e8310b24ed589408f157c391a1bde195ddea7ad60f41bf72bed04112a9ec095"
+    }
+  ],
+  "allowlist_path_count": 83,
+  "allowlist_present_at_stored": 83,
+  "allowlist_present_at_current": 83,
+  "changed_allowlist_paths": [],
+  "excluded_change_paths": [
+    "quant_framework/control_plane/jobs.py",
+    "quant_framework/control_plane/search_bootstrap.py",
+    "quant_framework/control_plane/static/assets/dashboard.js",
+    "quant_framework/discovery/search_program.py",
+    "quant_framework/tests/test_search_resume.py"
+  ],
+  "stored_repository_git_sha": "cfb7f6d86fbea350c87609770743cfcaf28dc4d4",
+  "current_repository_git_sha": "0d0a15f9c4d594d148d8686e3a8e45c8a26b2a64",
+  "stored_execution_semantic_hash": "esem_6dc16b6ba00858ee36c4dcc9a86f400f",
+  "current_execution_semantic_hash": "esem_6dc16b6ba00858ee36c4dcc9a86f400f",
+  "semantic_hashes_match": true,
+  "migration_decision": "MIGRATE_ALLOW_RESUME",
+  "migration_reason": "execution_semantic_hash identical across cfb7f6d and 0d0a15f; changed paths are control-plane/dashboard/search-program/tests only",
+  "verification": {
+    "search_program_id": "sp_c80221c114d546af",
+    "copied_verification": true,
+    "cumulative_generated": 540,
+    "cumulative_evaluated": 530,
+    "cumulative_full_wfo": 529,
+    "pending_stress": 84,
+    "pipeline_phase": "STRESS",
+    "legacy_code_hash_migrated": true,
+    "control_plane_code_changed": true
+  }
+}

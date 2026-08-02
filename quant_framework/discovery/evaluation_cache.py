@@ -18,8 +18,15 @@ def build_evaluation_cache_key(
     wfo_config_hash: str,
     cost_model_version: str,
     risk_model_version: str,
-    execution_engine_code_hash: str,
+    execution_semantic_hash: str = "",
+    execution_engine_code_hash: str = "",
 ) -> str:
+    """Build a durable eval-cache key.
+
+    ``execution_semantic_hash`` is preferred; ``execution_engine_code_hash`` is a
+    legacy alias accepted for older call sites.
+    """
+    semantic = str(execution_semantic_hash or execution_engine_code_hash or "")
     payload = {
         "candidate_canonical_hash": str(candidate_canonical_hash),
         "dataset_hash": str(dataset_hash),
@@ -27,7 +34,7 @@ def build_evaluation_cache_key(
         "wfo_config_hash": str(wfo_config_hash),
         "cost_model_version": str(cost_model_version),
         "risk_model_version": str(risk_model_version),
-        "execution_engine_code_hash": str(execution_engine_code_hash),
+        "execution_semantic_hash": semantic,
     }
     return "evcache_" + sha256_json(payload)[:40]
 

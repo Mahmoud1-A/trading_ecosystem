@@ -26,15 +26,33 @@ def _git_sha(cwd: Path) -> str:
 
 
 def collect_runtime_provenance(*, repo_hint: Path | None = None) -> dict[str, Any]:
-    """Capture executable identity so UI/report can prove which code is running."""
+    """Capture executable identity so UI/report can prove which code is running.
+
+    Always records ``repository_git_sha`` (exact commit) for audit. Separately
+    records ``execution_semantic_hash`` (allowlisted evaluation-critical modules)
+    used for search resume compatibility.
+    """
     cwd = Path.cwd().resolve()
     repo = (repo_hint or cwd).resolve()
     import control_plane.jobs as jobs_mod
     import control_plane.alpha_results as alpha_mod
     import discovery.event_wfo_backend as backend_mod
+    from discovery.execution_semantic_hash import (
+        compute_execution_semantic_hash,
+        resolve_repo_root,
+    )
+
+    repo_root = resolve_repo_root(repo)
+    repository_git_sha = _git_sha(repo_root)
+    try:
+        execution_semantic_hash = compute_execution_semantic_hash(repo_root)
+    except Exception:  # noqa: BLE001
+        execution_semantic_hash = "UNKNOWN"
 
     return {
-        "git_commit_sha": _git_sha(repo),
+        "git_commit_sha": repository_git_sha,
+        "repository_git_sha": repository_git_sha,
+        "execution_semantic_hash": execution_semantic_hash,
         "python_executable": sys.executable,
         "python_version": sys.version.split()[0],
         "cwd": str(cwd),

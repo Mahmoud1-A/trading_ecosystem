@@ -102,7 +102,7 @@ def _fp_components(**overrides: str) -> dict[str, str]:
         "wfo_config_hash": "wfo_test",
         "cost_model_version": "cost_v1",
         "risk_model_version": "demo",
-        "execution_engine_code_hash": "code_test",
+        "execution_semantic_hash": "code_test",
     }
     base.update(overrides)
     return base
@@ -152,7 +152,7 @@ def test_evaluation_cache_key_components() -> None:
         wfo_config_hash="wfo1",
         cost_model_version="cost_v1",
         risk_model_version="demo",
-        execution_engine_code_hash="code1",
+        execution_semantic_hash="code1",
     )
     k2 = build_evaluation_cache_key(
         candidate_canonical_hash="cand_a",
@@ -161,7 +161,7 @@ def test_evaluation_cache_key_components() -> None:
         wfo_config_hash="wfo1",
         cost_model_version="cost_v1",
         risk_model_version="demo",
-        execution_engine_code_hash="code1",
+        execution_semantic_hash="code1",
     )
     k3 = build_evaluation_cache_key(
         candidate_canonical_hash="cand_a",
@@ -170,7 +170,7 @@ def test_evaluation_cache_key_components() -> None:
         wfo_config_hash="wfo1",
         cost_model_version="cost_v1",
         risk_model_version="demo",
-        execution_engine_code_hash="code1",
+        execution_semantic_hash="code1",
     )
     assert k1 == k2
     assert k1 != k3
@@ -183,7 +183,7 @@ def test_incompatible_fingerprint_blocks_true_resume() -> None:
         wfo_config_hash="wfo1",
         cost_model_version="cost_v1",
         risk_model_version="demo",
-        execution_engine_code_hash="code1",
+        execution_semantic_hash="code1",
         multi_family_config_hash="mf1",
         seed=7,
     )
@@ -193,7 +193,7 @@ def test_incompatible_fingerprint_blocks_true_resume() -> None:
         wfo_config_hash="wfo1",
         cost_model_version="cost_v1",
         risk_model_version="demo",
-        execution_engine_code_hash="code1",
+        execution_semantic_hash="code1",
         multi_family_config_hash="mf1",
         seed=7,
     )
@@ -381,7 +381,7 @@ def test_reevaluate_reuses_dsls_but_invalidates_cache(tmp_path: Path) -> None:
         wfo_config_hash="wfo",
         cost_model_version="cost_v1",
         risk_model_version="demo",
-        execution_engine_code_hash="code",
+        execution_semantic_hash="code",
     )
     cache.put(
         EvaluationCacheEntry(
@@ -796,7 +796,7 @@ def test_legacy_runtime_exhausted_continue_search_bootstraps(tmp_path: Path) -> 
             wfo_config_hash=fp_comp["wfo_config_hash"],
             cost_model_version=fp_comp["cost_model_version"],
             risk_model_version=fp_comp["risk_model_version"],
-            execution_engine_code_hash=fp_comp["execution_engine_code_hash"],
+            execution_semantic_hash=fp_comp["execution_semantic_hash"],
         )
         prepared.evaluation_cache.put(
             EvaluationCacheEntry(
@@ -1274,7 +1274,7 @@ def test_legacy_list_param_bootstrap_recovers_and_enters_stress(tmp_path: Path) 
             wfo_config_hash=fp_comp["wfo_config_hash"],
             cost_model_version=fp_comp["cost_model_version"],
             risk_model_version=fp_comp["risk_model_version"],
-            execution_engine_code_hash=fp_comp["execution_engine_code_hash"],
+            execution_semantic_hash=fp_comp["execution_semantic_hash"],
         )
         prepared.evaluation_cache.put(
             EvaluationCacheEntry(
@@ -1498,8 +1498,16 @@ def _fp_from_mf(mf: dict[str, Any], **comp_overrides: Any) -> tuple[str, dict[st
         wfo_config_hash=str(comp_overrides.get("wfo_config_hash", hash_wfo_config({"n_folds": 3}))),
         cost_model_version=str(comp_overrides.get("cost_model_version", "cost_v1")),
         risk_model_version=str(comp_overrides.get("risk_model_version", "demo")),
-        execution_engine_code_hash=str(
-            comp_overrides.get("execution_engine_code_hash", "code_test")
+        execution_semantic_hash=str(
+            comp_overrides.get(
+                "execution_semantic_hash",
+                comp_overrides.get("execution_engine_code_hash", "code_test"),
+            )
+        ),
+        repository_git_sha=(
+            str(comp_overrides["repository_git_sha"])
+            if comp_overrides.get("repository_git_sha") not in (None, "")
+            else None
         ),
         multi_family_config_hash=hash_multi_family_config(mf),
         seed=int(mf.get("seed") or 7),
@@ -1511,7 +1519,7 @@ def _fp_from_mf(mf: dict[str, Any], **comp_overrides: Any) -> tuple[str, dict[st
         wfo_config_hash=str(comps["wfo_config_hash"]),
         cost_model_version=str(comps["cost_model_version"]),
         risk_model_version=str(comps["risk_model_version"]),
-        execution_engine_code_hash=str(comps["execution_engine_code_hash"]),
+        execution_semantic_hash=str(comps["execution_semantic_hash"]),
         multi_family_config_hash=str(comps["multi_family_config_hash"]),
         seed=int(comps["seed"]),
         family_ids=list(mf.get("family_ids") or []),
@@ -1563,7 +1571,7 @@ def test_extend_budget_fingerprint_matches_after_runtime_enrichment(tmp_path: Pa
                 "wfo_config_hash",
                 "cost_model_version",
                 "risk_model_version",
-                "execution_engine_code_hash",
+                "execution_semantic_hash",
             )
         },
     )
@@ -1650,7 +1658,7 @@ def test_fingerprint_rejects_dataset_wfo_code_and_structure_changes(tmp_path: Pa
                 "wfo_config_hash",
                 "cost_model_version",
                 "risk_model_version",
-                "execution_engine_code_hash",
+                "execution_semantic_hash",
             )
         },
     )
@@ -1659,7 +1667,7 @@ def test_fingerprint_rejects_dataset_wfo_code_and_structure_changes(tmp_path: Pa
     cases = [
         ("dataset_hash", "ds_CHANGED", "DATASET_HASH_CHANGED"),
         ("wfo_config_hash", "wfo_CHANGED", "WFO_CONFIG_CHANGED"),
-        ("execution_engine_code_hash", "code_CHANGED", "CODE_HASH_CHANGED"),
+        ("execution_semantic_hash", "code_CHANGED", "EXECUTION_SEMANTICS_CHANGED"),
     ]
     for key, value, reason in cases:
         art = tmp_path / f"art_{key}"
@@ -1770,7 +1778,7 @@ def test_legacy_aggregate_fingerprint_migrates_when_components_match(tmp_path: P
         wfo_config_hash=str(comps["wfo_config_hash"]),
         cost_model_version=str(comps["cost_model_version"]),
         risk_model_version=str(comps["risk_model_version"]),
-        execution_engine_code_hash=str(comps["execution_engine_code_hash"]),
+        execution_semantic_hash=str(comps["execution_semantic_hash"]),
         multi_family_config_hash=old_mf_hash,
         seed=7,
         family_ids=list(base["family_ids"]),
@@ -1801,7 +1809,7 @@ def test_legacy_aggregate_fingerprint_migrates_when_components_match(tmp_path: P
                 "wfo_config_hash",
                 "cost_model_version",
                 "risk_model_version",
-                "execution_engine_code_hash",
+                "execution_semantic_hash",
             )
         },
     )
@@ -1918,3 +1926,402 @@ def test_continue_enters_pending_stress_without_regen(tmp_path: Path) -> None:
     assert CountingBackend.evaluate_calls < calls_after_first
     assert evaluated_before.issubset(set(ckpt2.evaluation_records.keys()))
     assert result1 is not None and result2 is not None
+
+def _program_with_checkpoint(
+    tmp_path: Path,
+    *,
+    comps: dict[str, Any],
+    fp: str,
+    mf: dict[str, Any],
+    legacy_code_hash: str | None = None,
+) -> tuple[str, SearchProgramStore]:
+    program_id = new_search_program_id()
+    store = SearchProgramStore(tmp_path / "search_programs")
+    stored_comps = dict(comps)
+    if legacy_code_hash is not None:
+        # Legacy schema: whole-repo SHA in execution_engine_code_hash only.
+        stored_comps = {
+            k: v
+            for k, v in comps.items()
+            if k not in {"execution_semantic_hash", "repository_git_sha"}
+        }
+        stored_comps["execution_engine_code_hash"] = legacy_code_hash
+        # Aggregate still computed from the legacy value for the stored program.
+        from discovery.search_program import compute_compatibility_fingerprint
+
+        fp = compute_compatibility_fingerprint(
+            dataset_hash=str(stored_comps["dataset_hash"]),
+            timeframe=str(stored_comps["timeframe"]),
+            wfo_config_hash=str(stored_comps["wfo_config_hash"]),
+            cost_model_version=str(stored_comps["cost_model_version"]),
+            risk_model_version=str(stored_comps["risk_model_version"]),
+            execution_engine_code_hash=legacy_code_hash,
+            multi_family_config_hash=str(stored_comps["multi_family_config_hash"]),
+            seed=int(stored_comps["seed"]),
+            family_ids=list(mf.get("family_ids") or []),
+        )
+    store.create(
+        compatibility_fingerprint=fp,
+        seed=int(mf.get("seed") or 7),
+        family_ids=list(mf.get("family_ids") or []),
+        search_program_id=program_id,
+        metadata={"fingerprint_components": stored_comps},
+    )
+    ckpt_fp_keys = [
+        "dataset_hash",
+        "timeframe",
+        "wfo_config_hash",
+        "cost_model_version",
+        "risk_model_version",
+    ]
+    ckpt_comps = {k: str(stored_comps[k]) for k in ckpt_fp_keys if k in stored_comps}
+    if legacy_code_hash is not None:
+        ckpt_comps["execution_engine_code_hash"] = legacy_code_hash
+    elif stored_comps.get("execution_semantic_hash"):
+        ckpt_comps["execution_semantic_hash"] = str(stored_comps["execution_semantic_hash"])
+        if stored_comps.get("repository_git_sha"):
+            ckpt_comps["repository_git_sha"] = str(stored_comps["repository_git_sha"])
+    ckpt = empty_checkpoint(
+        search_program_id=program_id,
+        compatibility_fingerprint=fp,
+        session_run_id="run_new",
+        search_mode=SearchMode.NEW_SEARCH.value,
+        seed=int(mf.get("seed") or 7),
+        config=dict(mf),
+        fingerprint_components=ckpt_comps,
+    )
+    ckpt.campaign_generated = 540
+    ckpt.campaign_evaluated = 530
+    ckpt.campaign_full_wfo = 529
+    ckpt.pipeline_phase = PipelinePhase.STRESS.value
+    ckpt.pending_stress_ids = []
+    save_checkpoint(store.checkpoint_path(program_id), ckpt)
+    store.update_cumulative(
+        program_id,
+        generated=540,
+        evaluated=530,
+        full_wfo=529,
+        checkpoint_path=str(store.checkpoint_path(program_id)),
+    )
+    return program_id, store
+
+
+def test_dashboard_only_change_does_not_block_resume(tmp_path: Path) -> None:
+    """repository_git_sha drift with identical semantic hash allows EXTEND_BUDGET."""
+    from control_plane.search_bootstrap import prepare_search_program_session
+
+    base = _new_search_mf()
+    fp, comps = _fp_from_mf(
+        base,
+        execution_semantic_hash="esem_same",
+        repository_git_sha="a" * 40,
+    )
+    comps["repository_git_sha"] = "a" * 40
+    program_id, store = _program_with_checkpoint(tmp_path, comps=comps, fp=fp, mf=base)
+    before = store.get(program_id)
+    assert before is not None
+    cum_before = (
+        before.cumulative_generated,
+        before.cumulative_evaluated,
+        before.cumulative_full_wfo,
+    )
+
+    incoming_fp, incoming_comps = _fp_from_mf(
+        base,
+        execution_semantic_hash="esem_same",
+        repository_git_sha="b" * 40,
+    )
+    incoming_comps["repository_git_sha"] = "b" * 40
+    # Aggregate may match if repository SHA is not in the fingerprint payload.
+    prepared = prepare_search_program_session(
+        search_mode=SearchMode.EXTEND_BUDGET.value,
+        program_id=program_id,
+        program_store=store,
+        compatibility_fingerprint=incoming_fp,
+        seed=7,
+        family_ids=list(base["family_ids"]),
+        run_id="run_dash",
+        source_run_id="run_new",
+        resumed_from_run_id="run_new",
+        artifacts_root=tmp_path / "artifacts",
+        fingerprint_components=incoming_comps,
+        multi_family_config=base,
+        run_artifact_dir=tmp_path / "artifacts" / "run_dash",
+    )
+    assert prepared.resume_checkpoint is not None
+    after = store.get(program_id)
+    assert after is not None
+    assert (
+        after.cumulative_generated,
+        after.cumulative_evaluated,
+        after.cumulative_full_wfo,
+    ) == cum_before
+    if incoming_fp != fp:
+        assert prepared.control_plane_code_changed or prepared.fingerprint_migrated
+
+
+def test_test_only_and_search_metadata_change_do_not_block_resume(tmp_path: Path) -> None:
+    """Opaque non-semantic bookkeeping changes must not alter the gate."""
+    from control_plane.search_bootstrap import prepare_search_program_session
+
+    base = _new_search_mf()
+    fp, comps = _fp_from_mf(base, execution_semantic_hash="esem_meta")
+    program_id, store = _program_with_checkpoint(tmp_path, comps=comps, fp=fp, mf=base)
+
+    # Enriched clone adds search metadata but keeps structural + semantic identity.
+    enriched = _enrich_frozen_mf(base, program_id=program_id, fp=fp, comps=comps)
+    extend_mf = _clone_for_extend(enriched, program_id=program_id, source_run_id="run_new")
+    incoming_fp, incoming_comps = _fp_from_mf(extend_mf, execution_semantic_hash="esem_meta")
+    assert incoming_fp == fp
+
+    prepared = prepare_search_program_session(
+        search_mode=SearchMode.RESUME_SEARCH.value,
+        program_id=program_id,
+        program_store=store,
+        compatibility_fingerprint=incoming_fp,
+        seed=7,
+        family_ids=list(base["family_ids"]),
+        run_id="run_meta",
+        source_run_id="run_new",
+        resumed_from_run_id="run_new",
+        artifacts_root=tmp_path / "artifacts",
+        fingerprint_components=incoming_comps,
+        multi_family_config=extend_mf,
+        run_artifact_dir=tmp_path / "artifacts" / "run_meta",
+    )
+    assert prepared.search_program_id == program_id
+    prog = store.get(program_id)
+    assert prog is not None
+    assert prog.cumulative_generated == 540
+    assert prog.sessions == []  # prepare does not append sessions
+
+
+def test_evaluator_or_cost_semantic_change_blocks_resume(tmp_path: Path) -> None:
+    from control_plane.search_bootstrap import prepare_search_program_session
+
+    base = _new_search_mf()
+    fp, comps = _fp_from_mf(base, execution_semantic_hash="esem_v1")
+    program_id, store = _program_with_checkpoint(tmp_path, comps=comps, fp=fp, mf=base)
+
+    for label, new_hash in (
+        ("evaluator", "esem_evaluator_CHANGED"),
+        ("cost_slippage", "esem_cost_CHANGED"),
+    ):
+        art = tmp_path / f"art_{label}"
+        art.mkdir(parents=True, exist_ok=True)
+        bad_fp, bad_comps = _fp_from_mf(base, execution_semantic_hash=new_hash)
+        with pytest.raises(IncompatibleSearchFingerprint, match="EXECUTION_SEMANTICS_CHANGED"):
+            prepare_search_program_session(
+                search_mode=SearchMode.EXTEND_BUDGET.value,
+                program_id=program_id,
+                program_store=store,
+                compatibility_fingerprint=bad_fp,
+                seed=7,
+                family_ids=list(base["family_ids"]),
+                run_id=f"run_bad_{label}",
+                source_run_id="run_new",
+                resumed_from_run_id="run_new",
+                artifacts_root=tmp_path / "artifacts",
+                fingerprint_components=bad_comps,
+                multi_family_config=base,
+                run_artifact_dir=art,
+            )
+        assert (art / "fingerprint_diff.json").is_file()
+
+    prog = store.get(program_id)
+    assert prog is not None
+    assert prog.sessions == []
+    assert prog.cumulative_generated == 540
+    assert prog.cumulative_evaluated == 530
+    assert prog.cumulative_full_wfo == 529
+    assert prog.compatibility_fingerprint == fp
+
+
+def test_legacy_git_sha_code_hash_migrates_atomically(tmp_path: Path) -> None:
+    """Whole-repo SHA stored as execution_engine_code_hash migrates when semantic matches."""
+    from control_plane.search_bootstrap import prepare_search_program_session
+    from discovery.execution_semantic_hash import (
+        compute_execution_semantic_hash,
+        looks_like_git_sha,
+        resolve_repo_root,
+    )
+
+    stored_sha = "cfb7f6d86fbea350c87609770743cfcaf28dc4d4"
+    current_sha = "0d0a15f9c4d594d148d8686e3a8e45c8a26b2a64"
+    assert looks_like_git_sha(stored_sha)
+    root = resolve_repo_root()
+    sem = compute_execution_semantic_hash(root, at_commit=stored_sha)
+    assert sem == compute_execution_semantic_hash(root, at_commit=current_sha)
+
+    base = _new_search_mf()
+    modern_fp, modern_comps = _fp_from_mf(
+        base,
+        execution_semantic_hash=sem,
+        repository_git_sha=current_sha,
+    )
+    modern_comps["repository_git_sha"] = current_sha
+
+    # Stored program uses legacy whole-repo SHA as the code component.
+    program_id, store = _program_with_checkpoint(
+        tmp_path,
+        comps=modern_comps,
+        fp=modern_fp,
+        mf=base,
+        legacy_code_hash=stored_sha,
+    )
+    before = store.get(program_id)
+    assert before is not None
+    legacy_fp = before.compatibility_fingerprint
+    assert legacy_fp != modern_fp
+    ckpt_before = load_checkpoint(store.checkpoint_path(program_id))
+    assert ckpt_before is not None
+    pending_before = list(ckpt_before.pending_stress_ids)
+    eval_cache_files_before = sorted(
+        p.name for p in store.evaluation_cache_dir(program_id).glob("*.json")
+    )
+
+    prepared = prepare_search_program_session(
+        search_mode=SearchMode.EXTEND_BUDGET.value,
+        program_id=program_id,
+        program_store=store,
+        compatibility_fingerprint=modern_fp,
+        seed=7,
+        family_ids=list(base["family_ids"]),
+        run_id="run_mig_sem",
+        source_run_id="run_new",
+        resumed_from_run_id="run_new",
+        artifacts_root=tmp_path / "artifacts",
+        fingerprint_components=modern_comps,
+        multi_family_config=base,
+        run_artifact_dir=tmp_path / "artifacts" / "run_mig_sem",
+    )
+    assert prepared.fingerprint_migrated is True
+    assert prepared.legacy_code_hash_migrated is True
+    assert prepared.control_plane_code_changed is True
+
+    after = store.get(program_id)
+    assert after is not None
+    assert after.compatibility_fingerprint == modern_fp
+    assert after.cumulative_generated == 540
+    assert after.cumulative_evaluated == 530
+    assert after.cumulative_full_wfo == 529
+    assert after.sessions == []
+    history = after.metadata.get("fingerprint_migration_history") or []
+    assert history
+    assert history[-1]["from_fingerprint"] == legacy_fp
+    assert history[-1]["legacy_code_hash_migrated"] is True
+    assert (after.metadata.get("fingerprint_components") or {}).get(
+        "execution_semantic_hash"
+    ) == sem
+
+    ckpt_after = load_checkpoint(store.checkpoint_path(program_id))
+    assert ckpt_after is not None
+    assert ckpt_after.campaign_generated == 540
+    assert ckpt_after.pending_stress_ids == pending_before
+    assert ckpt_after.fingerprint_components.get("execution_semantic_hash") == sem
+    assert sorted(
+        p.name for p in store.evaluation_cache_dir(program_id).glob("*.json")
+    ) == eval_cache_files_before
+
+
+def test_zero_work_failed_attempt_does_not_change_program(tmp_path: Path) -> None:
+    from control_plane.search_bootstrap import prepare_search_program_session
+
+    base = _new_search_mf()
+    fp, comps = _fp_from_mf(base, execution_semantic_hash="esem_stable")
+    program_id, store = _program_with_checkpoint(tmp_path, comps=comps, fp=fp, mf=base)
+    snap = store.get(program_id)
+    assert snap is not None
+    raw_before = store.program_path(program_id).read_text(encoding="utf-8")
+
+    art = tmp_path / "art_zero"
+    art.mkdir(parents=True, exist_ok=True)
+    bad_fp, bad_comps = _fp_from_mf(base, execution_semantic_hash="esem_BROKEN")
+    with pytest.raises(IncompatibleSearchFingerprint):
+        prepare_search_program_session(
+            search_mode=SearchMode.RESUME_SEARCH.value,
+            program_id=program_id,
+            program_store=store,
+            compatibility_fingerprint=bad_fp,
+            seed=7,
+            family_ids=list(base["family_ids"]),
+            run_id="run_zero",
+            source_run_id="run_new",
+            resumed_from_run_id="run_new",
+            artifacts_root=tmp_path / "artifacts",
+            fingerprint_components=bad_comps,
+            multi_family_config=base,
+            run_artifact_dir=art,
+        )
+    assert store.program_path(program_id).read_text(encoding="utf-8") == raw_before
+
+
+def test_resume_of_resume_across_sessions(tmp_path: Path) -> None:
+    """Fingerprint identity remains stable across chained EXTEND_BUDGET prepares."""
+    from control_plane.search_bootstrap import prepare_search_program_session
+
+    base = _new_search_mf()
+    fp, comps = _fp_from_mf(
+        base,
+        execution_semantic_hash="esem_chain",
+        repository_git_sha="c" * 40,
+    )
+    comps["repository_git_sha"] = "c" * 40
+    program_id, store = _program_with_checkpoint(tmp_path, comps=comps, fp=fp, mf=base)
+
+    for i, repo_sha in enumerate(("d" * 40, "e" * 40, "f" * 40), start=1):
+        incoming_fp, incoming_comps = _fp_from_mf(
+            base,
+            execution_semantic_hash="esem_chain",
+            repository_git_sha=repo_sha,
+        )
+        incoming_comps["repository_git_sha"] = repo_sha
+        prepared = prepare_search_program_session(
+            search_mode=SearchMode.EXTEND_BUDGET.value,
+            program_id=program_id,
+            program_store=store,
+            compatibility_fingerprint=incoming_fp,
+            seed=7,
+            family_ids=list(base["family_ids"]),
+            run_id=f"run_chain_{i}",
+            source_run_id="run_new",
+            resumed_from_run_id="run_new",
+            artifacts_root=tmp_path / "artifacts",
+            fingerprint_components=incoming_comps,
+            multi_family_config=base,
+            run_artifact_dir=tmp_path / "artifacts" / f"run_chain_{i}",
+        )
+        assert prepared.resume_checkpoint is not None
+        prog = store.get(program_id)
+        assert prog is not None
+        assert prog.cumulative_generated == 540
+        assert prog.cumulative_full_wfo == 529
+        assert (prog.metadata.get("fingerprint_components") or {}).get(
+            "execution_semantic_hash"
+        ) == "esem_chain"
+
+
+def test_semantic_hash_cfb7_to_0d0a_matches() -> None:
+    from discovery.execution_semantic_hash import (
+        build_semantic_hash_manifest,
+        compute_execution_semantic_hash,
+        resolve_repo_root,
+    )
+
+    root = resolve_repo_root()
+    a = "cfb7f6d86fbea350c87609770743cfcaf28dc4d4"
+    b = "0d0a15f9c4d594d148d8686e3a8e45c8a26b2a64"
+    ha = compute_execution_semantic_hash(root, at_commit=a)
+    hb = compute_execution_semantic_hash(root, at_commit=b)
+    assert ha == hb
+    assert ha.startswith("esem_")
+    manifest = build_semantic_hash_manifest(
+        repo_root=root,
+        stored_repository_git_sha=a,
+        current_repository_git_sha=b,
+    )
+    assert manifest["semantic_hashes_match"] is True
+    assert manifest["migration_decision"] == "MIGRATE_ALLOW_RESUME"
+    assert "quant_framework/control_plane/jobs.py" in manifest["excluded_change_paths"]
+    assert "quant_framework/tests/test_search_resume.py" in manifest["excluded_change_paths"]
+    assert manifest["changed_allowlist_paths"] == []

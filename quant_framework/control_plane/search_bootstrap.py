@@ -28,6 +28,7 @@ from discovery.search_checkpoint import (
     save_checkpoint,
 )
 from discovery.search_program import (
+    CONTROL_PLANE_CODE_CHANGED,
     MISSING_CHECKPOINT,
     PipelinePhase,
     SearchMode,
@@ -35,9 +36,14 @@ from discovery.search_program import (
     assert_fingerprint_compatible,
     build_fingerprint_components,
     canonical_multi_family_payload,
+    engine_fingerprint_subset,
     hash_multi_family_config,
     new_search_program_id,
     now_iso,
+)
+from discovery.execution_semantic_hash import (
+    normalize_legacy_code_hash_component,
+    resolve_repo_root,
 )
 from discovery.search_resume import (
     mark_score_qualified_pending,
@@ -112,6 +118,9 @@ class PreparedSearchSession:
     bootstrapped_from_source: bool
     bootstrap_report: LegacyBootstrapReport | None = None
     fingerprint_migrated: bool = False
+    control_plane_code_changed: bool = False
+    legacy_code_hash_migrated: bool = False
+    migration_info: dict[str, Any] = field(default_factory=dict)
 
 
 def _load_source_multi_family(artifacts_root: Path, source_run_id: str | None) -> dict[str, Any]:
@@ -181,11 +190,18 @@ def _stored_fingerprint_context(
         wfo_config_hash=_pick("wfo_config_hash"),
         cost_model_version=_pick("cost_model_version"),
         risk_model_version=_pick("risk_model_version"),
+        execution_semantic_hash=_pick("execution_semantic_hash"),
         execution_engine_code_hash=_pick("execution_engine_code_hash"),
+        repository_git_sha=_pick("repository_git_sha"),
         multi_family_config_hash=mf_hash,
         seed=int(program.seed),
         family_ids=family_ids,
     )
+    # Ensure legacy whole-repo SHA remains visible for schema migration even when
+    # build_fingerprint_components promoted it into execution_semantic_hash.
+    legacy = _pick("execution_engine_code_hash")
+    if legacy:
+        stored_components["execution_engine_code_hash"] = legacy
     return stored_components, canonical_multi_family_payload(stored_mf)
 
 
@@ -826,6 +842,9 @@ def prepare_search_program_session(
     created_new = False
     bootstrapped = False
     fingerprint_migrated = False
+    control_plane_code_changed = False
+    legacy_code_hash_migrated = False
+    migration_info: dict[str, Any] = {}
     resume_ckpt: SearchCheckpoint | None = None
     bootstrap_report: LegacyBootstrapReport | None = None
     incoming_components = dict(fingerprint_components or {})
@@ -842,6 +861,10 @@ def prepare_search_program_session(
                 metadata={
                     "created_by_run_id": run_id,
                     "fingerprint_components": dict(incoming_components),
+                    "repository_git_sha": incoming_components.get("repository_git_sha"),
+                    "execution_semantic_hash": incoming_components.get(
+                        "execution_semantic_hash"
+                    ),
                 },
             )
             created_new = True
@@ -890,25 +913,99 @@ def prepare_search_program_session(
                 incoming_components["family_ids"] = (
                     sorted(str(x) for x in family_ids) if family_ids else None
                 )
+
+            repo_root = resolve_repo_root(Path(__file__).resolve().parents[2])
+            current_sem = str(incoming_components.get("execution_semantic_hash") or "")
+            normalized_stored, legacy_info = normalize_legacy_code_hash_component(
+                stored_components,
+                repo_root=repo_root,
+                current_execution_semantic_hash=current_sem or None,
+            )
+            migration_info = dict(legacy_info)
+            legacy_code_hash_migrated = bool(legacy_info.get("legacy_schema"))
+
             migrate_diff = assert_fingerprint_compatible(
                 existing.compatibility_fingerprint,
                 compatibility_fingerprint,
                 mode=mode,
-                stored_components=stored_components,
+                stored_components=normalized_stored,
                 incoming_components=incoming_components,
                 stored_multi_family_canonical=stored_mf_canonical,
                 incoming_multi_family_canonical=incoming_mf_canonical,
                 artifact_dir=run_artifact_dir,
+                legacy_code_hash_migrated=legacy_code_hash_migrated,
             )
-            if migrate_diff is not None and migrate_diff.migrated_aggregate:
+            if migrate_diff is not None and (
+                migrate_diff.migrated_aggregate
+                or migrate_diff.control_plane_code_changed
+                or legacy_code_hash_migrated
+            ):
+                # Atomic program metadata migration — never touch counters/queues/cache.
+                original_fp = existing.compatibility_fingerprint
+                original_comps = dict(
+                    (existing.metadata or {}).get("fingerprint_components")
+                    or stored_components
+                )
                 existing.compatibility_fingerprint = compatibility_fingerprint
                 meta = dict(existing.metadata or {})
+                history = list(meta.get("fingerprint_migration_history") or [])
+                history.append(
+                    {
+                        "migrated_at": now_iso(),
+                        "from_fingerprint": original_fp,
+                        "to_fingerprint": compatibility_fingerprint,
+                        "from_components": original_comps,
+                        "to_components": dict(incoming_components),
+                        "legacy_code_hash_migrated": legacy_code_hash_migrated,
+                        "legacy_info": dict(legacy_info),
+                        "control_plane_code_changed": bool(
+                            migrate_diff.control_plane_code_changed
+                        ),
+                        "audit_reason_codes": list(migrate_diff.audit_reason_codes),
+                        "run_id": run_id,
+                    }
+                )
+                meta["fingerprint_migration_history"] = history
                 meta["fingerprint_components"] = dict(incoming_components)
                 meta["fingerprint_migrated_at"] = now_iso()
-                meta["fingerprint_migrated_from"] = migrate_diff.stored_fingerprint
+                meta["fingerprint_migrated_from"] = original_fp
+                meta["repository_git_sha"] = incoming_components.get(
+                    "repository_git_sha"
+                )
+                meta["execution_semantic_hash"] = incoming_components.get(
+                    "execution_semantic_hash"
+                )
+                if migrate_diff.control_plane_code_changed:
+                    control_plane_code_changed = True
+                    audits = list(meta.get("audit_events") or [])
+                    audits.append(
+                        {
+                            "reason": CONTROL_PLANE_CODE_CHANGED,
+                            "stored_repository_git_sha": migrate_diff.stored_git_commit_sha,
+                            "incoming_repository_git_sha": migrate_diff.incoming_git_commit_sha,
+                            "execution_semantic_hash": incoming_components.get(
+                                "execution_semantic_hash"
+                            ),
+                            "at": now_iso(),
+                            "run_id": run_id,
+                        }
+                    )
+                    meta["audit_events"] = audits
                 existing.metadata = meta
                 program_store.save(existing)
+
+                # Update checkpoint fingerprint components in place (identity only).
+                if stored_ckpt is not None:
+                    stored_ckpt.compatibility_fingerprint = compatibility_fingerprint
+                    stored_ckpt.fingerprint_components = engine_fingerprint_subset(
+                        incoming_components
+                    )
+                    save_checkpoint(ckpt_path_early, stored_ckpt)
+
                 fingerprint_migrated = True
+                migration_info["migrated"] = True
+                migration_info["from_fingerprint"] = original_fp
+                migration_info["to_fingerprint"] = compatibility_fingerprint
 
     ckpt_path = program_store.checkpoint_path(pid)
     # Do not mkdir the program dir until bootstrap publishes (atomic rollback).
@@ -960,20 +1057,7 @@ def prepare_search_program_session(
                 compatibility_fingerprint=compatibility_fingerprint,
                 session_run_id=run_id,
                 search_mode=mode.value,
-                fingerprint_components={
-                    k: str(v)
-                    for k, v in incoming_components.items()
-                    if k
-                    in {
-                        "dataset_hash",
-                        "timeframe",
-                        "wfo_config_hash",
-                        "cost_model_version",
-                        "risk_model_version",
-                        "execution_engine_code_hash",
-                    }
-                    and v is not None
-                },
+                fingerprint_components=engine_fingerprint_subset(incoming_components),
                 source_run_id=str(source_run_id),
                 resumed_from_run_id=str(resumed_from_run_id or source_run_id),
             )
@@ -1059,4 +1143,7 @@ def prepare_search_program_session(
         bootstrapped_from_source=bootstrapped,
         bootstrap_report=bootstrap_report,
         fingerprint_migrated=fingerprint_migrated,
+        control_plane_code_changed=control_plane_code_changed,
+        legacy_code_hash_migrated=legacy_code_hash_migrated,
+        migration_info=migration_info,
     )

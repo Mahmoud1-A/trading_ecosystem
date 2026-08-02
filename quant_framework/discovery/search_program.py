@@ -46,16 +46,32 @@ MISSING_CHECKPOINT = "MISSING_SEARCH_CHECKPOINT"
 INVALID_RESUME_MODE = "INVALID_RESUME_MODE"
 
 # Strict semantic components that gate true resume (order is diagnostic display order).
+# ``execution_semantic_hash`` is an allowlisted content hash of evaluation-critical
+# modules. ``repository_git_sha`` is provenance-only and never gates resume alone.
 FINGERPRINT_COMPONENT_KEYS: tuple[str, ...] = (
     "dataset_hash",
     "timeframe",
     "wfo_config_hash",
     "cost_model_version",
     "risk_model_version",
-    "execution_engine_code_hash",
+    "execution_semantic_hash",
     "multi_family_config_hash",
     "seed",
     "family_ids",
+)
+
+# Subset persisted on checkpoints / eval-cache wiring (plus optional provenance).
+ENGINE_FINGERPRINT_KEYS: tuple[str, ...] = (
+    "dataset_hash",
+    "timeframe",
+    "wfo_config_hash",
+    "cost_model_version",
+    "risk_model_version",
+    "execution_semantic_hash",
+)
+
+PROVENANCE_COMPONENT_KEYS: tuple[str, ...] = (
+    "repository_git_sha",
 )
 
 FINGERPRINT_REASON_CODES: dict[str, str] = {
@@ -64,11 +80,16 @@ FINGERPRINT_REASON_CODES: dict[str, str] = {
     "wfo_config_hash": "WFO_CONFIG_CHANGED",
     "cost_model_version": "COST_MODEL_CHANGED",
     "risk_model_version": "RISK_MODEL_CHANGED",
+    "execution_semantic_hash": "EXECUTION_SEMANTICS_CHANGED",
+    # Legacy alias retained for diagnostics of pre-migration programs.
     "execution_engine_code_hash": "CODE_HASH_CHANGED",
     "multi_family_config_hash": "MULTI_FAMILY_STRUCTURE_CHANGED",
     "seed": "SEED_CHANGED",
     "family_ids": "FAMILY_IDS_CHANGED",
 }
+
+CONTROL_PLANE_CODE_CHANGED = "CONTROL_PLANE_CODE_CHANGED"
+EXECUTION_SEMANTICS_CHANGED = "EXECUTION_SEMANTICS_CHANGED"
 
 # Structural research semantics only — session/runtime/dashboard metadata excluded.
 MULTI_FAMILY_STRUCTURAL_KEYS: tuple[str, ...] = (
@@ -117,19 +138,29 @@ def compute_compatibility_fingerprint(
     wfo_config_hash: str,
     cost_model_version: str,
     risk_model_version: str,
-    execution_engine_code_hash: str,
     multi_family_config_hash: str,
     seed: int,
     family_ids: list[str] | None = None,
+    execution_semantic_hash: str | None = None,
+    execution_engine_code_hash: str | None = None,
 ) -> str:
-    """Dataset/config/code fingerprint that gates true resume vs reevaluation."""
+    """Dataset/config/code fingerprint that gates true resume vs reevaluation.
+
+    ``execution_semantic_hash`` is preferred. ``execution_engine_code_hash`` is
+    accepted as a legacy alias (older callers / polluted aggregates).
+    """
+    semantic = (
+        str(execution_semantic_hash)
+        if execution_semantic_hash not in (None, "")
+        else str(execution_engine_code_hash or "")
+    )
     payload = {
         "dataset_hash": str(dataset_hash),
         "timeframe": str(timeframe),
         "wfo_config_hash": str(wfo_config_hash),
         "cost_model_version": str(cost_model_version),
         "risk_model_version": str(risk_model_version),
-        "execution_engine_code_hash": str(execution_engine_code_hash),
+        "execution_semantic_hash": semantic,
         "multi_family_config_hash": str(multi_family_config_hash),
         "seed": int(seed),
         "family_ids": list(family_ids) if family_ids else None,
@@ -250,23 +281,54 @@ def build_fingerprint_components(
     wfo_config_hash: str,
     cost_model_version: str,
     risk_model_version: str,
-    execution_engine_code_hash: str,
     multi_family_config_hash: str,
     seed: int,
     family_ids: list[str] | None = None,
+    execution_semantic_hash: str | None = None,
+    execution_engine_code_hash: str | None = None,
+    repository_git_sha: str | None = None,
 ) -> dict[str, Any]:
-    """Full strict-component map used for diagnostics and identity checks."""
-    return {
+    """Full strict-component map used for diagnostics and identity checks.
+
+    ``repository_git_sha`` is stored for audit/provenance and is not a resume gate.
+    """
+    semantic = (
+        str(execution_semantic_hash)
+        if execution_semantic_hash not in (None, "")
+        else str(execution_engine_code_hash or "")
+    )
+    out: dict[str, Any] = {
         "dataset_hash": str(dataset_hash),
         "timeframe": str(timeframe),
         "wfo_config_hash": str(wfo_config_hash),
         "cost_model_version": str(cost_model_version),
         "risk_model_version": str(risk_model_version),
-        "execution_engine_code_hash": str(execution_engine_code_hash),
+        "execution_semantic_hash": semantic,
         "multi_family_config_hash": str(multi_family_config_hash),
         "seed": int(seed),
         "family_ids": sorted(str(x) for x in family_ids) if family_ids else None,
     }
+    if repository_git_sha not in (None, ""):
+        out["repository_git_sha"] = str(repository_git_sha)
+    return out
+
+
+def engine_fingerprint_subset(components: dict[str, Any]) -> dict[str, str]:
+    """Checkpoint / campaign subset including provenance when present.
+
+    Also mirrors ``execution_semantic_hash`` into ``execution_engine_code_hash``
+    so older campaign/eval-cache call sites keep working without touching
+    evaluation-critical modules.
+    """
+    keys = list(ENGINE_FINGERPRINT_KEYS) + list(PROVENANCE_COMPONENT_KEYS)
+    out = {
+        k: str(components[k])
+        for k in keys
+        if components.get(k) not in (None, "")
+    }
+    if "execution_semantic_hash" in out:
+        out["execution_engine_code_hash"] = out["execution_semantic_hash"]
+    return out
 
 
 @dataclass
@@ -285,6 +347,9 @@ class FingerprintDiff:
     incoming_git_commit_sha: str | None = None
     compatible: bool = False
     migrated_aggregate: bool = False
+    control_plane_code_changed: bool = False
+    audit_reason_codes: list[str] = field(default_factory=list)
+    legacy_code_hash_migrated: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -298,12 +363,23 @@ class FingerprintDiff:
             "incoming_multi_family_canonical": dict(self.incoming_multi_family_canonical),
             "stored_git_commit_sha": self.stored_git_commit_sha,
             "incoming_git_commit_sha": self.incoming_git_commit_sha,
+            "stored_repository_git_sha": self.stored_git_commit_sha,
+            "incoming_repository_git_sha": self.incoming_git_commit_sha,
+            "stored_execution_semantic_hash": self.stored_components.get(
+                "execution_semantic_hash"
+            ),
+            "incoming_execution_semantic_hash": self.incoming_components.get(
+                "execution_semantic_hash"
+            ),
             "stored_dataset_hash": self.stored_components.get("dataset_hash"),
             "incoming_dataset_hash": self.incoming_components.get("dataset_hash"),
             "stored_wfo_hash": self.stored_components.get("wfo_config_hash"),
             "incoming_wfo_hash": self.incoming_components.get("wfo_config_hash"),
             "compatible": self.compatible,
             "migrated_aggregate": self.migrated_aggregate,
+            "control_plane_code_changed": self.control_plane_code_changed,
+            "audit_reason_codes": list(self.audit_reason_codes),
+            "legacy_code_hash_migrated": self.legacy_code_hash_migrated,
         }
 
 
@@ -319,6 +395,29 @@ class IncompatibleSearchFingerprint(ValueError):
         )
 
 
+def _component_semantic_value(components: dict[str, Any]) -> str | None:
+    """Prefer execution_semantic_hash; fall back to legacy execution_engine_code_hash."""
+    sem = components.get("execution_semantic_hash")
+    if sem not in (None, ""):
+        return str(sem)
+    legacy = components.get("execution_engine_code_hash")
+    if legacy not in (None, ""):
+        return str(legacy)
+    return None
+
+
+def _component_repo_sha(components: dict[str, Any]) -> str | None:
+    repo = components.get("repository_git_sha")
+    if repo not in (None, ""):
+        return str(repo)
+    legacy = components.get("execution_engine_code_hash")
+    from discovery.execution_semantic_hash import looks_like_git_sha
+
+    if looks_like_git_sha(legacy):
+        return str(legacy)
+    return None
+
+
 def compare_fingerprint_components(
     *,
     stored_fingerprint: str,
@@ -327,12 +426,22 @@ def compare_fingerprint_components(
     incoming_components: dict[str, Any],
     stored_multi_family_canonical: dict[str, Any] | None = None,
     incoming_multi_family_canonical: dict[str, Any] | None = None,
+    legacy_code_hash_migrated: bool = False,
 ) -> FingerprintDiff:
-    """Compare strict semantic components; aggregates alone are not authoritative."""
+    """Compare strict semantic components; aggregates alone are not authoritative.
+
+    ``repository_git_sha`` may differ without blocking resume when
+    ``execution_semantic_hash`` matches; that case records
+    ``CONTROL_PLANE_CODE_CHANGED`` as a non-blocking audit reason.
+    """
     changed: list[str] = []
     for key in FINGERPRINT_COMPONENT_KEYS:
-        left = stored_components.get(key)
-        right = incoming_components.get(key)
+        if key == "execution_semantic_hash":
+            left = _component_semantic_value(stored_components)
+            right = _component_semantic_value(incoming_components)
+        else:
+            left = stored_components.get(key)
+            right = incoming_components.get(key)
         if key == "family_ids":
             left = sorted(str(x) for x in left) if left else None
             right = sorted(str(x) for x in right) if right else None
@@ -347,6 +456,20 @@ def compare_fingerprint_components(
     reasons = [FINGERPRINT_REASON_CODES[k] for k in changed if k in FINGERPRINT_REASON_CODES]
     compatible = not changed
     migrated = compatible and stored_fingerprint != incoming_fingerprint
+
+    stored_repo = _component_repo_sha(stored_components)
+    incoming_repo = _component_repo_sha(incoming_components)
+    audit: list[str] = []
+    control_plane_changed = False
+    if (
+        compatible
+        and stored_repo
+        and incoming_repo
+        and stored_repo != incoming_repo
+    ):
+        control_plane_changed = True
+        audit.append(CONTROL_PLANE_CODE_CHANGED)
+
     return FingerprintDiff(
         stored_fingerprint=str(stored_fingerprint),
         incoming_fingerprint=str(incoming_fingerprint),
@@ -356,18 +479,13 @@ def compare_fingerprint_components(
         changed_reason_codes=reasons,
         stored_multi_family_canonical=dict(stored_multi_family_canonical or {}),
         incoming_multi_family_canonical=dict(incoming_multi_family_canonical or {}),
-        stored_git_commit_sha=(
-            None
-            if stored_components.get("execution_engine_code_hash") is None
-            else str(stored_components.get("execution_engine_code_hash"))
-        ),
-        incoming_git_commit_sha=(
-            None
-            if incoming_components.get("execution_engine_code_hash") is None
-            else str(incoming_components.get("execution_engine_code_hash"))
-        ),
+        stored_git_commit_sha=stored_repo,
+        incoming_git_commit_sha=incoming_repo,
         compatible=compatible,
         migrated_aggregate=migrated,
+        control_plane_code_changed=control_plane_changed,
+        audit_reason_codes=audit,
+        legacy_code_hash_migrated=bool(legacy_code_hash_migrated),
     )
 
 
@@ -571,6 +689,7 @@ def assert_fingerprint_compatible(
     stored_multi_family_canonical: dict[str, Any] | None = None,
     incoming_multi_family_canonical: dict[str, Any] | None = None,
     artifact_dir: Path | None = None,
+    legacy_code_hash_migrated: bool = False,
 ) -> FingerprintDiff | None:
     """True resume requires identical strict semantic components.
 
@@ -578,10 +697,27 @@ def assert_fingerprint_compatible(
     hashed with a broader multi-family payload (including runtime/dashboard
     metadata), component-level comparison using the canonical structural
     allowlist is authoritative. Reevaluation may diverge.
+
+    Repository git SHA may change while ``execution_semantic_hash`` stays
+    identical; that yields a compatible diff with ``CONTROL_PLANE_CODE_CHANGED``
+    audit metadata rather than a hard reject.
     """
     if mode is SearchMode.REEVALUATE_FROZEN_CANDIDATES:
         return None
-    if stored == incoming:
+    if stored == incoming and not legacy_code_hash_migrated:
+        # Still surface control-plane code drift when components are provided.
+        if stored_components is not None and incoming_components is not None:
+            diff = compare_fingerprint_components(
+                stored_fingerprint=stored,
+                incoming_fingerprint=incoming,
+                stored_components=stored_components,
+                incoming_components=incoming_components,
+                stored_multi_family_canonical=stored_multi_family_canonical,
+                incoming_multi_family_canonical=incoming_multi_family_canonical,
+                legacy_code_hash_migrated=False,
+            )
+            if diff.control_plane_code_changed:
+                return diff
         return None
 
     if stored_components is not None and incoming_components is not None:
@@ -592,9 +728,13 @@ def assert_fingerprint_compatible(
             incoming_components=incoming_components,
             stored_multi_family_canonical=stored_multi_family_canonical,
             incoming_multi_family_canonical=incoming_multi_family_canonical,
+            legacy_code_hash_migrated=legacy_code_hash_migrated,
         )
         if diff.compatible:
-            # Aggregate drift only (e.g. pre-runtime metadata polluted the old hash).
+            # Aggregate drift only (e.g. pre-runtime metadata polluted the old hash)
+            # and/or legacy whole-repo SHA → semantic-hash schema migration.
+            if legacy_code_hash_migrated:
+                diff.migrated_aggregate = True
             return diff
         if artifact_dir is not None:
             persist_fingerprint_diff(artifact_dir, diff)

@@ -549,6 +549,7 @@ def run_alpha_miner_job(
                 SearchSessionRecord,
                 build_fingerprint_components,
                 compute_compatibility_fingerprint,
+                engine_fingerprint_subset,
                 hash_multi_family_config,
                 hash_wfo_config,
                 now_iso,
@@ -622,10 +623,13 @@ def run_alpha_miner_job(
             )
             wfo_hash = hash_wfo_config(run.config_snapshot.get("wfo"))
             mf_hash = hash_multi_family_config(mf_raw)
-            code_hash = str(
-                provenance.get("git_commit_sha")
-                or provenance.get("code_hash")
-                or "local"
+            repository_git_sha = str(
+                provenance.get("repository_git_sha")
+                or provenance.get("git_commit_sha")
+                or "UNKNOWN"
+            )
+            execution_semantic_hash = str(
+                provenance.get("execution_semantic_hash") or "UNKNOWN"
             )
             family_ids = list(multi_cfg.family_ids) if multi_cfg.family_ids else None
             fp_components = build_fingerprint_components(
@@ -638,7 +642,8 @@ def run_alpha_miner_job(
                 risk_model_version=str(
                     run.config_snapshot.get("risk_profile") or "demo"
                 ),
-                execution_engine_code_hash=code_hash,
+                execution_semantic_hash=execution_semantic_hash,
+                repository_git_sha=repository_git_sha,
                 multi_family_config_hash=mf_hash,
                 seed=int(multi_cfg.seed),
                 family_ids=family_ids,
@@ -649,8 +654,8 @@ def run_alpha_miner_job(
                 wfo_config_hash=str(fp_components["wfo_config_hash"]),
                 cost_model_version=str(fp_components["cost_model_version"]),
                 risk_model_version=str(fp_components["risk_model_version"]),
-                execution_engine_code_hash=str(
-                    fp_components["execution_engine_code_hash"]
+                execution_semantic_hash=str(
+                    fp_components["execution_semantic_hash"]
                 ),
                 multi_family_config_hash=str(fp_components["multi_family_config_hash"]),
                 seed=int(fp_components["seed"]),
@@ -717,6 +722,15 @@ def run_alpha_miner_job(
             ckpt_path = prepared.checkpoint_path
             eval_cache = prepared.evaluation_cache
 
+            session_notes: dict[str, Any] = {
+                "repository_git_sha": repository_git_sha,
+                "execution_semantic_hash": execution_semantic_hash,
+            }
+            if prepared.control_plane_code_changed:
+                session_notes["audit_reason"] = "CONTROL_PLANE_CODE_CHANGED"
+            if prepared.legacy_code_hash_migrated:
+                session_notes["legacy_code_hash_migrated"] = True
+                session_notes["migration_info"] = dict(prepared.migration_info or {})
             program_store.append_session(
                 str(program_id),
                 SearchSessionRecord(
@@ -727,6 +741,7 @@ def run_alpha_miner_job(
                         str(resumed_from_run_id) if resumed_from_run_id else None
                     ),
                     started_at=now_iso(),
+                    notes=session_notes,
                 ),
             )
             # Freeze search_program metadata into config snapshot for dashboard.
@@ -739,11 +754,15 @@ def run_alpha_miner_job(
                     "resumed_from_run_id": resumed_from_run_id,
                     "compatibility_fingerprint": compatibility_fp,
                     "fingerprint_components": fp_components,
+                    "repository_git_sha": repository_git_sha,
+                    "execution_semantic_hash": execution_semantic_hash,
                 }
             )
             run.config_snapshot["multi_family"] = mf_raw
             run.config_snapshot["search_program_id"] = program_id
             run.config_snapshot["search_mode"] = search_mode
+            run.config_snapshot["repository_git_sha"] = repository_git_sha
+            run.config_snapshot["execution_semantic_hash"] = execution_semantic_hash
             run.config_hash = "cfg_" + sha256_json(run.config_snapshot)[:24]
             if on_update is not None:
                 on_update(run)
@@ -759,20 +778,7 @@ def run_alpha_miner_job(
                 search_program_id=str(program_id),
                 search_mode=search_mode,
                 compatibility_fingerprint=compatibility_fp,
-                fingerprint_components={
-                    k: str(v)
-                    for k, v in fp_components.items()
-                    if k
-                    in {
-                        "dataset_hash",
-                        "timeframe",
-                        "wfo_config_hash",
-                        "cost_model_version",
-                        "risk_model_version",
-                        "execution_engine_code_hash",
-                    }
-                    and v is not None
-                },
+                fingerprint_components=engine_fingerprint_subset(fp_components),
                 checkpoint_path=ckpt_path,
                 evaluation_cache=eval_cache,
                 resume_checkpoint=resume_ckpt,
