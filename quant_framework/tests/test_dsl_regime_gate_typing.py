@@ -321,10 +321,13 @@ class TestImmutabilityAcquisition:
         if not MULTIYEAR_PARENT.is_file():
             pytest.skip("no multiyear parent")
         parent = json.loads(MULTIYEAR_PARENT.read_text(encoding="utf-8"))
-        assert parent.get("state") == "RUNNING"
+        state = str(parent.get("state") or "")
+        assert state in {"RUNNING", "PAUSED", "COMPLETED"}
         assert 2024 not in (parent.get("years") or [])
         pid = parent.get("pid")
-        if pid:
+        # A completed immutable acquisition is healthy and has no live worker.
+        # Only active lifecycle states are required to prove the PID is alive.
+        if state in {"RUNNING", "PAUSED"} and pid:
             out = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {int(pid)}"],
                 capture_output=True,

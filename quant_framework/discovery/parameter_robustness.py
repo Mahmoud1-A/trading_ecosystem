@@ -280,13 +280,15 @@ class ParameterRobustness:
             raise RuntimeError(SYNTHETIC_ROBUSTNESS_FORBIDDEN)
         if forbid:
             kind = str(getattr(self.backend, "backend_kind", ""))
-            # Real EventDrivenDiscoveryBackend or an injected backend that
-            # honestly declares the expected event-driven kind.
-            from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
+            # The existing integrity contract accepts either the concrete real
+            # backend or an injected backend declaring the exact expected kind.
+            # Avoid importing the local data stack when that declaration already
+            # satisfies the gate; import only for the concrete-class fallback.
+            if kind != self.expected_backend_kind:
+                from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
 
-            is_real = isinstance(self.backend, EventDrivenDiscoveryBackend)
-            if not is_real and kind != self.expected_backend_kind:
-                raise RuntimeError(REAL_ROBUSTNESS_BACKEND_REQUIRED)
+                if not isinstance(self.backend, EventDrivenDiscoveryBackend):
+                    raise RuntimeError(REAL_ROBUSTNESS_BACKEND_REQUIRED)
 
         backend_kind = str(getattr(self.backend, "backend_kind", type(self.backend).__name__))
         names = (

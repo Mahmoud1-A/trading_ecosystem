@@ -664,6 +664,32 @@ EMPTY_COLLECTIONS_REASONS_AFTER_SHORTLIST: dict[str, list[str]] = {
 }
 
 
+# Operational search/session metadata must never contaminate a scientific
+# reproducibility fingerprint. Two semantically identical NEW/RESUME runs may
+# have different program IDs, cache counters, or pending queues while producing
+# exactly the same research artifact.
+_REPRODUCIBLE_ALLOCATION_EXCLUDED_KEYS = frozenset(
+    {
+        "search_program_id",
+        "source_run_id",
+        "resumed_from_run_id",
+        "session_totals",
+        "evaluation_cache_hits",
+        "evaluation_cache_misses",
+        "pending_by_gate",
+    }
+)
+
+
+def _reproducible_allocation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return allocation evidence stripped only of run/session volatility."""
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _REPRODUCIBLE_ALLOCATION_EXCLUDED_KEYS
+    }
+
+
 @dataclass
 class FamilyCampaignConfig:
     """Multi-family campaign configuration.
@@ -2478,11 +2504,13 @@ class MultiFamilyCampaign:
         if forbid and isinstance(self.backend, SyntheticOOSBackend):
             return None, SYNTHETIC_ROBUSTNESS_FORBIDDEN, "synthetic_oos_probe"
 
-        from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
-
         kind = str(getattr(self.backend, "backend_kind", type(self.backend).__name__))
-        if forbid and not isinstance(self.backend, EventDrivenDiscoveryBackend):
-            if kind != _REQUIRED_ROBUSTNESS_BACKEND_KIND:
+        if forbid and kind != _REQUIRED_ROBUSTNESS_BACKEND_KIND:
+            # Only import the concrete real-data backend when a declaration did
+            # not already satisfy the exact kind required by the existing gate.
+            from discovery.event_wfo_backend import EventDrivenDiscoveryBackend
+
+            if not isinstance(self.backend, EventDrivenDiscoveryBackend):
                 return None, REAL_ROBUSTNESS_BACKEND_REQUIRED, kind
 
         probe = ParameterRobustness(
@@ -5168,7 +5196,7 @@ class MultiFamilyCampaign:
         fingerprint = sha256_json(
             {
                 "families": [f.canonical_hash() for f in families],
-                "allocation": allocation_payload,
+                "allocation": _reproducible_allocation_payload(allocation_payload),
                 "config": cfg.as_dict(),
                 "pipeline_level": pipeline,
                 "generation_records": [g.as_dict() for g in generation_records],
@@ -5503,7 +5531,7 @@ class MultiFamilyCampaign:
         fingerprint = sha256_json(
             {
                 "families": [f.canonical_hash() for f in families],
-                "allocation": allocation_payload,
+                "allocation": _reproducible_allocation_payload(allocation_payload),
                 "config": cfg.as_dict(),
                 "pipeline_level": PIPELINE_LEVEL_MULTI_FAMILY_WFO_SCREENING,
             }

@@ -371,12 +371,13 @@ class TestImmutabilityAndAcquisition:
         if not MULTIYEAR_PARENT.is_file():
             pytest.skip("multiyear parent_job.json missing")
         parent = json.loads(MULTIYEAR_PARENT.read_text(encoding="utf-8"))
-        assert parent.get("state") in {"RUNNING", "PAUSED"}
-        # Must not have been rewritten to include 2024
+        state = str(parent.get("state") or "")
+        assert state in {"RUNNING", "PAUSED", "COMPLETED"}
+        # Must not have been rewritten to include protected diagnostic year 2024.
         years = parent.get("years") or []
         assert 2024 not in years
         pid = parent.get("pid")
-        if pid:
+        if state in {"RUNNING", "PAUSED"} and pid:
             alive = False
             try:
                 os.kill(int(pid), 0)
