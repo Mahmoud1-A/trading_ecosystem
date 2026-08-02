@@ -7,13 +7,12 @@ on:
       - fix/alpha-budget-drain
     paths:
       - scripts/apply_economic_fitness_and_stress_observability.py
+      - scripts/finalize_stress_progress_context.py
       - .github/workflows/apply-economic-fitness-hardening.yml
-  pull_request:
-    branches:
-      - main
-    paths:
-      - scripts/apply_economic_fitness_and_stress_observability.py
-      - .github/workflows/apply-economic-fitness-hardening.yml
+
+concurrency:
+  group: economic-hardening-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -32,7 +31,9 @@ jobs:
           python-version: "3.12"
 
       - name: Apply targeted hardening
-        run: python scripts/apply_economic_fitness_and_stress_observability.py
+        run: |
+          python scripts/apply_economic_fitness_and_stress_observability.py
+          python scripts/finalize_stress_progress_context.py
 
       - name: Install framework
         run: |
@@ -57,11 +58,15 @@ jobs:
               "STRESS_CANDIDATE_COMPLETED",
               "sync_pending_gate_queues(ckpt)",
               "self._persist_live_checkpoint()",
+              '"candidate_index": candidate_index',
+              '"total_candidates": len(ordered)',
           )
           required_stress = (
               "STRESS_SCENARIO_STARTED",
               "STRESS_SCENARIO_COMPLETED",
               "progress_hook",
+              "progress_context",
+              "{**self.progress_context, **payload}",
           )
           required_jobs = (
               '"STRESS_CANDIDATE_STARTED": EventType.PROGRESS',
@@ -93,6 +98,8 @@ jobs:
           if git diff --cached --quiet; then
             echo "No generated changes to commit"
           else
-            git commit -m "Harden economic fitness and make Stress observable"
+            git commit -m "Finalize monotonic Stress progress context"
+            git fetch origin fix/alpha-budget-drain
+            git rebase origin/fix/alpha-budget-drain
             git push origin HEAD:fix/alpha-budget-drain
           fi
