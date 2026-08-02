@@ -33,7 +33,10 @@ def _fold(
 
 
 def test_high_calmar_from_microscopic_drawdown_fails_economic_gate() -> None:
-    result = RobustFitness(min_total_oos_trades=8).score(
+    result = RobustFitness(
+        min_total_oos_trades=8,
+        min_risk_normalized_annual_return=0.12,
+    ).score(
         [_fold(calmar=20.0, max_drawdown=-0.0005)]
     )
 
@@ -45,7 +48,10 @@ def test_high_calmar_from_microscopic_drawdown_fails_economic_gate() -> None:
 
 
 def test_economically_useful_return_passes_at_common_risk_budget() -> None:
-    result = RobustFitness(min_total_oos_trades=8).score(
+    result = RobustFitness(
+        min_total_oos_trades=8,
+        min_risk_normalized_annual_return=0.12,
+    ).score(
         [_fold(calmar=3.0, max_drawdown=-0.04)]
     )
 

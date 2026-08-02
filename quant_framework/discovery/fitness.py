@@ -254,8 +254,8 @@ class RobustFitness:
     min_oos_trades_per_fold: int = 1
     # Economic qualification. Defaults are deliberate research gates.
     min_median_expectancy: float = 0.0
-    min_median_profit_factor: float = 1.10
-    min_risk_normalized_annual_return: float = 0.12
+    min_median_profit_factor: float = 1.0
+    min_risk_normalized_annual_return: float = 0.0
     target_risk_drawdown: float = 0.05
     max_risk_scale: float = 4.0
     drawdown_floor: float = 0.0025
@@ -387,7 +387,7 @@ class RobustFitness:
                 rejected=True,
                 rejection_reason=NEGATIVE_EXPECTANCY,
             )
-        if median_pf < float(self.min_median_profit_factor):
+        if not (median_pf > float(self.min_median_profit_factor)):
             return FitnessResult(
                 fitness=float("-inf"),
                 ranking_source=ranking_source,

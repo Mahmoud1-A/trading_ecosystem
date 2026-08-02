@@ -131,10 +131,15 @@ class StressTester:
     backend_factory: Callable[[str], BacktestBackend] = field(default=_default_backend_factory)
     research_eligible: bool = False
     synthetic_stress_forbidden: bool = False
+    progress_hook: Callable[[str, dict[str, Any]], None] | None = None
     # Legacy field retained but NOT used as sole pass criterion on research paths.
     min_fitness_ratio: float = 0.35
     # Accounting from the most recent run() call (honest Stress budget proof).
     last_run_accounting: dict[str, Any] = field(default_factory=dict)
+
+    def _emit(self, name: str, payload: dict[str, Any]) -> None:
+        if self.progress_hook is not None:
+            self.progress_hook(name, payload)
 
     def run(
         self,
@@ -169,9 +174,21 @@ class StressTester:
 
         single_symbol = len(candidate.asset_universe) <= 1
 
-        for scenario in chosen:
+        for scenario_index, scenario in enumerate(chosen, start=1):
             if self.counters.stress >= self.budget.max_stress_evaluations:
                 break
+
+            self._emit(
+                "STRESS_SCENARIO_STARTED",
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "scenario": scenario,
+                    "scenario_index": scenario_index,
+                    "total_scenarios": len(chosen),
+                    "stress_consumed": int(self.counters.stress),
+                    "max_stress_evaluations": int(self.budget.max_stress_evaluations),
+                },
+            )
 
             # Scenarios that can never be a genuine rerun must not consume a
             # stress-evaluation slot, must never be marked passed or failed,
@@ -298,6 +315,21 @@ class StressTester:
                 )
             )
             self.counters.stress += 1
+            completed = results[-1]
+            self._emit(
+                "STRESS_SCENARIO_COMPLETED",
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "scenario": scenario,
+                    "scenario_index": scenario_index,
+                    "total_scenarios": len(chosen),
+                    "status": completed.status,
+                    "passed": completed.passed,
+                    "failure_reason": completed.failure_reason,
+                    "stress_consumed": int(self.counters.stress),
+                    "max_stress_evaluations": int(self.budget.max_stress_evaluations),
+                },
+            )
 
         stress_counter_delta = int(self.counters.stress) - stress_before
         self.last_run_accounting = {

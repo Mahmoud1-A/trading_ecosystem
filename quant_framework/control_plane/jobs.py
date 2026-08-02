@@ -301,6 +301,19 @@ def run_alpha_miner_job(
         "WFO_FOLD_COMPLETED": EventType.WFO_FOLD_COMPLETED,
         "BEHAVIORAL_CLUSTER_UPDATED": EventType.BEHAVIORAL_CLUSTER_UPDATED,
         "FINALIST_SELECTED": EventType.FINALIST_SELECTED,
+        # Multi-family resume / Stress visibility. Generic PROGRESS events are
+        # intentional: payload carries candidate/scenario detail without adding
+        # execution semantics to the EventType enum.
+        "SEARCH_RESUME_STARTED": EventType.PROGRESS,
+        "MULTI_FAMILY_STRESS_STARTED": EventType.PROGRESS,
+        "STRESS_CANDIDATE_STARTED": EventType.PROGRESS,
+        "STRESS_SCENARIO_STARTED": EventType.PROGRESS,
+        "STRESS_SCENARIO_COMPLETED": EventType.PROGRESS,
+        "STRESS_CANDIDATE_COMPLETED": EventType.PROGRESS,
+        "SEARCH_CHECKPOINT_SAVED": EventType.PROGRESS,
+        "MULTI_FAMILY_STRESS_COMPLETED": EventType.PROGRESS,
+        "MULTI_FAMILY_ROBUSTNESS_STARTED": EventType.PROGRESS,
+        "MULTI_FAMILY_ROBUSTNESS_COMPLETED": EventType.PROGRESS,
     }
     t0 = datetime.now(tz=timezone.utc)
     dataset_id = str(run.config_snapshot.get("dataset") or "synthetic_demo")
@@ -508,6 +521,20 @@ def run_alpha_miner_job(
         if multi_cfg is not None:
             gen_cap = max(1, multi_cfg.total_candidate_budget)
         progress = min(95.0, 10.0 + 80.0 * (counter_proxy.generated / gen_cap))
+        if name in {
+            "STRESS_CANDIDATE_STARTED",
+            "STRESS_CANDIDATE_COMPLETED",
+        }:
+            idx = int(payload.get("candidate_index") or 0)
+            total = max(1, int(payload.get("total_candidates") or 1))
+            progress = min(95.0, 80.0 + 15.0 * (idx / total))
+        elif name in {"STRESS_SCENARIO_STARTED", "STRESS_SCENARIO_COMPLETED"}:
+            cidx = int(payload.get("candidate_index") or 0)
+            ctotal = max(1, int(payload.get("total_candidates") or 1))
+            sidx = int(payload.get("scenario_index") or 0)
+            stotal = max(1, int(payload.get("total_scenarios") or 1))
+            fractional = ((max(cidx, 1) - 1) + sidx / stotal) / ctotal
+            progress = min(95.0, 80.0 + 15.0 * fractional)
         run.generated_count = counter_proxy.generated
         run.evaluated_count = counter_proxy.evaluated
         run.rejected_count = len(registry.rejected_trials())

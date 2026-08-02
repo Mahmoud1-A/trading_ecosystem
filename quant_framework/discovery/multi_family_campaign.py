@@ -687,6 +687,14 @@ class FamilyCampaignConfig:
     min_oos_trades: int = 1
     min_oos_trades_per_fold: int = 1
     max_oos_drawdown: float = 0.20
+    # Economic objective: compatibility defaults stay permissive for direct
+    # unit construction; family_campaign_from_config enables research defaults.
+    min_median_profit_factor: float = 1.0
+    min_risk_normalized_annual_return: float = 0.0
+    target_risk_drawdown: float = 0.05
+    max_risk_scale: float = 4.0
+    drawdown_floor: float = 0.0025
+    calmar_cap: float = 3.0
     population_size: int = 2
     stagnation_generations: int = 99
     family_local_evolution: bool = False
@@ -734,6 +742,12 @@ class FamilyCampaignConfig:
             "min_oos_trades": self.min_oos_trades,
             "min_oos_trades_per_fold": self.min_oos_trades_per_fold,
             "max_oos_drawdown": self.max_oos_drawdown,
+            "min_median_profit_factor": self.min_median_profit_factor,
+            "min_risk_normalized_annual_return": self.min_risk_normalized_annual_return,
+            "target_risk_drawdown": self.target_risk_drawdown,
+            "max_risk_scale": self.max_risk_scale,
+            "drawdown_floor": self.drawdown_floor,
+            "calmar_cap": self.calmar_cap,
             "population_size": self.population_size,
             "stagnation_generations": self.stagnation_generations,
             "family_local_evolution": self.family_local_evolution,
@@ -1563,6 +1577,23 @@ class MultiFamilyCampaign:
         if self.progress_hook is not None:
             self.progress_hook(name, payload or {})
 
+    def _build_fitness_model(self) -> RobustFitness:
+        """One bounded economic objective for discovery, Stress, and robustness."""
+        cfg = self.config
+        return RobustFitness(
+            min_total_oos_trades=int(cfg.min_oos_trades),
+            min_oos_trades_per_fold=int(cfg.min_oos_trades_per_fold),
+            max_oos_drawdown=float(cfg.max_oos_drawdown),
+            min_median_profit_factor=float(cfg.min_median_profit_factor),
+            min_risk_normalized_annual_return=float(
+                cfg.min_risk_normalized_annual_return
+            ),
+            target_risk_drawdown=float(cfg.target_risk_drawdown),
+            max_risk_scale=float(cfg.max_risk_scale),
+            drawdown_floor=float(cfg.drawdown_floor),
+            calmar_cap=float(cfg.calmar_cap),
+        )
+
     def _make_evaluator(self, *, spec: FamilySpec, wfo_cap: int, gen_cap: int) -> CandidateEvaluator:
         cfg = self.config
         budget = SearchBudget(
@@ -1584,11 +1615,7 @@ class MultiFamilyCampaign:
             max_oos_drawdown=float(cfg.max_oos_drawdown),
         )
         counters = BudgetCounters()
-        fitness = RobustFitness(
-            min_total_oos_trades=int(cfg.min_oos_trades),
-            min_oos_trades_per_fold=int(cfg.min_oos_trades_per_fold),
-            max_oos_drawdown=float(cfg.max_oos_drawdown),
-        )
+        fitness = self._build_fitness_model()
         ev = CandidateEvaluator(
             registry=self.registry,
             budget=budget,
@@ -1826,11 +1853,7 @@ class MultiFamilyCampaign:
     ) -> tuple[StressTester | None, str | None, str]:
         """Return (tester, bind_error, backend_kind_label)."""
         forbid = bool(self.synthetic_stress_forbidden or self.research_eligible)
-        fitness = RobustFitness(
-            min_total_oos_trades=int(self.config.min_oos_trades),
-            min_oos_trades_per_fold=int(self.config.min_oos_trades_per_fold),
-            max_oos_drawdown=float(self.config.max_oos_drawdown),
-        )
+        fitness = self._build_fitness_model()
         if self.stress_backend_factory is not None:
             factory = self.stress_backend_factory
             kind = str(getattr(factory, "backend_kind", "injected_stress_factory"))
@@ -2106,7 +2129,7 @@ class MultiFamilyCampaign:
             },
         )
 
-        for family_id, rec, cand in ordered:
+        for candidate_index, (family_id, rec, cand) in enumerate(ordered, start=1):
             if time.perf_counter() - t0 >= float(cfg.max_runtime_seconds):
                 accounting.stop_reason = "max_runtime_seconds"
                 break
@@ -2199,6 +2222,18 @@ class MultiFamilyCampaign:
                 )
                 continue
 
+            self._emit(
+                "STRESS_CANDIDATE_STARTED",
+                {
+                    "candidate_id": cand.candidate_id,
+                    "family_id": family_id,
+                    "candidate_index": candidate_index,
+                    "total_candidates": len(ordered),
+                    "scenarios": list(chosen),
+                    "stress_consumed": int(counters.stress),
+                    "max_stress_evaluations": int(budget.max_stress_evaluations),
+                },
+            )
             budget_before = int(counters.stress)
             baseline_arts = None
             if isinstance(rec.meta, dict):
@@ -2329,6 +2364,35 @@ class MultiFamilyCampaign:
                     "summary": summary.as_dict(),
                 },
             )
+            # Crash-safe Stress drain: persist every completed candidate, not only
+            # the entire phase. A restart resumes from the remaining gate queue.
+            if self._live_checkpoint is not None:
+                from discovery.search_resume import sync_pending_gate_queues
+
+                ckpt = self._live_checkpoint
+                ckpt.candidate_gates[cand.candidate_id] = decision
+                ckpt.stress_summaries = [
+                    s.as_dict() for s in self.candidate_stress_summaries
+                ]
+                ckpt.status_history = [e.as_dict() for e in self.candidate_status_history]
+                ckpt.status_seq = int(self._status_seq)
+                sync_pending_gate_queues(ckpt)
+                self._persist_live_checkpoint()
+            self._emit(
+                "STRESS_CANDIDATE_COMPLETED",
+                {
+                    "candidate_id": cand.candidate_id,
+                    "family_id": family_id,
+                    "candidate_index": candidate_index,
+                    "total_candidates": len(ordered),
+                    "decision": decision,
+                    "reason": reason,
+                    "pass_rate": summary.pass_rate,
+                    "scenarios_executed": summary.total_scenarios_executed,
+                    "stress_consumed": int(counters.stress),
+                    "max_stress_evaluations": int(budget.max_stress_evaluations),
+                },
+            )
 
         accounting.stress_evaluations_consumed = int(counters.stress)
         if (
@@ -2405,11 +2469,7 @@ class MultiFamilyCampaign:
         cfg = self.config
         default_steps = (-0.2, -0.1, 0.0, 0.1, 0.2)
         steps = default_steps[: max(1, int(cfg.max_points_per_parameter))]
-        fitness = RobustFitness(
-            min_total_oos_trades=int(cfg.min_oos_trades),
-            min_oos_trades_per_fold=int(cfg.min_oos_trades_per_fold),
-            max_oos_drawdown=float(cfg.max_oos_drawdown),
-        )
+        fitness = self._build_fitness_model()
         if forbid and isinstance(self.backend, SyntheticOOSBackend):
             return None, SYNTHETIC_ROBUSTNESS_FORBIDDEN, "synthetic_oos_probe"
 
@@ -5489,6 +5549,14 @@ def family_campaign_from_config(raw: dict[str, Any] | None) -> FamilyCampaignCon
         min_oos_trades=int(raw.get("min_oos_trades", 1)),
         min_oos_trades_per_fold=int(raw.get("min_oos_trades_per_fold", 1)),
         max_oos_drawdown=float(raw.get("max_oos_drawdown", raw.get("max_drawdown_limit", 0.20))),
+        min_median_profit_factor=float(raw.get("min_median_profit_factor", 1.10)),
+        min_risk_normalized_annual_return=float(
+            raw.get("min_risk_normalized_annual_return", 0.12)
+        ),
+        target_risk_drawdown=float(raw.get("target_risk_drawdown", 0.05)),
+        max_risk_scale=float(raw.get("max_risk_scale", 4.0)),
+        drawdown_floor=float(raw.get("drawdown_floor", 0.0025)),
+        calmar_cap=float(raw.get("calmar_cap", 3.0)),
         population_size=int(raw.get("population_size", 2)),
         stagnation_generations=int(raw.get("stagnation_generations", 99)),
         family_local_evolution=bool(raw.get("family_local_evolution", False)),
