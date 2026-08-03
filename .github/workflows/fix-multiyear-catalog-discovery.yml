@@ -1,0 +1,102 @@
+name: Fix multiyear catalog discovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/alpha-budget-drain
+    paths:
+      - scripts/fix_multiyear_catalog_discovery.py
+      - .github/workflows/fix-multiyear-catalog-discovery.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - scripts/fix_multiyear_catalog_discovery.py
+      - .github/workflows/fix-multiyear-catalog-discovery.yml
+
+concurrency:
+  group: multiyear-catalog-discovery-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/alpha-budget-drain
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply catalog discovery fix
+        run: python scripts/fix_multiyear_catalog_discovery.py
+
+      - name: Compile builder
+        run: python -m compileall -q scripts/build_multiyear_usa500_dataset.py
+
+      - name: Verify control-plane catalog discovery
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import json
+          import tempfile
+          from pathlib import Path
+
+          script = Path("scripts/build_multiyear_usa500_dataset.py").resolve()
+          spec = importlib.util.spec_from_file_location("multiyear_builder", script)
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+
+          with tempfile.TemporaryDirectory() as raw:
+              root = Path(raw)
+              framework = root / "quant_framework"
+              archive = framework / "data_import" / "dukascopy_archive"
+              ui_catalog = framework / "artifacts" / "control_plane" / "dataset_catalog"
+              ui_catalog.mkdir(parents=True)
+              path = ui_catalog / "dataset_catalog.json"
+              path.write_text(
+                  json.dumps({
+                      "datasets": [{
+                          "dataset_id": module.TEMPLATE_DATASET_ID,
+                          "asset_class": "cfd",
+                          "symbols": ["USA500IDXUSD"],
+                          "research_eligible": True,
+                          "schema": {},
+                      }]
+                  }),
+                  encoding="utf-8",
+              )
+              module.REPO_ROOT = root
+              module.FRAMEWORK_ROOT = framework
+              module.ARCHIVE_ROOT = archive
+              module.MAIN_CATALOG_ROOT = archive / "dataset_catalog"
+              module.MAIN_CATALOG_PATH = module.MAIN_CATALOG_ROOT / "dataset_catalog.json"
+              paths = module._catalog_paths()
+              assert path.resolve() in paths, paths
+              targets = module._catalog_targets()
+              assert len(targets) == 1
+              assert targets[0][0] == path.resolve()
+              assert targets[0][2]["dataset_id"] == module.TEMPLATE_DATASET_ID
+          PY
+
+      - name: Commit generated builder fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/build_multiyear_usa500_dataset.py
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit"
+          else
+            git commit -m "Discover all local catalog copies for multiyear dataset"
+            git fetch origin fix/alpha-budget-drain
+            git rebase --autostash origin/fix/alpha-budget-drain
+            git push origin HEAD:fix/alpha-budget-drain
+          fi
